@@ -62,6 +62,11 @@ set(DJANGO_NATIVE_SOURCES
   cpp/cache.cpp
   cpp/datastructures.cpp
   cpp/orm.cpp
+  cpp/orm_engine/schema.cpp
+  cpp/orm_engine/query.cpp
+  cpp/orm_engine/compile.cpp
+  cpp/orm_engine/queryset.cpp
+  cpp/orm_engine/bind.cpp
   cpp/module.cpp
 )
 

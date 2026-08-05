@@ -4128,5 +4128,9 @@ NB_MODULE(_native, m) {
       },
       nb::arg("rows"));
 
+  // ORM data plane (QuerySet + schema + compiler) — see docs/design/
+  extern void register_orm_engine(nb::module_&);
+  register_orm_engine(m);
+
   m.attr("AVAILABLE") = true;
 }

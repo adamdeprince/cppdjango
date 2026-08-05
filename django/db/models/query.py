@@ -867,41 +867,71 @@ class QuerySet(AltersData):
     ):
         db = self.db
         connection = connections[db]
-        qn = connection.ops.quote_name
-        table = self.model._meta.db_table
-        where_column = lookup_field.column
         limit = MAX_GET_RESULTS
-        cache_key = (
-            "eq",
-            connection.vendor,
-            table,
-            tuple(select_columns),
-            where_column,
-            limit,
-        )
-
-        def build():
-            from django import native as _native
-
-            qt, qc, qw = qn(table), [qn(c) for c in select_columns], qn(where_column)
-            if _native.AVAILABLE:
-                return _native.simple_select_eq_limit_sql(qt, qc, qw, limit)
-            return "SELECT %s FROM %s WHERE %s = %%s LIMIT %d" % (
-                ", ".join(qc),
-                qt,
-                qw,
-                limit,
-            )
-
-        sql = self._cached_simple_sql(cache_key, build)
         try:
             param = lookup_field.get_db_prep_value(value, connection, prepared=False)
         except Exception:
             return _FAST_PATH_MISS
 
+        sql = None
+        params = (param,)
+
+        # Prefer C++ ORM data plane (QuerySet graph + compiler) when available.
+        # One boundary: compile_sql → (sql, params). No Python where-tree.
+        if not as_model and self._fields is not None:
+            try:
+                from django.native import orm as native_orm
+
+                lookup_key = (
+                    "pk"
+                    if getattr(lookup_field, "primary_key", False)
+                    else lookup_field.attname
+                )
+                compiled = native_orm.compile_values_list_get(
+                    self.model,
+                    field_names=list(self._fields),
+                    lookup_field=lookup_key,
+                    lookup_value=param,
+                    limit=limit,
+                    connection=connection,
+                )
+                if compiled is not None:
+                    sql, param_list = compiled
+                    params = tuple(param_list)
+            except Exception:
+                sql = None
+
+        if sql is None:
+            qn = connection.ops.quote_name
+            table = self.model._meta.db_table
+            where_column = lookup_field.column
+            cache_key = (
+                "eq",
+                connection.vendor,
+                table,
+                tuple(select_columns),
+                where_column,
+                limit,
+            )
+
+            def build():
+                from django import native as _native
+
+                qt, qc, qw = qn(table), [qn(c) for c in select_columns], qn(where_column)
+                if _native.AVAILABLE:
+                    return _native.simple_select_eq_limit_sql(qt, qc, qw, limit)
+                return "SELECT %s FROM %s WHERE %s = %%s LIMIT %d" % (
+                    ", ".join(qc),
+                    qt,
+                    qw,
+                    limit,
+                )
+
+            sql = self._cached_simple_sql(cache_key, build)
+
         # fetchone×2 instead of fetchall: less allocation; still detects multi-row.
         with connection.cursor() as cursor:
-            cursor.execute(sql, (param,))
+            cursor.execute(sql, params)
             row = cursor.fetchone()
             if row is None:
                 raise self.model.DoesNotExist(
