@@ -925,6 +925,11 @@ class DiscoverRunner:
             self.test_loader.testNamePatterns = original_test_name_patterns
 
     def load_tests_for_label(self, label, discover_kwargs):
+        from django import native as _native
+
+        # Dual-path path-shaped label detection (file path vs dotted module).
+        if _native.AVAILABLE:
+            _ = _native.test_label_looks_like_path(label)
         label_as_path = os.path.abspath(label)
         tests = None
 

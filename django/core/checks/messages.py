@@ -49,6 +49,10 @@ class CheckMessage:
         )
 
     def is_serious(self, level=ERROR):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.check_is_serious(self.level, level)
         return self.level >= level
 
     def is_silenced(self):

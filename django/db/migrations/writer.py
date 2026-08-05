@@ -283,6 +283,10 @@ class MigrationWriter:
 
     @property
     def filename(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.migration_filename(self.migration.name)
         return "%s.py" % self.migration.name
 
     @property

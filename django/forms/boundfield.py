@@ -1,5 +1,6 @@
 import re
 
+from django import native as _native
 from django.core.exceptions import ValidationError
 from django.forms.utils import RenderableFieldMixin, pretty_name
 from django.forms.widgets import MultiWidget, Textarea, TextInput
@@ -246,6 +247,8 @@ class BoundField(RenderableFieldMixin):
         otherwise.
         """
         auto_id = self.form.auto_id  # Boolean or string
+        if _native.AVAILABLE and isinstance(auto_id, str):
+            return _native.form_auto_id(auto_id, self.html_name)
         if auto_id and "%s" in str(auto_id):
             return auto_id % self.html_name
         elif auto_id:

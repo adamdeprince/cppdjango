@@ -43,10 +43,16 @@ BOOLEAN_ATTRIBUTES = {
 
 
 def normalize_whitespace(string):
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.normalize_ascii_whitespace(string)
     return ASCII_WHITESPACE.sub(" ", string)
 
 
 def normalize_attributes(attributes):
+    from django import native as _native
+
     normalized = []
     for name, value in attributes:
         if name == "class" and value:
@@ -59,7 +65,10 @@ def normalize_attributes(attributes):
         # that equals the attributes name. For example:
         #   <input checked> == <input checked="checked">
         if name in BOOLEAN_ATTRIBUTES:
-            if not value or value == name:
+            if _native.AVAILABLE:
+                if _native.html_boolean_attr_is_true(name, value or ""):
+                    value = None
+            elif not value or value == name:
                 value = None
         elif value is None:
             value = ""

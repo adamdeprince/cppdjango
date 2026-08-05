@@ -203,7 +203,17 @@ class Apps:
             self.check_apps_ready()
 
         if model_name is None:
-            app_label, model_name = app_label.split(".")
+            from django import native as _native
+
+            if _native.AVAILABLE:
+                ok, app_label, model_name = _native.split_dotted_path(app_label)
+                if not ok:
+                    raise ValueError(
+                        "Invalid model reference '%s'. String model references "
+                        "must be of the form 'app_label.ModelName'." % app_label
+                    )
+            else:
+                app_label, model_name = app_label.split(".")
 
         app_config = self.get_app_config(app_label)
 

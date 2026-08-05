@@ -55,7 +55,15 @@ class SessionMiddleware(MiddlewareMixin):
                     expires = http_date(expires_time)
                 # Save the session data and refresh the client cookie.
                 # Skip session save for 5xx responses.
-                if response.status_code < 500:
+                from django import native as _native
+
+                if _native.AVAILABLE:
+                    saveable = _native.http_status_session_saveable(
+                        response.status_code
+                    )
+                else:
+                    saveable = response.status_code < 500
+                if saveable:
                     try:
                         request.session.save()
                     except UpdateError:

@@ -173,7 +173,13 @@ class Signal:
         return disconnected
 
     def has_listeners(self, sender=None):
+        from django import native as _native
+
         sync_receivers, async_receivers = self._live_receivers(sender)
+        if _native.AVAILABLE:
+            return _native.signal_has_receivers(
+                len(sync_receivers) + len(async_receivers)
+            )
         return bool(sync_receivers) or bool(async_receivers)
 
     def send(self, sender, **named):

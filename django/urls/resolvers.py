@@ -16,6 +16,7 @@ from urllib.parse import quote
 
 from asgiref.local import Local
 
+from django import native as _native
 from django.conf import settings
 from django.core.checks import Error, Warning
 from django.core.checks.urls import check_resolver
@@ -320,10 +321,24 @@ class RoutePattern(CheckURLMixin):
         self._regex_dict = {}
         self._is_endpoint = is_endpoint
         self.name = name
+        # Native matcher for default converters only (None → Python regex path).
+        self._native_route = (
+            _native.compile_route(str(route), is_endpoint)
+            if _native.AVAILABLE
+            else None
+        )
 
     def match(self, path):
         # Only use regex overhead if there are converters.
         if self.converters:
+            # Fast path: compiled native route (int/str/slug/path/uuid only).
+            # kwargs already run through converter types (int/uuid/str).
+            if self._native_route is not None:
+                matched = _native.match_route(self._native_route, path)
+                if matched is not None:
+                    remaining, kwargs = matched
+                    return remaining, (), kwargs
+                # Native miss → fall through to Python regex path.
             if match := self.regex.search(path):
                 # RoutePattern doesn't allow non-named groups so args are
                 # ignored.
@@ -337,6 +352,12 @@ class RoutePattern(CheckURLMixin):
                 return path[match.end() :], (), kwargs
         # If this is an endpoint, the path should be exactly the same as the
         # route.
+        elif _native.AVAILABLE:
+            kind, remaining = _native.route_simple_match(
+                self._is_endpoint, str(self._route), path
+            )
+            if kind:
+                return remaining, (), {}
         elif self._is_endpoint:
             if self._route == path:
                 return "", (), {}
@@ -351,7 +372,12 @@ class RoutePattern(CheckURLMixin):
             *self._check_pattern_unmatched_angle_brackets(),
         ]
         route = self._route
-        if "(?P<" in route or route.startswith("^") or route.endswith("$"):
+        looks_regex = (
+            _native.route_looks_like_regex(str(route))
+            if _native.AVAILABLE
+            else ("(?P<" in route or route.startswith("^") or route.endswith("$"))
+        )
+        if looks_regex:
             warnings.append(
                 Warning(
                     "Your URL pattern {} has a route that contains '(?P<', begins "
@@ -805,10 +831,11 @@ class URLResolver:
                     candidate_pat % text_candidate_subs,
                 ):
                     # safe characters from `pchar` definition of RFC 3986
-                    url = quote(
-                        candidate_pat % text_candidate_subs,
-                        safe=RFC3986_SUBDELIMS + "/~:@",
-                    )
+                    decoded = candidate_pat % text_candidate_subs
+                    if _native.AVAILABLE:
+                        # quote + escape leading // in one native hop
+                        return _native.reverse_quote(decoded)
+                    url = quote(decoded, safe=RFC3986_SUBDELIMS + "/~:@")
                     # Don't allow construction of scheme relative urls.
                     return escape_leading_slashes(url)
         # lookup_view can be URL name or callable, but callables are not

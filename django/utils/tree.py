@@ -5,6 +5,7 @@ ORM.
 
 import copy
 
+from django import native as _native
 from django.utils.hashable import make_hashable
 
 
@@ -98,6 +99,25 @@ class Node:
         Return a node which can be used in place of data regardless if the
         node other got squashed or not.
         """
+        if _native.AVAILABLE:
+            action = _native.node_add_action(
+                self.connector,
+                conn_type,
+                isinstance(data, Node),
+                getattr(data, "negated", False),
+                getattr(data, "connector", "") or "",
+                len(data) if isinstance(data, Node) else 0,
+            )
+            if action == 0:
+                obj = self.copy()
+                self.connector = conn_type
+                self.children = [obj, data]
+                return data
+            if action == 1:
+                self.children.extend(data.children)
+                return self
+            self.children.append(data)
+            return data
         if self.connector != conn_type:
             obj = self.copy()
             self.connector = conn_type

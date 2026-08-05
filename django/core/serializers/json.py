@@ -21,11 +21,17 @@ class Serializer(PythonSerializer):
     internal_use_only = False
 
     def _init_options(self):
+        from django import native as _native
+
         self._current = None
         self.json_kwargs = self.options.copy()
         self.json_kwargs.pop("stream", None)
         self.json_kwargs.pop("fields", None)
-        if self.options.get("indent"):
+        if _native.AVAILABLE:
+            if _native.json_use_indent_separators(bool(self.options.get("indent"))):
+                # Prevent trailing spaces
+                self.json_kwargs["separators"] = (",", ": ")
+        elif self.options.get("indent"):
             # Prevent trailing spaces
             self.json_kwargs["separators"] = (",", ": ")
         self.json_kwargs.setdefault("cls", DjangoJSONEncoder)
@@ -90,10 +96,14 @@ class DjangoJSONEncoder(json.JSONEncoder):
     def default(self, o):
         # See "Date Time String Format" in the ECMA-262 specification.
         if isinstance(o, datetime.datetime):
+            from django import native as _native
+
             r = o.isoformat()
             if o.microsecond:
                 r = r[:23] + r[26:]
-            if r.endswith("+00:00"):
+            if _native.AVAILABLE:
+                r = _native.datetime_iso_utc_z(r)
+            elif r.endswith("+00:00"):
                 r = r.removesuffix("+00:00") + "Z"
             return r
         elif isinstance(o, datetime.date):

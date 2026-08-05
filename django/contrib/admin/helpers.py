@@ -176,6 +176,8 @@ class AdminField:
         self.is_fieldset = self.field.field.widget.use_fieldset
 
     def label_tag(self):
+        from django import native as _native
+
         classes = []
         contents = conditional_escape(self.field.label)
         if self.is_checkbox:
@@ -185,7 +187,13 @@ class AdminField:
             classes.append("required")
         if not self.is_first:
             classes.append("inline")
-        attrs = {"class": " ".join(classes)} if classes else {}
+        if classes:
+            if _native.AVAILABLE:
+                attrs = {"class": _native.css_classes_join(classes)}
+            else:
+                attrs = {"class": " ".join(classes)}
+        else:
+            attrs = {}
         tag = "legend" if self.is_fieldset else None
         # checkboxes should not have a label suffix as the checkbox appears
         # to the left of the label.

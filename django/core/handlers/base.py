@@ -37,16 +37,24 @@ class BaseHandler:
         get_response = self._get_response_async if is_async else self._get_response
         handler = convert_exception_to_response(get_response)
         handler_is_async = is_async
+        from django import native as _native
+
         for middleware_path in reversed(settings.MIDDLEWARE):
             middleware = import_string(middleware_path)
             middleware_can_sync = getattr(middleware, "sync_capable", True)
             middleware_can_async = getattr(middleware, "async_capable", False)
-            if not middleware_can_sync and not middleware_can_async:
+            if _native.AVAILABLE:
+                cap_ok = _native.middleware_capability_ok(
+                    middleware_can_sync, middleware_can_async
+                )
+            else:
+                cap_ok = middleware_can_sync or middleware_can_async
+            if not cap_ok:
                 raise RuntimeError(
                     "Middleware %s must have at least one of "
                     "sync_capable/async_capable set to True." % middleware_path
                 )
-            elif not handler_is_async and middleware_can_sync:
+            if not handler_is_async and middleware_can_sync:
                 middleware_is_async = False
             else:
                 middleware_is_async = middleware_can_async

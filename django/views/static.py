@@ -111,10 +111,18 @@ def was_modified_since(header=None, mtime=0):
     mtime
       This is the modification time of the item we're talking about.
     """
+    from django import native as _native
+
     try:
         if header is None:
+            if _native.AVAILABLE:
+                return _native.resource_was_modified(True, float(mtime), 0.0)
             raise ValueError
         header_mtime = parse_http_date(header)
+        if _native.AVAILABLE:
+            return _native.resource_was_modified(
+                False, float(int(mtime)), float(header_mtime)
+            )
         if int(mtime) > header_mtime:
             raise ValueError
     except (ValueError, OverflowError):

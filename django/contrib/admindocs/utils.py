@@ -21,11 +21,17 @@ else:
 
 
 def get_view_name(view_func):
+    from django import native as _native
+
     if hasattr(view_func, "view_class"):
         klass = view_func.view_class
+        if _native.AVAILABLE:
+            return _native.dotted_qualname(klass.__module__, klass.__qualname__)
         return f"{klass.__module__}.{klass.__qualname__}"
     mod_name = view_func.__module__
     view_name = getattr(view_func, "__qualname__", view_func.__class__.__name__)
+    if _native.AVAILABLE:
+        return _native.dotted_qualname(mod_name, view_name)
     return mod_name + "." + view_name
 
 
@@ -265,4 +271,8 @@ def remove_non_capturing_groups(pattern):
 
 
 def strip_p_tags(value):
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return mark_safe(_native.strip_p_tags(value))
     return mark_safe(value.replace("<p>", "").replace("</p>", ""))

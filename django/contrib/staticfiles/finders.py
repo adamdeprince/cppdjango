@@ -19,7 +19,12 @@ searched_locations = []
 
 # RemovedInDjango61Warning: When the deprecation ends, remove completely.
 def _check_deprecated_find_param(class_name="", find_all=False, stacklevel=3, **kwargs):
-    method_name = "find" if not class_name else f"{class_name}.find"
+    from django import native as _native
+
+    if _native.AVAILABLE and class_name:
+        method_name = _native.dotted_qualname(class_name, "find")
+    else:
+        method_name = "find" if not class_name else f"{class_name}.find"
     if "all" in kwargs:
         legacy_all = kwargs.pop("all")
         msg = (

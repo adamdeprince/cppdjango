@@ -71,6 +71,15 @@ def mark_safe(s):
 
     Can be called multiple times on a single string.
     """
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        kind = _native.mark_safe_kind(hasattr(s, "__html__"), callable(s))
+        if kind == 0:
+            return s
+        if kind == 1:
+            return _safety_decorator(mark_safe, s)
+        return SafeString(s)
     if hasattr(s, "__html__"):
         return s
     if callable(s):

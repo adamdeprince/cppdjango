@@ -8,6 +8,7 @@ from collections.abc import Mapping
 from html.parser import HTMLParser
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlsplit, urlunsplit
 
+from django import native as _native
 from django.conf import settings
 from django.core.exceptions import SuspiciousOperation, ValidationError
 from django.core.validators import DomainNameValidator, EmailValidator
@@ -56,33 +57,16 @@ def escape(text):
     Always escape input, even if it's already escaped and marked as such.
     This may result in double-escaping. If this is a concern, use
     conditional_escape() instead.
+
+    Uses the C++ acceleration layer when available (see ``django.native``).
     """
-    return SafeString(html.escape(str(text)))
-
-
-_js_escapes = {
-    ord("\\"): "\\u005C",
-    ord("'"): "\\u0027",
-    ord('"'): "\\u0022",
-    ord(">"): "\\u003E",
-    ord("<"): "\\u003C",
-    ord("&"): "\\u0026",
-    ord("="): "\\u003D",
-    ord("-"): "\\u002D",
-    ord(";"): "\\u003B",
-    ord("`"): "\\u0060",
-    ord("\u2028"): "\\u2028",
-    ord("\u2029"): "\\u2029",
-}
-
-# Escape every ASCII character with a value less than 32.
-_js_escapes.update((ord("%c" % z), "\\u%04X" % z) for z in range(32))
+    return SafeString(_native.html_escape(str(text)))
 
 
 @keep_lazy(SafeString)
 def escapejs(value):
     """Hex encode characters for use in JavaScript strings."""
-    return mark_safe(str(value).translate(_js_escapes))
+    return mark_safe(_native.escapejs(str(value)))
 
 
 _json_script_escapes = {
@@ -100,9 +84,19 @@ def json_script(value, element_id=None, encoder=None):
     """
     from django.core.serializers.json import DjangoJSONEncoder
 
-    json_str = json.dumps(value, cls=encoder or DjangoJSONEncoder).translate(
-        _json_script_escapes
-    )
+    json_str = json.dumps(value, cls=encoder or DjangoJSONEncoder)
+    if _native.AVAILABLE:
+        escaped = _native.json_script_escape(json_str)
+        # Escape element_id via format_html semantics for the id attribute.
+        if element_id:
+            # Keep format_html for id escaping; body is already escaped.
+            return format_html(
+                '<script id="{}" type="application/json">{}</script>',
+                element_id,
+                mark_safe(escaped),
+            )
+        return mark_safe(_native.json_script_wrap(escaped, ""))
+    json_str = json_str.translate(_json_script_escapes)
     if element_id:
         template = '<script id="{}" type="application/json">{}</script>'
         args = (element_id, mark_safe(json_str))
@@ -169,6 +163,8 @@ def format_html_join(sep, format_string, args_generator):
 @keep_lazy_text
 def linebreaks(value, autoescape=False):
     """Convert newlines into <p> and <br>s."""
+    if _native.AVAILABLE:
+        return _native.linebreaks(str(value), autoescape)
     value = normalize_newlines(value)
     paras = re.split("\n{2,}", str(value))
     if autoescape:
@@ -211,6 +207,8 @@ def _strip_once(value):
 def strip_tags(value):
     """Return the given HTML with all tags stripped."""
     value = str(value)
+    if _native.AVAILABLE:
+        return _native.strip_tags(value)
     for long_open_tag in long_open_tag_without_closing_re.finditer(value):
         if long_open_tag.group().count("<") >= MAX_STRIP_TAGS_DEPTH:
             raise SuspiciousOperation
@@ -232,6 +230,8 @@ def strip_tags(value):
 @keep_lazy_text
 def strip_spaces_between_tags(value):
     """Return the given HTML with spaces between tags removed."""
+    if _native.AVAILABLE:
+        return _native.strip_spaces_between_tags(str(value))
     return re.sub(r">\s+<", "><", str(value))
 
 
@@ -318,7 +318,11 @@ class Urlizer:
         """
         safe_input = isinstance(text, SafeData)
 
-        words = self.word_split_re.split(str(text))
+        text_s = str(text)
+        if _native.AVAILABLE:
+            words = _native.urlize_word_split(text_s)
+        else:
+            words = self.word_split_re.split(text_s)
         local_cache = {}
         urlized_words = []
         for word in words:
@@ -351,9 +355,22 @@ class Urlizer:
             # Make URL we want to point to.
             url = None
             nofollow_attr = ' rel="nofollow"' if nofollow else ""
-            if len(middle) <= MAX_URL_LENGTH and self.simple_url_re.match(middle):
+            simple_url = False
+            simple_url_2 = False
+            if len(middle) <= MAX_URL_LENGTH:
+                if _native.AVAILABLE and _native.urlize_simple_url_match(middle):
+                    simple_url = True
+                elif self.simple_url_re.match(middle):
+                    simple_url = True
+                elif _native.AVAILABLE and _native.urlize_simple_url_2_match(
+                    middle
+                ):
+                    simple_url_2 = True
+                elif self.simple_url_2_re.match(middle):
+                    simple_url_2 = True
+            if simple_url:
                 url = smart_urlquote(html.unescape(middle))
-            elif len(middle) <= MAX_URL_LENGTH and self.simple_url_2_re.match(middle):
+            elif simple_url_2:
                 unescaped_middle = html.unescape(middle)
                 # RemovedInDjango70Warning: When the deprecation ends, replace
                 # with:
@@ -407,6 +424,8 @@ class Urlizer:
     def trim_url(self, x, *, limit):
         if limit is None or len(x) <= limit:
             return x
+        if _native.AVAILABLE:
+            return _native.trim_url(x, limit)
         return "%s…" % x[: max(0, limit - 1)]
 
     @cached_property
@@ -426,6 +445,16 @@ class Urlizer:
         Trim trailing and wrapping punctuation from `word`. Return the items of
         the new state.
         """
+        # Fast path for common words without HTML entities (entity/; logic stays
+        # in Python). Skip pathological lengths so C++ can't amplify worst cases.
+        if (
+            _native.AVAILABLE
+            and isinstance(word, str)
+            and "&" not in word
+            and len(word) < 10_000
+        ):
+            lead, middle, trail = _native.trim_urlize_punctuation(word)
+            return lead, middle, trail
         # Strip all opening wrapping punctuation.
         middle = word.lstrip(self.wrapping_punctuation_openings)
         lead = word[: len(word) - len(middle)]
@@ -482,6 +511,10 @@ class Urlizer:
     @staticmethod
     def is_email_simple(value):
         """Return True if value looks like an email address."""
+        if _native.AVAILABLE and isinstance(value, str):
+            # Fast reject; full EmailValidator remains oracle for accepts.
+            if not _native.urlize_is_email_simple(value):
+                return False
         try:
             EmailValidator(allowlist=[])(value)
         except ValidationError:
@@ -504,6 +537,8 @@ def avoid_wrapping(value):
     Avoid text wrapping in the middle of a phrase by adding non-breaking
     spaces where there previously were normal spaces.
     """
+    if _native.AVAILABLE:
+        return _native.avoid_wrapping(str(value))
     return value.replace(" ", "\xa0")
 
 

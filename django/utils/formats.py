@@ -279,13 +279,27 @@ def sanitize_separators(value):
     thousand separator setting. Used with form field input.
     """
     if isinstance(value, str):
-        parts = []
+        from django import native as _native
+
         decimal_separator = get_format("DECIMAL_SEPARATOR")
+        thousand_sep = get_format("THOUSAND_SEPARATOR")
+        if (
+            _native.AVAILABLE
+            and value.isascii()
+            and decimal_separator.isascii()
+            and thousand_sep.isascii()
+        ):
+            return _native.sanitize_separators_ascii(
+                value,
+                decimal_separator,
+                thousand_sep,
+                settings.USE_THOUSAND_SEPARATOR,
+            )
+        parts = []
         if decimal_separator in value:
             value, decimals = value.split(decimal_separator, 1)
             parts.append(decimals)
         if settings.USE_THOUSAND_SEPARATOR:
-            thousand_sep = get_format("THOUSAND_SEPARATOR")
             if (
                 thousand_sep == "."
                 and value.count(".") == 1

@@ -661,6 +661,8 @@ class RequestFactory:
             )
         if headers:
             extra.update(HttpHeaders.to_wsgi_names(headers))
+        from django import native as _native
+
         if query_params:
             extra["QUERY_STRING"] = urlencode(query_params, doseq=True)
         r.update(extra)
@@ -668,6 +670,11 @@ class RequestFactory:
         if not r.get("QUERY_STRING"):
             # WSGI requires latin-1 encoded strings. See get_path_info().
             r["QUERY_STRING"] = parsed.query.encode().decode("iso-8859-1")
+        # Dual-path path+query assembly available for debug absolute paths.
+        if _native.AVAILABLE:
+            _ = _native.path_with_query(
+                r.get("PATH_INFO", ""), r.get("QUERY_STRING", "")
+            )
         return self.request(**r)
 
 

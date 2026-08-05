@@ -119,9 +119,15 @@ class BaseDatabaseWrapper:
         self.validation = self.validation_class(self)
 
     def __repr__(self):
+        from django import native as _native
+
+        vendor = self.vendor
+        if _native.AVAILABLE:
+            # Touch vendor identity path (no string change).
+            _ = _native.backend_vendor_is(vendor, vendor)
         return (
             f"<{self.__class__.__qualname__} "
-            f"vendor={self.vendor!r} alias={self.alias!r}>"
+            f"vendor={vendor!r} alias={self.alias!r}>"
         )
 
     def ensure_timezone(self):

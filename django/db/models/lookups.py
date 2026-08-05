@@ -1,6 +1,7 @@
 import itertools
 import math
 
+from django import native as _native
 from django.core.exceptions import EmptyResultSet, FullResultSet
 from django.db.models.expressions import (
     Case,
@@ -239,6 +240,8 @@ class BuiltinLookup(Lookup):
         rhs_sql, rhs_params = self.process_rhs(compiler, connection)
         params = (*params, *rhs_params)
         rhs_sql = self.get_rhs_op(connection, rhs_sql)
+        if _native.AVAILABLE:
+            return _native.sql_lhs_rhs(lhs_sql, rhs_sql), params
         return "%s %s" % (lhs_sql, rhs_sql), params
 
     def get_rhs_op(self, connection, rhs):
@@ -532,13 +535,19 @@ class In(FieldGetDbPrepValueIterableMixin, BuiltinLookup):
             except TypeError:  # Unhashable items in self.rhs
                 rhs = [r for r in self.rhs if r is not None]
 
-            if not rhs:
+            if _native.AVAILABLE:
+                if _native.in_lookup_empty(len(rhs)):
+                    raise EmptyResultSet
+            elif not rhs:
                 raise EmptyResultSet
 
             # rhs should be an iterable; use batch_process_rhs() to
             # prepare/transform those values.
             sqls, sqls_params = self.batch_process_rhs(compiler, connection, rhs)
-            placeholder = "(" + ", ".join(sqls) + ")"
+            if _native.AVAILABLE and sqls and all(s == "%s" for s in sqls):
+                placeholder = "(" + _native.sql_in_placeholders(len(sqls)) + ")"
+            else:
+                placeholder = "(" + ", ".join(sqls) + ")"
             return (placeholder, sqls_params)
         return super().process_rhs(compiler, connection)
 
@@ -603,10 +612,19 @@ class PatternLookup(BuiltinLookup):
     def process_rhs(self, qn, connection):
         rhs, params = super().process_rhs(qn, connection)
         if self.rhs_is_direct_value() and params and not self.bilateral_transforms:
-            params = (
-                self.param_pattern % connection.ops.prep_for_like_query(params[0]),
-                *params[1:],
-            )
+            prepared = connection.ops.prep_for_like_query(params[0])
+            if _native.AVAILABLE and self.lookup_name in {
+                "contains",
+                "icontains",
+                "startswith",
+                "istartswith",
+                "endswith",
+                "iendswith",
+            }:
+                wrapped = _native.sql_pattern_wrap(prepared, self.lookup_name)
+            else:
+                wrapped = self.param_pattern % prepared
+            params = (wrapped, *params[1:])
         return rhs, params
 
 
@@ -670,6 +688,8 @@ class IsNull(BuiltinLookup):
                 result_exception = EmptyResultSet if self.rhs else FullResultSet
             raise result_exception
         sql, params = self.process_lhs(compiler, connection)
+        if _native.AVAILABLE:
+            return "%s %s" % (sql, _native.sql_isnull_sql(not self.rhs)), params
         if self.rhs:
             return "%s IS NULL" % sql, params
         else:

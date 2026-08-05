@@ -30,10 +30,18 @@ class MigrationOptimizer:
         if app_label is None:
             raise TypeError("app_label must be a str.")
         self._iterations = 0
+        from django import native as _native
+
         while True:
             result = self.optimize_inner(operations, app_label)
             self._iterations += 1
-            if result == operations:
+            if _native.AVAILABLE:
+                # Length equal is necessary; identity/equality still via ==.
+                if _native.optimizer_lists_equal_len(
+                    len(result), len(operations)
+                ) and result == operations:
+                    return result
+            elif result == operations:
                 return result
             operations = result
 

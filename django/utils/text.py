@@ -10,6 +10,7 @@ from html import escape
 from html.parser import HTMLParser
 from io import BytesIO
 
+from django import native as _native
 from django.core.exceptions import SuspiciousFileOperation
 from django.utils.functional import (
     SimpleLazyObject,
@@ -49,6 +50,8 @@ def wrap(text, width):
     Don't wrap long words, thus the output text may have lines longer than
     ``width``.
     """
+    if _native.AVAILABLE:
+        return _native.wordwrap(str(text), int(width))
 
     wrapper = textwrap.TextWrapper(
         width=width,
@@ -205,6 +208,11 @@ class Truncator(SimpleLazyObject):
         text = unicodedata.normalize("NFC", self._wrapped)
 
         if html:
+            if _native.AVAILABLE and "%(truncated_text)s" not in (truncate or ""):
+                suffix = add_truncation_text("", truncate)
+                result = _native.truncate_chars_html(text, length, suffix)
+                if result is not None:
+                    return result
             parser = TruncateCharsHTMLParser(length=length, replacement=truncate)
             parser.feed(text)
             parser.close()
@@ -213,6 +221,12 @@ class Truncator(SimpleLazyObject):
 
     def _text_chars(self, length, truncate, text):
         """Truncate a string after a certain number of chars."""
+        # Resolve truncate suffix in Python (i18n), accelerate the walk in C++.
+        if _native.AVAILABLE:
+            suffix = add_truncation_text("", truncate)
+            # Only use native when suffix is a plain append (no %(truncated_text)s).
+            if "%(truncated_text)s" not in (truncate or ""):
+                return _native.truncate_chars(text, length, suffix)
         truncate_len = calculate_truncate_chars_length(length, truncate)
         s_len = 0
         end_index = None
@@ -242,6 +256,11 @@ class Truncator(SimpleLazyObject):
         if length <= 0:
             return ""
         if html:
+            if _native.AVAILABLE and "%(truncated_text)s" not in (truncate or ""):
+                suffix = add_truncation_text("", truncate)
+                result = _native.truncate_words_html(self._wrapped, length, suffix)
+                if result is not None:
+                    return result
             parser = TruncateWordsHTMLParser(length=length, replacement=truncate)
             parser.feed(self._wrapped)
             parser.close()
@@ -254,6 +273,9 @@ class Truncator(SimpleLazyObject):
 
         Strip newlines in the string.
         """
+        if _native.AVAILABLE and "%(truncated_text)s" not in (truncate or ""):
+            suffix = add_truncation_text("", truncate)
+            return _native.truncate_words(self._wrapped, length, suffix)
         words = self._wrapped.split()
         if len(words) > length:
             words = words[:length]
@@ -271,10 +293,10 @@ def get_valid_filename(name):
     >>> get_valid_filename("john's portrait in 2004.jpg")
     'johns_portrait_in_2004.jpg'
     """
-    s = str(name).strip().replace(" ", "_")
-    s = re.sub(r"(?u)[^-\w.]", "", s)
-    if s in {"", ".", ".."}:
-        raise SuspiciousFileOperation("Could not derive file name from '%s'" % name)
+    original = name
+    s = _native.get_valid_filename(str(name))
+    if s is None:
+        raise SuspiciousFileOperation("Could not derive file name from '%s'" % original)
     return s
 
 
@@ -307,12 +329,16 @@ def get_text_list(list_, last_word=gettext_lazy("or")):
 @keep_lazy_text
 def normalize_newlines(text):
     """Normalize CRLF and CR newlines to just LF."""
+    if _native.AVAILABLE:
+        return _native.normalize_newlines(str(text))
     return re_newlines.sub("\n", str(text))
 
 
 @keep_lazy_text
 def phone2numeric(phone):
     """Convert a phone number with letters into its numeric equivalent."""
+    if _native.AVAILABLE:
+        return _native.phone2numeric(str(phone))
     char2number = {
         "a": "2",
         "b": "2",
@@ -435,6 +461,9 @@ def smart_split(text):
     >>> list(smart_split(r'A "\"funky\" style" test.'))
     ['A', '"\\"funky\\" style"', 'test.']
     """
+    if _native.AVAILABLE:
+        yield from _native.smart_split(str(text))
+        return
     for bit in smart_split_re.finditer(str(text)):
         yield bit[0]
 
@@ -454,8 +483,14 @@ def unescape_string_literal(s):
         >>> unescape_string_literal("'\'ab\' c'")
         "'ab' c"
     """
+    s = str(s)
     if not s or s[0] not in "\"'" or s[-1] != s[0]:
         raise ValueError("Not a string literal: %r" % s)
+    if _native.AVAILABLE:
+        try:
+            return _native.unescape_string_literal(s)
+        except ValueError:
+            raise ValueError("Not a string literal: %r" % s)
     quote = s[0]
     return s[1:-1].replace(r"\%s" % quote, quote).replace(r"\\", "\\")
 
@@ -467,24 +502,18 @@ def slugify(value, allow_unicode=False):
     dashes to single dashes. Remove characters that aren't alphanumerics,
     underscores, or hyphens. Convert to lowercase. Also strip leading and
     trailing whitespace, dashes, and underscores.
+
+    Uses the C++ acceleration layer when available (see ``django.native``).
     """
-    value = str(value)
-    if allow_unicode:
-        value = unicodedata.normalize("NFKC", value)
-    else:
-        value = (
-            unicodedata.normalize("NFKD", value)
-            .encode("ascii", "ignore")
-            .decode("ascii")
-        )
-    value = re.sub(r"[^\w\s-]", "", value.lower())
-    return re.sub(r"[-\s]+", "-", value).strip("-_")
+    return _native.slugify(str(value), allow_unicode=allow_unicode)
 
 
 def camel_case_to_spaces(value):
     """
     Split CamelCase and convert to lowercase. Strip surrounding whitespace.
     """
+    if _native.AVAILABLE:
+        return _native.camel_case_to_spaces(value)
     return re_camel_case.sub(r" \1", value).strip().lower()
 
 

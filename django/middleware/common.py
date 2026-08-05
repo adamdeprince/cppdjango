@@ -1,6 +1,7 @@
 import re
 from urllib.parse import urlsplit
 
+from django import native as _native
 from django.conf import settings
 from django.core.exceptions import PermissionDenied
 from django.core.mail import mail_managers
@@ -47,7 +48,12 @@ class CommonMiddleware(MiddlewareMixin):
         # Check for a redirect based on settings.PREPEND_WWW
         host = request.get_host()
 
-        if settings.PREPEND_WWW and host and not host.startswith("www."):
+        needs_www = (
+            _native.host_needs_www_prefix(host)
+            if _native.AVAILABLE
+            else (host and not host.startswith("www."))
+        )
+        if settings.PREPEND_WWW and needs_www:
             # Check if we also need to append a slash so we can do it all
             # with a single redirect. (This check may be somewhat expensive,
             # so we only do it if we already know we're sending a redirect,
@@ -57,14 +63,23 @@ class CommonMiddleware(MiddlewareMixin):
             else:
                 path = request.get_full_path()
 
-            return self.response_redirect_class(f"{request.scheme}://www.{host}{path}")
+            if _native.AVAILABLE:
+                url = _native.www_redirect_url(request.scheme, host, path)
+            else:
+                url = f"{request.scheme}://www.{host}{path}"
+            return self.response_redirect_class(url)
 
     def should_redirect_with_slash(self, request):
         """
         Return True if settings.APPEND_SLASH is True and appending a slash to
         the request path turns an invalid path into a valid one.
         """
-        if settings.APPEND_SLASH and not request.path_info.endswith("/"):
+        ends_slash = (
+            _native.path_ends_with_slash(request.path_info)
+            if _native.AVAILABLE
+            else request.path_info.endswith("/")
+        )
+        if settings.APPEND_SLASH and not ends_slash:
             urlconf = getattr(request, "urlconf", None)
             if not is_valid_path(request.path_info, urlconf):
                 match = is_valid_path("%s/" % request.path_info, urlconf)

@@ -717,6 +717,8 @@ class Model(AltersData, metaclass=ModelBase):
         When accessing deferred fields of an instance, the deferred loading
         of the field will call this method.
         """
+        from django import native as _native
+
         if fields is None:
             self._prefetched_objects_cache = {}
         else:
@@ -726,13 +728,22 @@ class Model(AltersData, metaclass=ModelBase):
                 if field in prefetched_objects_cache:
                     del prefetched_objects_cache[field]
                     fields.remove(field)
-            if not fields:
-                return
-            if any(LOOKUP_SEP in f for f in fields):
-                raise ValueError(
-                    'Found "%s" in fields argument. Relations and transforms '
-                    "are not allowed in fields." % LOOKUP_SEP
-                )
+            if _native.AVAILABLE:
+                if _native.refresh_fields_empty(len(fields)):
+                    return
+                if _native.refresh_fields_have_lookup_sep(list(fields)):
+                    raise ValueError(
+                        'Found "%s" in fields argument. Relations and transforms '
+                        "are not allowed in fields." % LOOKUP_SEP
+                    )
+            else:
+                if not fields:
+                    return
+                if any(LOOKUP_SEP in f for f in fields):
+                    raise ValueError(
+                        'Found "%s" in fields argument. Relations and transforms '
+                        "are not allowed in fields." % LOOKUP_SEP
+                    )
 
         if from_queryset is None:
             hints = {"instance": self}
@@ -825,10 +836,21 @@ class Model(AltersData, metaclass=ModelBase):
         non-SQL backends), respectively. Normally, they should not be set.
         """
 
+        from django import native as _native
+
         self._prepare_related_fields_for_save(operation_name="save")
 
         using = using or router.db_for_write(self.__class__, instance=self)
-        if force_insert and (force_update or update_fields):
+        if _native.AVAILABLE:
+            if _native.save_force_conflict(
+                bool(force_insert),
+                bool(force_update),
+                bool(update_fields),
+            ):
+                raise ValueError(
+                    "Cannot force both insert and updating in model saving."
+                )
+        elif force_insert and (force_update or update_fields):
             raise ValueError("Cannot force both insert and updating in model saving.")
 
         deferred_non_generated_fields = {
@@ -840,7 +862,12 @@ class Model(AltersData, metaclass=ModelBase):
             # If update_fields is empty, skip the save. We do also check for
             # no-op saves later on for inheritance cases. This bailout is
             # still needed for skipping signal sending.
-            if not update_fields:
+            if _native.AVAILABLE:
+                if _native.save_skip_empty_update_fields(
+                    False, len(update_fields)
+                ):
+                    return
+            elif not update_fields:
                 return
 
             update_fields = frozenset(update_fields)
@@ -848,10 +875,13 @@ class Model(AltersData, metaclass=ModelBase):
             not_updatable_fields = update_fields.difference(field_names)
 
             if not_updatable_fields:
+                if _native.AVAILABLE:
+                    names = _native.join_sorted_comma(list(not_updatable_fields))
+                else:
+                    names = ", ".join(not_updatable_fields)
                 raise ValueError(
                     "The following fields do not exist in this model, are m2m "
-                    "fields, primary keys, or are non-concrete fields: %s"
-                    % ", ".join(not_updatable_fields)
+                    "fields, primary keys, or are non-concrete fields: %s" % names
                 )
 
         # If saving to the same database, and this model is deferred, then
@@ -934,6 +964,8 @@ class Model(AltersData, metaclass=ModelBase):
         models and not to do any changes to the values before save. This
         is used by fixture loading.
         """
+        from django import native as _native
+
         using = using or router.db_for_write(self.__class__, instance=self)
         assert not (force_insert and (force_update or update_fields))
         assert update_fields is None or update_fields
@@ -951,7 +983,11 @@ class Model(AltersData, metaclass=ModelBase):
                 update_fields=update_fields,
             )
         # A transaction isn't needed if one query is issued.
-        if meta.parents:
+        if _native.AVAILABLE:
+            needs_atomic = _native.save_base_needs_atomic(bool(meta.parents))
+        else:
+            needs_atomic = bool(meta.parents)
+        if needs_atomic:
             context_manager = transaction.atomic(using=using, savepoint=False)
         else:
             context_manager = transaction.mark_for_rollback_on_error(using=using)
@@ -978,10 +1014,14 @@ class Model(AltersData, metaclass=ModelBase):
 
         # Signal that the save is complete
         if not meta.auto_created:
+            if _native.AVAILABLE:
+                created = _native.save_created_flag(bool(updated))
+            else:
+                created = not updated
             post_save.send(
                 sender=origin,
                 instance=self,
-                created=(not updated),
+                created=created,
                 update_fields=update_fields,
                 raw=raw,
                 using=using,
@@ -1064,11 +1104,20 @@ class Model(AltersData, metaclass=ModelBase):
                 if f.name in update_fields or f.attname in update_fields
             ]
 
+        from django import native as _native
+
         if not self._is_pk_set(meta):
             pk_val = meta.pk.get_pk_value_on_save(self)
             setattr(self, meta.pk.attname, pk_val)
         pk_set = self._is_pk_set(meta)
-        if not pk_set and (force_update or update_fields):
+        if _native.AVAILABLE:
+            if _native.save_force_update_no_pk(
+                pk_set, bool(force_update), bool(update_fields)
+            ):
+                raise ValueError(
+                    "Cannot force an update in save() with no primary key."
+                )
+        elif not pk_set and (force_update or update_fields):
             raise ValueError("Cannot force an update in save() with no primary key.")
         updated = False
         # Skip an UPDATE when adding an instance and primary key has a default.
@@ -1187,6 +1236,8 @@ class Model(AltersData, metaclass=ModelBase):
         Try to update the model. Return True if the model was updated (if an
         update query was done and a matching row was found in the DB).
         """
+        from django import native as _native
+
         filtered = base_qs.filter(pk=pk_val)
         if not values:
             # We can end up here when saving a model in inheritance chain where
@@ -1194,6 +1245,11 @@ class Model(AltersData, metaclass=ModelBase):
             # case we just say the update succeeded. Another case ending up
             # here is a model with just PK - in that case check that the PK
             # still exists.
+            if _native.AVAILABLE:
+                kind = _native.do_update_empty_values_kind(
+                    update_fields is not None, filtered.exists()
+                )
+                return [()] if kind == 0 else []
             if update_fields is not None or filtered.exists():
                 return [()]
             return []
@@ -1429,6 +1485,8 @@ class Model(AltersData, metaclass=ModelBase):
         Check unique constraints on the model and raise ValidationError if any
         failed.
         """
+        from django import native as _native
+
         unique_checks, date_checks = self._get_unique_checks(exclude=exclude)
 
         errors = self._perform_unique_checks(unique_checks)
@@ -1437,7 +1495,10 @@ class Model(AltersData, metaclass=ModelBase):
         for k, v in date_errors.items():
             errors.setdefault(k, []).extend(v)
 
-        if errors:
+        if _native.AVAILABLE:
+            if _native.validation_has_errors(len(errors)):
+                raise ValidationError(errors)
+        elif errors:
             raise ValidationError(errors)
 
     def _get_unique_checks(self, exclude=None, include_meta_constraints=False):
@@ -1448,9 +1509,12 @@ class Model(AltersData, metaclass=ModelBase):
         in that check. Fields that did not validate should also be excluded,
         but they need to be passed in via the exclude argument.
         """
+        from django import native as _native
+
         if exclude is None:
             exclude = set()
         unique_checks = []
+        exclude_list = list(exclude)
 
         unique_togethers = [(self.__class__, self._meta.unique_together)]
         constraints = []
@@ -1468,14 +1532,24 @@ class Model(AltersData, metaclass=ModelBase):
 
         for model_class, unique_together in unique_togethers:
             for check in unique_together:
-                if not any(name in exclude for name in check):
+                if _native.AVAILABLE:
+                    if _native.unique_check_excluded(list(check), exclude_list):
+                        continue
+                    unique_checks.append((model_class, tuple(check)))
+                elif not any(name in exclude for name in check):
                     # Add the check if the field isn't excluded.
                     unique_checks.append((model_class, tuple(check)))
 
         if include_meta_constraints:
             for model_class, model_constraints in constraints:
                 for constraint in model_constraints:
-                    if not any(name in exclude for name in constraint.fields):
+                    if _native.AVAILABLE:
+                        if _native.unique_check_excluded(
+                            list(constraint.fields), exclude_list
+                        ):
+                            continue
+                        unique_checks.append((model_class, constraint.fields))
+                    elif not any(name in exclude for name in constraint.fields):
                         unique_checks.append((model_class, constraint.fields))
 
         # These are checks for the unique_for_<date/year/month>.
@@ -1509,7 +1583,10 @@ class Model(AltersData, metaclass=ModelBase):
         return unique_checks, date_checks
 
     def _perform_unique_checks(self, unique_checks):
+        from django import native as _native
+
         errors = {}
+        empty_as_null = connection.features.interprets_empty_strings_as_nulls
 
         for model_class, unique_check in unique_checks:
             # Try to look up an existing object with the same values as this
@@ -1520,9 +1597,15 @@ class Model(AltersData, metaclass=ModelBase):
                 f = self._meta.get_field(field_name)
                 lookup_value = getattr(self, f.attname)
                 # TODO: Handle multiple backends with different feature flags.
-                if lookup_value is None or (
-                    lookup_value == ""
-                    and connection.features.interprets_empty_strings_as_nulls
+                if _native.AVAILABLE:
+                    if _native.unique_lookup_skip_value(
+                        lookup_value is None,
+                        lookup_value == "",
+                        empty_as_null,
+                    ):
+                        continue
+                elif lookup_value is None or (
+                    lookup_value == "" and empty_as_null
                 ):
                     # no value, skip the lookup
                     continue
@@ -1532,7 +1615,12 @@ class Model(AltersData, metaclass=ModelBase):
                 lookup_kwargs[str(field_name)] = lookup_value
 
             # some fields were skipped, no reason to do the check
-            if len(unique_check) != len(lookup_kwargs):
+            if _native.AVAILABLE:
+                if _native.unique_check_incomplete(
+                    len(unique_check), len(lookup_kwargs)
+                ):
+                    continue
+            elif len(unique_check) != len(lookup_kwargs):
                 continue
 
             qs = model_class._default_manager.filter(**lookup_kwargs)
@@ -1547,7 +1635,12 @@ class Model(AltersData, metaclass=ModelBase):
             if not self._state.adding and self._is_pk_set(model_class._meta):
                 qs = qs.exclude(pk=model_class_pk)
             if qs.exists():
-                if len(unique_check) == 1:
+                if _native.AVAILABLE:
+                    if _native.unique_error_is_single_field(len(unique_check)):
+                        key = unique_check[0]
+                    else:
+                        key = NON_FIELD_ERRORS
+                elif len(unique_check) == 1:
                     key = unique_check[0]
                 else:
                     key = NON_FIELD_ERRORS
@@ -1670,6 +1763,8 @@ class Model(AltersData, metaclass=ModelBase):
         validate_constraints() on the model. Raise a ValidationError for any
         errors that occur.
         """
+        from django import native as _native
+
         errors = {}
         if exclude is None:
             exclude = set()
@@ -1691,7 +1786,13 @@ class Model(AltersData, metaclass=ModelBase):
         # Run unique checks, but only for fields that passed validation.
         if validate_unique:
             for name in errors:
-                if name != NON_FIELD_ERRORS and name not in exclude:
+                if _native.AVAILABLE:
+                    if (
+                        not _native.is_non_field_errors_key(name)
+                        and name not in exclude
+                    ):
+                        exclude.add(name)
+                elif name != NON_FIELD_ERRORS and name not in exclude:
                     exclude.add(name)
             try:
                 self.validate_unique(exclude=exclude)
@@ -1701,14 +1802,23 @@ class Model(AltersData, metaclass=ModelBase):
         # Run constraints checks, but only for fields that passed validation.
         if validate_constraints:
             for name in errors:
-                if name != NON_FIELD_ERRORS and name not in exclude:
+                if _native.AVAILABLE:
+                    if (
+                        not _native.is_non_field_errors_key(name)
+                        and name not in exclude
+                    ):
+                        exclude.add(name)
+                elif name != NON_FIELD_ERRORS and name not in exclude:
                     exclude.add(name)
             try:
                 self.validate_constraints(exclude=exclude)
             except ValidationError as e:
                 errors = e.update_error_dict(errors)
 
-        if errors:
+        if _native.AVAILABLE:
+            if _native.validation_has_errors(len(errors)):
+                raise ValidationError(errors)
+        elif errors:
             raise ValidationError(errors)
 
     def clean_fields(self, exclude=None):
@@ -1716,17 +1826,27 @@ class Model(AltersData, metaclass=ModelBase):
         Clean all fields and raise a ValidationError containing a dict
         of all validation errors if any occur.
         """
+        from django import native as _native
+
         if exclude is None:
             exclude = set()
 
         errors = {}
         for f in self._meta.fields:
-            if f.name in exclude or f.generated:
+            if _native.AVAILABLE:
+                if _native.clean_field_skip(f.name in exclude, bool(f.generated)):
+                    continue
+            elif f.name in exclude or f.generated:
                 continue
             # Skip validation for empty fields with blank=True. The developer
             # is responsible for making sure they have a valid value.
             raw_value = getattr(self, f.attname)
-            if f.blank and raw_value in f.empty_values:
+            if _native.AVAILABLE:
+                if _native.clean_field_skip_blank_empty(
+                    bool(f.blank), raw_value in f.empty_values
+                ):
+                    continue
+            elif f.blank and raw_value in f.empty_values:
                 continue
             # Skip validation for empty fields when db_default is used.
             if isinstance(raw_value, DatabaseDefault):
@@ -1736,7 +1856,10 @@ class Model(AltersData, metaclass=ModelBase):
             except ValidationError as e:
                 errors[f.name] = e.error_list
 
-        if errors:
+        if _native.AVAILABLE:
+            if _native.validation_has_errors(len(errors)):
+                raise ValidationError(errors)
+        elif errors:
             raise ValidationError(errors)
 
     @classmethod

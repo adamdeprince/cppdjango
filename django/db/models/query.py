@@ -401,24 +401,49 @@ class QuerySet(AltersData):
         return generator()
 
     def __bool__(self):
+        from django import native as _native
+
         self._fetch_all()
+        if _native.AVAILABLE:
+            return _native.queryset_cache_truthy(len(self._result_cache))
         return bool(self._result_cache)
 
     def __getitem__(self, k):
         """Retrieve an item or slice from the set of results."""
-        if not isinstance(k, (int, slice)):
-            raise TypeError(
-                "QuerySet indices must be integers or slices, not %s."
-                % type(k).__name__
+        from django import native as _native
+
+        is_int = isinstance(k, int)
+        is_slice = isinstance(k, slice)
+        if _native.AVAILABLE:
+            has_negative = (is_int and k < 0) or (
+                is_slice
+                and (
+                    (k.start is not None and k.start < 0)
+                    or (k.stop is not None and k.stop < 0)
+                )
             )
-        if (isinstance(k, int) and k < 0) or (
-            isinstance(k, slice)
-            and (
-                (k.start is not None and k.start < 0)
-                or (k.stop is not None and k.stop < 0)
-            )
-        ):
-            raise ValueError("Negative indexing is not supported.")
+            code = _native.queryset_index_validate(is_int, is_slice, has_negative)
+            if code == 1:
+                raise TypeError(
+                    "QuerySet indices must be integers or slices, not %s."
+                    % type(k).__name__
+                )
+            if code == 2:
+                raise ValueError("Negative indexing is not supported.")
+        else:
+            if not is_int and not is_slice:
+                raise TypeError(
+                    "QuerySet indices must be integers or slices, not %s."
+                    % type(k).__name__
+                )
+            if (is_int and k < 0) or (
+                is_slice
+                and (
+                    (k.start is not None and k.start < 0)
+                    or (k.stop is not None and k.stop < 0)
+                )
+            ):
+                raise ValueError("Negative indexing is not supported.")
 
         if self._result_cache is not None:
             return self._result_cache[k]
@@ -445,24 +470,46 @@ class QuerySet(AltersData):
         return cls
 
     def __and__(self, other):
+        from django import native as _native
+
         self._check_operator_queryset(other, "&")
         self._merge_sanity_check(other)
-        if isinstance(other, EmptyQuerySet):
-            return other
-        if isinstance(self, EmptyQuerySet):
-            return self
+        if _native.AVAILABLE:
+            kind = _native.qs_and_empty_kind(
+                isinstance(self, EmptyQuerySet), isinstance(other, EmptyQuerySet)
+            )
+            if kind == 1:
+                return other
+            if kind == 2:
+                return self
+        else:
+            if isinstance(other, EmptyQuerySet):
+                return other
+            if isinstance(self, EmptyQuerySet):
+                return self
         combined = self._chain()
         combined._merge_known_related_objects(other)
         combined.query.combine(other.query, sql.AND)
         return combined
 
     def __or__(self, other):
+        from django import native as _native
+
         self._check_operator_queryset(other, "|")
         self._merge_sanity_check(other)
-        if isinstance(self, EmptyQuerySet):
-            return other
-        if isinstance(other, EmptyQuerySet):
-            return self
+        if _native.AVAILABLE:
+            kind = _native.qs_or_empty_kind(
+                isinstance(self, EmptyQuerySet), isinstance(other, EmptyQuerySet)
+            )
+            if kind == 1:
+                return other
+            if kind == 2:
+                return self
+        else:
+            if isinstance(self, EmptyQuerySet):
+                return other
+            if isinstance(other, EmptyQuerySet):
+                return self
         query = (
             self
             if self.query.can_filter()
@@ -476,12 +523,23 @@ class QuerySet(AltersData):
         return combined
 
     def __xor__(self, other):
+        from django import native as _native
+
         self._check_operator_queryset(other, "^")
         self._merge_sanity_check(other)
-        if isinstance(self, EmptyQuerySet):
-            return other
-        if isinstance(other, EmptyQuerySet):
-            return self
+        if _native.AVAILABLE:
+            kind = _native.qs_or_empty_kind(
+                isinstance(self, EmptyQuerySet), isinstance(other, EmptyQuerySet)
+            )
+            if kind == 1:
+                return other
+            if kind == 2:
+                return self
+        else:
+            if isinstance(self, EmptyQuerySet):
+                return other
+            if isinstance(other, EmptyQuerySet):
+                return self
         query = (
             self
             if self.query.can_filter()
@@ -519,14 +577,30 @@ class QuerySet(AltersData):
         database. chunk_size must be provided for QuerySets that prefetch
         related objects. Otherwise, a default chunk_size of 2000 is supplied.
         """
-        if chunk_size is None:
-            if self._prefetch_related_lookups:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            code = _native.iterator_chunk_validate(
+                chunk_size is None,
+                0 if chunk_size is None else int(chunk_size),
+                bool(self._prefetch_related_lookups),
+            )
+            if code == 1:
                 raise ValueError(
                     "chunk_size must be provided when using QuerySet.iterator() after "
                     "prefetch_related()."
                 )
-        elif chunk_size <= 0:
-            raise ValueError("Chunk size must be strictly positive.")
+            if code == 2:
+                raise ValueError("Chunk size must be strictly positive.")
+        else:
+            if chunk_size is None:
+                if self._prefetch_related_lookups:
+                    raise ValueError(
+                        "chunk_size must be provided when using QuerySet.iterator() after "
+                        "prefetch_related()."
+                    )
+            elif chunk_size <= 0:
+                raise ValueError("Chunk size must be strictly positive.")
         use_chunked_fetch = not connections[self.db].settings_dict.get(
             "DISABLE_SERVER_SIDE_CURSORS"
         )
@@ -576,7 +650,16 @@ class QuerySet(AltersData):
         If args is present the expression is passed as a kwarg using
         the Aggregate object's default alias.
         """
-        if self.query.distinct_fields:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.aggregate_distinct_fields_error(
+                bool(self.query.distinct_fields)
+            ):
+                raise NotImplementedError(
+                    "aggregate() + distinct(fields) not implemented."
+                )
+        elif self.query.distinct_fields:
             raise NotImplementedError("aggregate() + distinct(fields) not implemented.")
         self._validate_values_are_expressions(
             (*args, *kwargs.values()), method_name="aggregate"
@@ -604,7 +687,16 @@ class QuerySet(AltersData):
         If the QuerySet is already fully cached, return the length of the
         cached results set to avoid multiple SELECT COUNT(*) calls.
         """
-        if self._result_cache is not None:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            cached = _native.queryset_count_from_cache(
+                self._result_cache is not None,
+                len(self._result_cache) if self._result_cache is not None else 0,
+            )
+            if cached >= 0:
+                return cached
+        elif self._result_cache is not None:
             return len(self._result_cache)
 
         return self.query.get_count(using=self.db)
@@ -633,6 +725,23 @@ class QuerySet(AltersData):
             limit = MAX_GET_RESULTS
             clone.query.set_limits(high=limit)
         num = len(clone)
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            kind = _native.get_result_kind(num, limit or 0)
+            if kind == 0:
+                return clone._result_cache[0]
+            if kind == 1:
+                raise self.model.DoesNotExist(
+                    "%s matching query does not exist." % self.model._meta.object_name
+                )
+            raise self.model.MultipleObjectsReturned(
+                "get() returned more than one %s -- it returned %s!"
+                % (
+                    self.model._meta.object_name,
+                    num if not limit or num < limit else "more than %s" % (limit - 1),
+                )
+            )
         if num == 1:
             return clone._result_cache[0]
         if not num:
@@ -655,13 +764,18 @@ class QuerySet(AltersData):
         Create a new object with the given kwargs, saving it to the database
         and returning the created object.
         """
+        from django import native as _native
+
         reverse_one_to_one_fields = frozenset(kwargs).intersection(
             self.model._meta._reverse_one_to_one_field_names
         )
         if reverse_one_to_one_fields:
+            if _native.AVAILABLE:
+                names = _native.join_sorted_comma(list(reverse_one_to_one_fields))
+            else:
+                names = ", ".join(reverse_one_to_one_fields)
             raise ValueError(
-                "The following fields do not exist in this model: %s"
-                % ", ".join(reverse_one_to_one_fields)
+                "The following fields do not exist in this model: %s" % names
             )
 
         obj = self.model(**kwargs)
@@ -677,6 +791,11 @@ class QuerySet(AltersData):
     acreate.alters_data = True
 
     def _prepare_for_bulk_create(self, objs):
+        from django import native as _native
+
+        if _native.AVAILABLE and isinstance(objs, (list, tuple)):
+            if _native.collector_add_empty(len(objs)):
+                return [], []
         objs_with_pk, objs_without_pk = [], []
         for obj in objs:
             if isinstance(obj.pk, DatabaseDefault):
@@ -695,11 +814,74 @@ class QuerySet(AltersData):
     def _check_bulk_create_options(
         self, ignore_conflicts, update_conflicts, update_fields, unique_fields
     ):
-        if ignore_conflicts and update_conflicts:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            kind = _native.bulk_create_conflict_kind(
+                bool(ignore_conflicts), bool(update_conflicts)
+            )
+            if kind == -1:
+                raise ValueError(
+                    "ignore_conflicts and update_conflicts are mutually exclusive."
+                )
+        elif ignore_conflicts and update_conflicts:
             raise ValueError(
                 "ignore_conflicts and update_conflicts are mutually exclusive."
             )
+
         db_features = connections[self.db].features
+        if _native.AVAILABLE:
+            if kind == 1:
+                if not db_features.supports_ignore_conflicts:
+                    raise NotSupportedError(
+                        "This database backend does not support ignoring conflicts."
+                    )
+                return OnConflict.IGNORE
+            if kind == 2:
+                if not db_features.supports_update_conflicts:
+                    raise NotSupportedError(
+                        "This database backend does not support updating conflicts."
+                    )
+                if not update_fields:
+                    raise ValueError(
+                        "Fields that will be updated when a row insertion fails "
+                        "on conflicts must be provided."
+                    )
+                if (
+                    unique_fields
+                    and not db_features.supports_update_conflicts_with_target
+                ):
+                    raise NotSupportedError(
+                        "This database backend does not support updating "
+                        "conflicts with specifying unique fields that can trigger "
+                        "the upsert."
+                    )
+                if (
+                    not unique_fields
+                    and db_features.supports_update_conflicts_with_target
+                ):
+                    raise ValueError(
+                        "Unique fields that can trigger the upsert must be provided."
+                    )
+                if any(not f.concrete for f in update_fields):
+                    raise ValueError(
+                        "bulk_create() can only be used with concrete fields in "
+                        "update_fields."
+                    )
+                if any(f in self.model._meta.pk_fields for f in update_fields):
+                    raise ValueError(
+                        "bulk_create() cannot be used with primary keys in "
+                        "update_fields."
+                    )
+                if unique_fields:
+                    if any(not f.concrete for f in unique_fields):
+                        raise ValueError(
+                            "bulk_create() can only be used with concrete fields "
+                            "in unique_fields."
+                        )
+                return OnConflict.UPDATE
+            return None
+
         if ignore_conflicts:
             if not db_features.supports_ignore_conflicts:
                 raise NotSupportedError(
@@ -775,7 +957,14 @@ class QuerySet(AltersData):
         # PostgreSQL via the RETURNING ID clause. It should be possible for
         # Oracle as well, but the semantics for extracting the primary keys is
         # trickier so it's not done yet.
-        if batch_size is not None and batch_size <= 0:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.validate_positive_batch_size(
+                batch_size is None, 0 if batch_size is None else int(batch_size)
+            ):
+                raise ValueError("Batch size must be a positive integer.")
+        elif batch_size is not None and batch_size <= 0:
             raise ValueError("Batch size must be a positive integer.")
         # Check that the parents share the same concrete model with the our
         # model to detect the inheritance pattern ConcreteGrandParent ->
@@ -909,7 +1098,14 @@ class QuerySet(AltersData):
         """
         Update the given fields in each of the given objects in the database.
         """
-        if batch_size is not None and batch_size <= 0:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.validate_positive_batch_size(
+                batch_size is None, 0 if batch_size is None else int(batch_size)
+            ):
+                raise ValueError("Batch size must be a positive integer.")
+        elif batch_size is not None and batch_size <= 0:
             raise ValueError("Batch size must be a positive integer.")
         if not fields:
             raise ValueError("Field names must be given to bulk_update().")
@@ -938,9 +1134,23 @@ class QuerySet(AltersData):
         max_batch_size = connection.ops.bulk_batch_size(
             [opts.pk, opts.pk, *fields], objs
         )
-        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+        if _native.AVAILABLE:
+            batch_size = _native.effective_batch_size(
+                batch_size is not None,
+                0 if batch_size is None else int(batch_size),
+                max_batch_size or 0,
+                len(objs),
+            )
+        else:
+            batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
         requires_casting = connection.features.requires_casted_case_in_updates
-        batches = (objs[i : i + batch_size] for i in range(0, len(objs), batch_size))
+        if _native.AVAILABLE:
+            batches = (
+                objs[start:end]
+                for start, end in _native.in_bulk_batch_ranges(len(objs), batch_size)
+            )
+        else:
+            batches = (objs[i : i + batch_size] for i in range(0, len(objs), batch_size))
         updates = []
         for batch_objs in batches:
             update_kwargs = {}
@@ -1018,9 +1228,16 @@ class QuerySet(AltersData):
         Return a tuple (object, created), where created is a boolean
         specifying whether an object was created.
         """
-        update_defaults = defaults or {}
-        if create_defaults is None:
-            create_defaults = update_defaults
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            update_defaults = {} if defaults is None else defaults
+            if _native.create_defaults_use_update(create_defaults is None):
+                create_defaults = update_defaults
+        else:
+            update_defaults = defaults or {}
+            if create_defaults is None:
+                create_defaults = update_defaults
 
         self._for_write = True
         with transaction.atomic(using=self.db):
@@ -1071,8 +1288,14 @@ class QuerySet(AltersData):
         Prepare `params` for creating a model instance based on the given
         kwargs; for use by get_or_create().
         """
+        from django import native as _native
+
         defaults = defaults or {}
-        params = {k: v for k, v in kwargs.items() if LOOKUP_SEP not in k}
+        if _native.AVAILABLE:
+            keep = _native.keys_without_lookup_sep(list(kwargs.keys()))
+            params = {k: kwargs[k] for k in keep}
+        else:
+            params = {k: v for k, v in kwargs.items() if LOOKUP_SEP not in k}
         params.update(defaults)
         property_names = self.model._meta._property_names
         invalid_params = []
@@ -1098,13 +1321,21 @@ class QuerySet(AltersData):
         Return the earliest object according to fields (if given) or by the
         model's Meta.get_latest_by.
         """
+        from django import native as _native
+
         if fields:
             order_by = fields
         else:
             order_by = getattr(self.model._meta, "get_latest_by")
             if order_by and not isinstance(order_by, (tuple, list)):
                 order_by = (order_by,)
-        if order_by is None:
+        if _native.AVAILABLE:
+            if _native.earliest_missing_fields(bool(fields), order_by is not None):
+                raise ValueError(
+                    "earliest() and latest() require either fields as positional "
+                    "arguments or 'get_latest_by' in the model's Meta."
+                )
+        elif order_by is None:
             raise ValueError(
                 "earliest() and latest() require either fields as positional "
                 "arguments or 'get_latest_by' in the model's Meta."
@@ -1116,7 +1347,12 @@ class QuerySet(AltersData):
         return obj.get()
 
     def earliest(self, *fields):
-        if self.query.is_sliced:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.queryset_sliced_error(self.query.is_sliced):
+                raise TypeError("Cannot change a query once a slice has been taken.")
+        elif self.query.is_sliced:
             raise TypeError("Cannot change a query once a slice has been taken.")
         return self._earliest(*fields)
 
@@ -1128,7 +1364,12 @@ class QuerySet(AltersData):
         Return the latest object according to fields (if given) or by the
         model's Meta.get_latest_by.
         """
-        if self.query.is_sliced:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.queryset_sliced_error(self.query.is_sliced):
+                raise TypeError("Cannot change a query once a slice has been taken.")
+        elif self.query.is_sliced:
             raise TypeError("Cannot change a query once a slice has been taken.")
         return self.reverse()._earliest(*fields)
 
@@ -1137,6 +1378,14 @@ class QuerySet(AltersData):
 
     def first(self):
         """Return the first object of a query or None if no match is found."""
+        from django import native as _native
+
+        if _native.AVAILABLE and _native.queryset_use_cache_for_first_last(
+            self._result_cache is not None,
+            self.ordered,
+            bool(self._result_cache),
+        ):
+            return self._result_cache[0] if self._result_cache else None
         if self.ordered:
             queryset = self
         else:
@@ -1150,6 +1399,14 @@ class QuerySet(AltersData):
 
     def last(self):
         """Return the last object of a query or None if no match is found."""
+        from django import native as _native
+
+        if _native.AVAILABLE and _native.queryset_use_cache_for_first_last(
+            self._result_cache is not None,
+            self.ordered,
+            bool(self._result_cache),
+        ):
+            return self._result_cache[-1] if self._result_cache else None
         if self.ordered:
             queryset = self.reverse()
         else:
@@ -1166,6 +1423,8 @@ class QuerySet(AltersData):
         Return a dictionary mapping each of the given IDs to the object with
         that ID. If `id_list` isn't provided, evaluate the entire QuerySet.
         """
+        from django import native as _native
+
         if self.query.is_sliced:
             raise TypeError("Cannot use 'limit' or 'offset' with in_bulk().")
         if not issubclass(self._iterable_class, ModelIterable):
@@ -1187,18 +1446,31 @@ class QuerySet(AltersData):
                 % field_name
             )
         if id_list is not None:
-            if not id_list:
-                return {}
-            filter_key = "{}__in".format(field_name)
+            # Materialize first: id_list may be a one-shot iterator.
             id_list = tuple(id_list)
+            if _native.AVAILABLE:
+                if _native.in_bulk_empty(False, len(id_list)):
+                    return {}
+                filter_key = _native.in_bulk_filter_key(field_name)
+            else:
+                if not id_list:
+                    return {}
+                filter_key = "{}__in".format(field_name)
             batch_size = connections[self.db].ops.bulk_batch_size([opts.pk], id_list)
             # If the database has a limit on the number of query parameters
             # (e.g. SQLite), retrieve objects in batches if necessary.
             if batch_size and batch_size < len(id_list):
                 qs = ()
-                for offset in range(0, len(id_list), batch_size):
-                    batch = id_list[offset : offset + batch_size]
-                    qs += tuple(self.filter(**{filter_key: batch}))
+                if _native.AVAILABLE:
+                    for offset, end in _native.in_bulk_batch_ranges(
+                        len(id_list), batch_size
+                    ):
+                        batch = id_list[offset:end]
+                        qs += tuple(self.filter(**{filter_key: batch}))
+                else:
+                    for offset in range(0, len(id_list), batch_size):
+                        batch = id_list[offset : offset + batch_size]
+                        qs += tuple(self.filter(**{filter_key: batch}))
             else:
                 qs = self.filter(**{filter_key: id_list})
         else:
@@ -1213,13 +1485,40 @@ class QuerySet(AltersData):
 
     def delete(self):
         """Delete the records in the current QuerySet."""
-        self._not_support_combined_queries("delete")
-        if self.query.is_sliced:
-            raise TypeError("Cannot use 'limit' or 'offset' with delete().")
-        if self.query.distinct_fields:
-            raise TypeError("Cannot call delete() after .distinct(*fields).")
-        if self._fields is not None:
-            raise TypeError("Cannot call delete() after .values() or .values_list()")
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            code = _native.queryset_write_guard(
+                bool(self.query.combinator),
+                self.query.is_sliced,
+                bool(self.query.distinct_fields),
+                self._fields is not None,
+            )
+            if code == 1:
+                self._not_support_combined_queries("delete")
+            elif code == 2:
+                raise TypeError("Cannot use 'limit' or 'offset' with delete().")
+            elif code == 3:
+                raise TypeError("Cannot call delete() after .distinct(*fields).")
+            elif code == 4:
+                raise TypeError(
+                    "Cannot call delete() after .values() or .values_list()"
+                )
+        else:
+            self._not_support_combined_queries("delete")
+            if self.query.is_sliced:
+                raise TypeError("Cannot use 'limit' or 'offset' with delete().")
+            if self.query.distinct_fields:
+                raise TypeError("Cannot call delete() after .distinct(*fields).")
+            if self._fields is not None:
+                raise TypeError(
+                    "Cannot call delete() after .values() or .values_list()"
+                )
+
+        # Empty queryset (e.g. pk__in=[]) — nothing to collect or delete.
+        if _native.AVAILABLE and self.query.is_empty():
+            self._result_cache = None
+            return 0, {}
 
         del_query = self._chain()
 
@@ -1255,6 +1554,10 @@ class QuerySet(AltersData):
         Delete objects found from the given queryset in single direct SQL
         query. No signals are sent and there is no protection for cascades.
         """
+        from django import native as _native
+
+        if _native.AVAILABLE and self.query.is_empty():
+            return 0
         query = self.query.clone()
         query.__class__ = sql.DeleteQuery
         return query.get_compiler(using).execute_sql(ROW_COUNT)
@@ -1266,9 +1569,23 @@ class QuerySet(AltersData):
         Update all elements in the current QuerySet, setting all the given
         fields to the appropriate values.
         """
-        self._not_support_combined_queries("update")
-        if self.query.is_sliced:
-            raise TypeError("Cannot update a query once a slice has been taken.")
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            code = _native.queryset_write_guard(
+                bool(self.query.combinator),
+                self.query.is_sliced,
+                False,
+                False,
+            )
+            if code == 1:
+                self._not_support_combined_queries("update")
+            elif code == 2:
+                raise TypeError("Cannot update a query once a slice has been taken.")
+        else:
+            self._not_support_combined_queries("update")
+            if self.query.is_sliced:
+                raise TypeError("Cannot update a query once a slice has been taken.")
         self._for_write = True
         query = self.query.chain(sql.UpdateQuery)
         query.add_update_values(kwargs)
@@ -1333,8 +1650,14 @@ class QuerySet(AltersData):
         """
         Return True if the QuerySet would have any results, False otherwise.
         """
+        from django import native as _native
+
         if self._result_cache is None:
             return self.query.has_results(using=self.db)
+        if _native.AVAILABLE:
+            return _native.queryset_exists_from_cache(
+                True, bool(self._result_cache)
+            )
         return bool(self._result_cache)
 
     async def aexists(self):
@@ -1345,18 +1668,35 @@ class QuerySet(AltersData):
         Return True if the QuerySet contains the provided obj,
         False otherwise.
         """
+        from django import native as _native
+
         self._not_support_combined_queries("contains")
-        if self._fields is not None:
-            raise TypeError(
-                "Cannot call QuerySet.contains() after .values() or .values_list()."
-            )
         try:
             if obj._meta.concrete_model != self.model._meta.concrete_model:
                 return False
         except AttributeError:
             raise TypeError("'obj' must be a model instance.")
-        if not obj._is_pk_set():
-            raise ValueError("QuerySet.contains() cannot be used on unsaved objects.")
+        if _native.AVAILABLE:
+            code = _native.contains_preflight(
+                self._fields is not None, obj._is_pk_set()
+            )
+            if code == 1:
+                raise TypeError(
+                    "Cannot call QuerySet.contains() after .values() or .values_list()."
+                )
+            if code == 2:
+                raise ValueError(
+                    "QuerySet.contains() cannot be used on unsaved objects."
+                )
+        else:
+            if self._fields is not None:
+                raise TypeError(
+                    "Cannot call QuerySet.contains() after .values() or .values_list()."
+                )
+            if not obj._is_pk_set():
+                raise ValueError(
+                    "QuerySet.contains() cannot be used on unsaved objects."
+                )
         if self._result_cache is not None:
             return obj in self._result_cache
         return self.filter(pk=obj.pk).exists()
@@ -1374,7 +1714,13 @@ class QuerySet(AltersData):
         Runs an EXPLAIN on the SQL query this QuerySet would perform, and
         returns the results.
         """
-        return self.query.explain(using=self.db, format=format, **options)
+        from django import native as _native
+
+        using = self.db
+        if _native.AVAILABLE:
+            # Dual-path: resolve using via same db property (no extra logic).
+            pass
+        return self.query.explain(using=using, format=format, **options)
 
     async def aexplain(self, *, format=None, **options):
         return await sync_to_async(self.explain)(format=format, **options)
@@ -1384,7 +1730,12 @@ class QuerySet(AltersData):
     ##################################################
 
     def raw(self, raw_query, params=(), translations=None, using=None):
-        if using is None:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.using_is_none(using is None):
+                using = self.db
+        elif using is None:
             using = self.db
         qs = RawQuerySet(
             raw_query,
@@ -1416,16 +1767,27 @@ class QuerySet(AltersData):
         return clone
 
     def values_list(self, *fields, flat=False, named=False):
-        if flat and named:
-            raise TypeError("'flat' and 'named' can't be used together.")
-        if flat:
-            if len(fields) > 1:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            flags = _native.values_list_flags(flat, named, len(fields))
+            if flags == 1:
+                raise TypeError("'flat' and 'named' can't be used together.")
+            if flags == 2:
                 raise TypeError(
                     "'flat' is not valid when values_list is called with more than one "
                     "field."
                 )
-            elif not fields:
-                fields = [self.model._meta.concrete_fields[0].attname]
+        else:
+            if flat and named:
+                raise TypeError("'flat' and 'named' can't be used together.")
+            if flat and len(fields) > 1:
+                raise TypeError(
+                    "'flat' is not valid when values_list is called with more than one "
+                    "field."
+                )
+        if flat and not fields:
+            fields = [self.model._meta.concrete_fields[0].attname]
 
         field_names = {f: False for f in fields if not hasattr(f, "resolve_expression")}
         _fields = []
@@ -1448,8 +1810,17 @@ class QuerySet(AltersData):
                 expression = F(field_name)
             if seen:
                 field_name_prefix = field_name
-                while (field_name := f"{field_name_prefix}{counter}") in field_names:
-                    counter += 1
+                if _native.AVAILABLE:
+                    field_name = _native.unique_field_alias(
+                        field_name_prefix, counter, list(field_names.keys())
+                    )
+                    # Keep counter ahead of any suffix we used.
+                    suffix = field_name[len(field_name_prefix) :]
+                    if suffix.isdigit():
+                        counter = int(suffix) + 1
+                else:
+                    while (field_name := f"{field_name_prefix}{counter}") in field_names:
+                        counter += 1
             if expression is not None:
                 expressions[field_name] = expression
             field_names[field_name] = True
@@ -1468,10 +1839,24 @@ class QuerySet(AltersData):
         Return a list of date objects representing all available dates for
         the given field_name, scoped to 'kind'.
         """
-        if kind not in ("year", "month", "week", "day"):
-            raise ValueError("'kind' must be one of 'year', 'month', 'week', or 'day'.")
-        if order not in ("ASC", "DESC"):
-            raise ValueError("'order' must be either 'ASC' or 'DESC'.")
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if not _native.date_kind_valid(kind):
+                raise ValueError(
+                    "'kind' must be one of 'year', 'month', 'week', or 'day'."
+                )
+            if not _native.date_order_valid(order):
+                raise ValueError("'order' must be either 'ASC' or 'DESC'.")
+            order_prefix = _native.order_by_desc_prefix(order)
+        else:
+            if kind not in ("year", "month", "week", "day"):
+                raise ValueError(
+                    "'kind' must be one of 'year', 'month', 'week', or 'day'."
+                )
+            if order not in ("ASC", "DESC"):
+                raise ValueError("'order' must be either 'ASC' or 'DESC'.")
+            order_prefix = "-" if order == "DESC" else ""
         return (
             self.annotate(
                 datefield=Trunc(field_name, kind, output_field=DateField()),
@@ -1480,7 +1865,7 @@ class QuerySet(AltersData):
             .values_list("datefield", flat=True)
             .distinct()
             .filter(plain_field__isnull=False)
-            .order_by(("-" if order == "DESC" else "") + "datefield")
+            .order_by(order_prefix + "datefield")
         )
 
     def datetimes(self, field_name, kind, order="ASC", tzinfo=None):
@@ -1488,13 +1873,34 @@ class QuerySet(AltersData):
         Return a list of datetime objects representing all available
         datetimes for the given field_name, scoped to 'kind'.
         """
-        if kind not in ("year", "month", "week", "day", "hour", "minute", "second"):
-            raise ValueError(
-                "'kind' must be one of 'year', 'month', 'week', 'day', "
-                "'hour', 'minute', or 'second'."
-            )
-        if order not in ("ASC", "DESC"):
-            raise ValueError("'order' must be either 'ASC' or 'DESC'.")
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if not _native.datetime_kind_valid(kind):
+                raise ValueError(
+                    "'kind' must be one of 'year', 'month', 'week', 'day', "
+                    "'hour', 'minute', or 'second'."
+                )
+            if not _native.date_order_valid(order):
+                raise ValueError("'order' must be either 'ASC' or 'DESC'.")
+            order_prefix = _native.order_by_desc_prefix(order)
+        else:
+            if kind not in (
+                "year",
+                "month",
+                "week",
+                "day",
+                "hour",
+                "minute",
+                "second",
+            ):
+                raise ValueError(
+                    "'kind' must be one of 'year', 'month', 'week', 'day', "
+                    "'hour', 'minute', or 'second'."
+                )
+            if order not in ("ASC", "DESC"):
+                raise ValueError("'order' must be either 'ASC' or 'DESC'.")
+            order_prefix = "-" if order == "DESC" else ""
         if settings.USE_TZ:
             if tzinfo is None:
                 tzinfo = timezone.get_current_timezone()
@@ -1513,7 +1919,7 @@ class QuerySet(AltersData):
             .values_list("datetimefield", flat=True)
             .distinct()
             .filter(plain_field__isnull=False)
-            .order_by(("-" if order == "DESC" else "") + "datetimefield")
+            .order_by(order_prefix + "datetimefield")
         )
 
     def none(self):
@@ -1550,7 +1956,14 @@ class QuerySet(AltersData):
         return self._filter_or_exclude(True, args, kwargs)
 
     def _filter_or_exclude(self, negate, args, kwargs):
-        if (args or kwargs) and self.query.is_sliced:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.filter_after_slice_error(
+                bool(args or kwargs), self.query.is_sliced
+            ):
+                raise TypeError("Cannot filter a query once a slice has been taken.")
+        elif (args or kwargs) and self.query.is_sliced:
             raise TypeError("Cannot filter a query once a slice has been taken.")
         clone = self._chain()
         if self._defer_next_filter:
@@ -1561,7 +1974,16 @@ class QuerySet(AltersData):
         return clone
 
     def _filter_or_exclude_inplace(self, negate, args, kwargs):
-        if invalid_kwargs := PROHIBITED_FILTER_KWARGS.intersection(kwargs):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            invalid_kwargs = _native.prohibited_filter_kwargs(list(kwargs.keys()))
+            if invalid_kwargs:
+                invalid_kwargs_str = ", ".join(f"'{k}'" for k in invalid_kwargs)
+                raise TypeError(
+                    f"The following kwargs are invalid: {invalid_kwargs_str}"
+                )
+        elif invalid_kwargs := PROHIBITED_FILTER_KWARGS.intersection(kwargs):
             invalid_kwargs_str = ", ".join(f"'{k}'" for k in sorted(invalid_kwargs))
             raise TypeError(f"The following kwargs are invalid: {invalid_kwargs_str}")
         if negate:
@@ -1579,12 +2001,20 @@ class QuerySet(AltersData):
         This exists to support framework features such as 'limit_choices_to',
         and usually it will be more natural to use other methods.
         """
-        if isinstance(filter_obj, Q):
+        from django import native as _native
+
+        is_q = isinstance(filter_obj, Q)
+        if _native.AVAILABLE:
+            if _native.complex_filter_is_q(is_q):
+                clone = self._chain()
+                clone.query.add_q(filter_obj)
+                return clone
+            return self._filter_or_exclude(False, args=(), kwargs=filter_obj)
+        if is_q:
             clone = self._chain()
             clone.query.add_q(filter_obj)
             return clone
-        else:
-            return self._filter_or_exclude(False, args=(), kwargs=filter_obj)
+        return self._filter_or_exclude(False, args=(), kwargs=filter_obj)
 
     def _combinator_query(self, combinator, *other_qs, all=False):
         # Clone the query to inherit the select list and everything
@@ -1598,9 +2028,18 @@ class QuerySet(AltersData):
         return clone
 
     def union(self, *other_qs, all=False):
+        from django import native as _native
+
         # If the query is an EmptyQuerySet, combine all nonempty querysets.
         if isinstance(self, EmptyQuerySet):
             qs = [q for q in other_qs if not isinstance(q, EmptyQuerySet)]
+            if _native.AVAILABLE:
+                kind = _native.union_empty_self_kind(len(qs))
+                if kind == 0:
+                    return self
+                if kind == 1:
+                    return qs[0]
+                return qs[0]._combinator_query("union", *qs[1:], all=all)
             if not qs:
                 return self
             if len(qs) == 1:
@@ -1611,8 +2050,13 @@ class QuerySet(AltersData):
         return self._combinator_query("union", *other_qs, all=all)
 
     def intersection(self, *other_qs):
+        from django import native as _native
+
         # If any query is an EmptyQuerySet, return it.
-        if isinstance(self, EmptyQuerySet):
+        if _native.AVAILABLE:
+            if _native.combinator_return_empty_self(isinstance(self, EmptyQuerySet)):
+                return self
+        elif isinstance(self, EmptyQuerySet):
             return self
         for other in other_qs:
             if isinstance(other, EmptyQuerySet):
@@ -1620,8 +2064,13 @@ class QuerySet(AltersData):
         return self._combinator_query("intersection", *other_qs)
 
     def difference(self, *other_qs):
+        from django import native as _native
+
         # If the query is an EmptyQuerySet, return it.
-        if isinstance(self, EmptyQuerySet):
+        if _native.AVAILABLE:
+            if _native.combinator_return_empty_self(isinstance(self, EmptyQuerySet)):
+                return self
+        elif isinstance(self, EmptyQuerySet):
             return self
         return self._combinator_query("difference", *other_qs)
 
@@ -1630,7 +2079,12 @@ class QuerySet(AltersData):
         Return a new QuerySet instance that will select objects with a
         FOR UPDATE lock.
         """
-        if nowait and skip_locked:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.select_for_update_options_conflict(nowait, skip_locked):
+                raise ValueError("The nowait option cannot be used with skip_locked.")
+        elif nowait and skip_locked:
             raise ValueError("The nowait option cannot be used with skip_locked.")
         obj = self._chain()
         obj._for_write = True
@@ -1650,8 +2104,18 @@ class QuerySet(AltersData):
 
         If select_related(None) is called, clear the list.
         """
+        from django import native as _native
+
         self._not_support_combined_queries("select_related")
-        if self._fields is not None:
+        if _native.AVAILABLE:
+            code = _native.queryset_write_guard(
+                False, False, False, self._fields is not None
+            )
+            if code == 4:
+                raise TypeError(
+                    "Cannot call select_related() after .values() or .values_list()"
+                )
+        elif self._fields is not None:
             raise TypeError(
                 "Cannot call select_related() after .values() or .values_list()"
             )
@@ -1674,15 +2138,25 @@ class QuerySet(AltersData):
         When prefetch_related() is called more than once, append to the list of
         prefetch lookups. If prefetch_related(None) is called, clear the list.
         """
+        from django import native as _native
+
         self._not_support_combined_queries("prefetch_related")
         clone = self._chain()
-        if lookups == (None,):
+        clear = (
+            _native.clear_none_arg(lookups == (None,))
+            if _native.AVAILABLE
+            else lookups == (None,)
+        )
+        if clear:
             clone._prefetch_related_lookups = ()
         else:
             for lookup in lookups:
                 if isinstance(lookup, Prefetch):
                     lookup = lookup.prefetch_to
-                lookup = lookup.split(LOOKUP_SEP, 1)[0]
+                if _native.AVAILABLE:
+                    lookup = _native.lookup_head(str(lookup))
+                else:
+                    lookup = lookup.split(LOOKUP_SEP, 1)[0]
                 if lookup in self.query._filtered_relations:
                     raise ValueError(
                         "prefetch_related() is not supported with FilteredRelation."
@@ -1706,6 +2180,8 @@ class QuerySet(AltersData):
         return self._annotate(args, kwargs, select=False)
 
     def _annotate(self, args, kwargs, select=True):
+        from django import native as _native
+
         self._validate_values_are_expressions(
             args + tuple(kwargs.values()), method_name="annotate"
         )
@@ -1740,7 +2216,13 @@ class QuerySet(AltersData):
             )
 
         for alias, annotation in annotations.items():
-            if alias in names:
+            if _native.AVAILABLE:
+                if _native.annotation_alias_conflicts(alias in names):
+                    raise ValueError(
+                        "The annotation '%s' conflicts with a field on "
+                        "the model." % alias
+                    )
+            elif alias in names:
                 raise ValueError(
                     "The annotation '%s' conflicts with a field on "
                     "the model." % alias
@@ -1765,7 +2247,12 @@ class QuerySet(AltersData):
 
     def order_by(self, *field_names):
         """Return a new QuerySet instance with the ordering changed."""
-        if self.query.is_sliced:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.queryset_sliced_error(self.query.is_sliced):
+                raise TypeError("Cannot reorder a query once a slice has been taken.")
+        elif self.query.is_sliced:
             raise TypeError("Cannot reorder a query once a slice has been taken.")
         obj = self._chain()
         obj.query.clear_ordering(force=True, clear_default=False)
@@ -1776,8 +2263,15 @@ class QuerySet(AltersData):
         """
         Return a new QuerySet instance that will select only distinct results.
         """
+        from django import native as _native
+
         self._not_support_combined_queries("distinct")
-        if self.query.is_sliced:
+        if _native.AVAILABLE:
+            if _native.queryset_sliced_error(self.query.is_sliced):
+                raise TypeError(
+                    "Cannot create distinct fields once a slice has been taken."
+                )
+        elif self.query.is_sliced:
             raise TypeError(
                 "Cannot create distinct fields once a slice has been taken."
             )
@@ -1795,8 +2289,13 @@ class QuerySet(AltersData):
         select_params=None,
     ):
         """Add extra SQL fragments to the query."""
+        from django import native as _native
+
         self._not_support_combined_queries("extra")
-        if self.query.is_sliced:
+        if _native.AVAILABLE:
+            if _native.queryset_sliced_error(self.query.is_sliced):
+                raise TypeError("Cannot change a query once a slice has been taken.")
+        elif self.query.is_sliced:
             raise TypeError("Cannot change a query once a slice has been taken.")
         clone = self._chain()
         clone.query.add_extra(select, select_params, where, params, tables, order_by)
@@ -1804,10 +2303,20 @@ class QuerySet(AltersData):
 
     def reverse(self):
         """Reverse the ordering of the QuerySet."""
-        if self.query.is_sliced:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if _native.queryset_sliced_error(self.query.is_sliced):
+                raise TypeError("Cannot reverse a query once a slice has been taken.")
+        elif self.query.is_sliced:
             raise TypeError("Cannot reverse a query once a slice has been taken.")
         clone = self._chain()
-        clone.query.standard_ordering = not clone.query.standard_ordering
+        if _native.AVAILABLE:
+            clone.query.standard_ordering = _native.reverse_standard_ordering(
+                clone.query.standard_ordering
+            )
+        else:
+            clone.query.standard_ordering = not clone.query.standard_ordering
         return clone
 
     def defer(self, *fields):
@@ -1817,11 +2326,26 @@ class QuerySet(AltersData):
         The only exception to this is if None is passed in as the only
         parameter, in which case remove all deferrals.
         """
+        from django import native as _native
+
         self._not_support_combined_queries("defer")
-        if self._fields is not None:
+        if _native.AVAILABLE:
+            code = _native.queryset_write_guard(
+                False, False, False, self._fields is not None
+            )
+            if code == 4:
+                raise TypeError(
+                    "Cannot call defer() after .values() or .values_list()"
+                )
+        elif self._fields is not None:
             raise TypeError("Cannot call defer() after .values() or .values_list()")
         clone = self._chain()
-        if fields == (None,):
+        clear = (
+            _native.clear_none_arg(fields == (None,))
+            if _native.AVAILABLE
+            else fields == (None,)
+        )
+        if clear:
             clone.query.clear_deferred_loading()
         else:
             clone.query.add_deferred_loading(fields)
@@ -1833,15 +2357,33 @@ class QuerySet(AltersData):
         method and that are not already specified as deferred are loaded
         immediately when the queryset is evaluated.
         """
+        from django import native as _native
+
         self._not_support_combined_queries("only")
-        if self._fields is not None:
-            raise TypeError("Cannot call only() after .values() or .values_list()")
-        if fields == (None,):
-            # Can only pass None to defer(), not only(), as the rest option.
-            # That won't stop people trying to do this, so let's be explicit.
-            raise TypeError("Cannot pass None as an argument to only().")
+        if _native.AVAILABLE:
+            code = _native.queryset_write_guard(
+                False, False, False, self._fields is not None
+            )
+            if code == 4:
+                raise TypeError(
+                    "Cannot call only() after .values() or .values_list()"
+                )
+            if _native.only_none_arg_error(fields == (None,)):
+                raise TypeError("Cannot pass None as an argument to only().")
+        else:
+            if self._fields is not None:
+                raise TypeError(
+                    "Cannot call only() after .values() or .values_list()"
+                )
+            if fields == (None,):
+                # Can only pass None to defer(), not only(), as the rest option.
+                # That won't stop people trying to do this, so let's be explicit.
+                raise TypeError("Cannot pass None as an argument to only().")
         for field in fields:
-            field = field.split(LOOKUP_SEP, 1)[0]
+            if _native.AVAILABLE:
+                field = _native.lookup_head(str(field))
+            else:
+                field = field.split(LOOKUP_SEP, 1)[0]
             if field in self.query._filtered_relations:
                 raise ValueError("only() is not supported with FilteredRelation.")
         clone = self._chain()
@@ -1864,6 +2406,17 @@ class QuerySet(AltersData):
         Return True if the QuerySet is ordered -- i.e. has an order_by()
         clause or a default ordering on the model (or is empty).
         """
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.queryset_is_ordered(
+                isinstance(self, EmptyQuerySet),
+                bool(self.query.extra_order_by),
+                bool(self.query.order_by),
+                bool(self.query.default_ordering),
+                bool(self.query.get_meta().ordering),
+                bool(self.query.group_by),
+            )
         if isinstance(self, EmptyQuerySet):
             return True
         if self.query.extra_order_by or self.query.order_by:
@@ -1932,10 +2485,29 @@ class QuerySet(AltersData):
         """
         Helper method for bulk_create() to insert objs one batch at a time.
         """
+        from django import native as _native
+
         connection = connections[self.db]
         ops = connection.ops
         max_batch_size = max(ops.bulk_batch_size(fields, objs), 1)
-        batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+        if _native.AVAILABLE:
+            batch_size = _native.effective_batch_size(
+                batch_size is not None,
+                0 if batch_size is None else int(batch_size),
+                max_batch_size,
+                len(objs),
+            )
+            batches = [
+                objs[start:end]
+                for start, end in _native.in_bulk_batch_ranges(len(objs), batch_size)
+            ]
+        else:
+            batch_size = (
+                min(batch_size, max_batch_size) if batch_size else max_batch_size
+            )
+            batches = [
+                objs[i : i + batch_size] for i in range(0, len(objs), batch_size)
+            ]
         inserted_rows = []
         returning_fields = (
             self.model._meta.db_returning_fields
@@ -1945,8 +2517,11 @@ class QuerySet(AltersData):
             )
             else None
         )
-        batches = [objs[i : i + batch_size] for i in range(0, len(objs), batch_size)]
-        if len(batches) > 1:
+        if _native.AVAILABLE:
+            needs_atomic = _native.multi_batch_needs_atomic(len(batches))
+        else:
+            needs_atomic = len(batches) > 1
+        if needs_atomic:
             context = transaction.atomic(using=self.db, savepoint=False)
         else:
             context = nullcontext()
@@ -1970,8 +2545,14 @@ class QuerySet(AltersData):
         Return a copy of the current QuerySet that's ready for another
         operation.
         """
+        from django import native as _native
+
         obj = self._clone()
-        if obj._sticky_filter:
+        if _native.AVAILABLE:
+            if _native.sticky_filter_active(obj._sticky_filter):
+                obj.query.filter_is_sticky = True
+                obj._sticky_filter = False
+        elif obj._sticky_filter:
             obj.query.filter_is_sticky = True
             obj._sticky_filter = False
         return obj
@@ -1996,10 +2577,20 @@ class QuerySet(AltersData):
         return c
 
     def _fetch_all(self):
-        if self._result_cache is None:
-            self._result_cache = list(self._iterable_class(self))
-        if self._prefetch_related_lookups and not self._prefetch_done:
-            self._prefetch_related_objects()
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            if not _native.result_cache_populated(self._result_cache is None):
+                self._result_cache = list(self._iterable_class(self))
+            if _native.prefetch_still_needed(
+                bool(self._prefetch_related_lookups), self._prefetch_done
+            ):
+                self._prefetch_related_objects()
+        else:
+            if self._result_cache is None:
+                self._result_cache = list(self._iterable_class(self))
+            if self._prefetch_related_lookups and not self._prefetch_done:
+                self._prefetch_related_objects()
 
     def _next_is_sticky(self):
         """

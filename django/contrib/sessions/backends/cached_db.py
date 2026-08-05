@@ -4,6 +4,7 @@ Cached, database-backed sessions.
 
 import logging
 
+from django import native as _native
 from django.conf import settings
 from django.contrib.sessions.backends.db import SessionStore as DBStore
 from django.core.cache import caches
@@ -26,10 +27,21 @@ class SessionStore(DBStore):
 
     @property
     def cache_key(self):
-        return self.cache_key_prefix + self._get_or_create_session_key()
+        key = self._get_or_create_session_key()
+        if _native.AVAILABLE:
+            return _native.session_cache_key(self.cache_key_prefix, key)
+        return self.cache_key_prefix + key
 
     async def acache_key(self):
-        return self.cache_key_prefix + await self._aget_or_create_session_key()
+        key = await self._aget_or_create_session_key()
+        if _native.AVAILABLE:
+            return _native.session_cache_key(self.cache_key_prefix, key)
+        return self.cache_key_prefix + key
+
+    def _prefixed_session_key(self, session_key):
+        if _native.AVAILABLE:
+            return _native.session_cache_key(self.cache_key_prefix, session_key)
+        return self.cache_key_prefix + session_key
 
     def load(self):
         try:
@@ -72,16 +84,20 @@ class SessionStore(DBStore):
         return data
 
     def exists(self, session_key):
+        if _native.AVAILABLE and _native.session_key_missing(session_key or ""):
+            return False
         return (
             session_key
-            and (self.cache_key_prefix + session_key) in self._cache
+            and self._prefixed_session_key(session_key) in self._cache
             or super().exists(session_key)
         )
 
     async def aexists(self, session_key):
+        if _native.AVAILABLE and _native.session_key_missing(session_key or ""):
+            return False
         return (
             session_key
-            and (self.cache_key_prefix + session_key) in self._cache
+            and self._prefixed_session_key(session_key) in self._cache
             or await super().aexists(session_key)
         )
 
@@ -109,7 +125,9 @@ class SessionStore(DBStore):
             if self.session_key is None:
                 return
             session_key = self.session_key
-        self._cache.delete(self.cache_key_prefix + session_key)
+        if _native.AVAILABLE and _native.session_key_missing(session_key or ""):
+            return
+        self._cache.delete(self._prefixed_session_key(session_key))
 
     async def adelete(self, session_key=None):
         await super().adelete(session_key)
@@ -117,7 +135,9 @@ class SessionStore(DBStore):
             if self.session_key is None:
                 return
             session_key = self.session_key
-        await self._cache.adelete(self.cache_key_prefix + session_key)
+        if _native.AVAILABLE and _native.session_key_missing(session_key or ""):
+            return
+        await self._cache.adelete(self._prefixed_session_key(session_key))
 
     def flush(self):
         """

@@ -38,6 +38,10 @@ def builtin_template_path(name):
     Avoid calling this function at the module level or in a class-definition
     because __file__ may not exist, e.g. in frozen environments.
     """
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        name = _native.debug_template_path(name)
     return Path(__file__).parent / "templates" / name
 
 

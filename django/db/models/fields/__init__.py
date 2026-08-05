@@ -252,13 +252,21 @@ class Field(RegisterLookupMixin):
         """
         if not hasattr(self, "model"):
             return super().__str__()
+        from django import native as _native
+
         model = self.model
+        if _native.AVAILABLE:
+            return _native.field_str(model._meta.label, self.name)
         return "%s.%s" % (model._meta.label, self.name)
 
     def __repr__(self):
         """Display the module, class, and name of the field."""
+        from django import native as _native
+
         path = "%s.%s" % (self.__class__.__module__, self.__class__.__qualname__)
         name = getattr(self, "name", None)
+        if _native.AVAILABLE:
+            return _native.field_repr(path, name is not None, name or "")
         if name is not None:
             return "<%s: %s>" % (path, name)
         return "<%s>" % path
@@ -282,6 +290,10 @@ class Field(RegisterLookupMixin):
         underscore, 2) does not contain "__" and 3) is not "pk".
         """
         if self.name is None:
+            return []
+        from django import native as _native
+
+        if _native.AVAILABLE and _native.field_name_check_code(self.name) == 0:
             return []
         if self.name.endswith("_"):
             return [
@@ -935,11 +947,16 @@ class Field(RegisterLookupMixin):
         return self.has_db_default()
 
     def set_attributes_from_name(self, name):
+        from django import native as _native
+
         self.name = self.name or name
         self.attname, self.column = self.get_attname_column()
         self.concrete = self.column is not None
         if self.verbose_name is None and self.name:
-            self.verbose_name = self.name.replace("_", " ")
+            if _native.AVAILABLE:
+                self.verbose_name = _native.verbose_name_from_name(self.name)
+            else:
+                self.verbose_name = self.name.replace("_", " ")
 
     def contribute_to_class(self, cls, name, private_only=False):
         """
@@ -958,10 +975,16 @@ class Field(RegisterLookupMixin):
             # this class, but don't check methods derived from inheritance, to
             # allow overriding inherited choices. For more complex inheritance
             # structures users should override contribute_to_class().
-            if "get_%s_display" % self.name not in cls.__dict__:
+            from django import native as _native
+
+            if _native.AVAILABLE:
+                display_name = _native.field_display_method_name(self.name)
+            else:
+                display_name = "get_%s_display" % self.name
+            if display_name not in cls.__dict__:
                 setattr(
                     cls,
-                    "get_%s_display" % self.name,
+                    display_name,
                     partialmethod(cls._get_FIELD_display, field=self),
                 )
 
@@ -976,8 +999,13 @@ class Field(RegisterLookupMixin):
         return self.name
 
     def get_attname_column(self):
+        from django import native as _native
+
         attname = self.get_attname()
-        column = self.db_column or attname
+        if _native.AVAILABLE:
+            column = _native.field_column_name(attname, self.db_column or "")
+        else:
+            column = self.db_column or attname
         return attname, column
 
     def get_internal_type(self):

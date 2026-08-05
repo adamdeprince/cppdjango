@@ -4,8 +4,9 @@ import operator
 import os
 from io import BytesIO
 from itertools import chain
-from urllib.parse import parse_qsl, quote, urlencode, urljoin, urlsplit
+from urllib.parse import quote, urlencode, urljoin, urlsplit
 
+from django import native as _native
 from django.conf import settings
 from django.core import signing
 from django.core.exceptions import (
@@ -575,11 +576,6 @@ class QueryDict(MultiValueDict):
         super().__init__()
         self.encoding = encoding or settings.DEFAULT_CHARSET
         query_string = query_string or ""
-        parse_qsl_kwargs = {
-            "keep_blank_values": True,
-            "encoding": self.encoding,
-            "max_num_fields": settings.DATA_UPLOAD_MAX_NUMBER_FIELDS,
-        }
         if isinstance(query_string, bytes):
             # query_string normally contains URL-encoded data, a subset of
             # ASCII.
@@ -589,7 +585,12 @@ class QueryDict(MultiValueDict):
                 # ... but some user agents are misbehaving :-(
                 query_string = query_string.decode("iso-8859-1")
         try:
-            for key, value in parse_qsl(query_string, **parse_qsl_kwargs):
+            # UTF-8 path uses C++ parse_qsl when the native layer is available.
+            for key, value in _native.parse_qsl(
+                query_string,
+                encoding=self.encoding,
+                max_num_fields=settings.DATA_UPLOAD_MAX_NUMBER_FIELDS,
+            ):
                 self.appendlist(key, value)
         except ValueError as e:
             # ValueError can also be raised if the strict_parsing argument to
@@ -703,6 +704,23 @@ class QueryDict(MultiValueDict):
             >>> q.urlencode(safe='/')
             'next=/a%26b/'
         """
+        safe_s = safe if safe is not None else ""
+        enc = (self.encoding or "utf-8").lower().replace("-", "")
+        if _native.AVAILABLE:
+            pairs = []
+            if enc in {"utf8", "utf_8", ""}:
+                for k, list_ in self.lists():
+                    for v in list_:
+                        pairs.append((str(k), str(v)))
+                return _native.querydict_urlencode(pairs, safe_s)
+            # Non-UTF-8: pass raw charset bytes into byte-oriented quoter.
+            for k, list_ in self.lists():
+                for v in list_:
+                    pairs.append(
+                        (str(k).encode(self.encoding), str(v).encode(self.encoding))
+                    )
+            return _native.querydict_urlencode_bytes(pairs, safe_s)
+
         output = []
         if safe:
             safe = safe.encode(self.encoding)
@@ -828,6 +846,8 @@ def split_domain_port(host):
     Returned domain is lowercased. If the host is invalid, the domain will be
     empty.
     """
+    if _native.AVAILABLE:
+        return _native.split_domain_port(host)
     if match := host_validation_re.fullmatch(host.lower()):
         domain, port = match.groups(default="")
         # Remove a trailing dot (if present) from the domain.
@@ -850,6 +870,8 @@ def validate_host(host, allowed_hosts):
 
     Return ``True`` for a valid host, ``False`` otherwise.
     """
+    if _native.AVAILABLE:
+        return _native.validate_host(host, list(allowed_hosts))
     return any(
         pattern == "*" or is_same_domain(host, pattern) for pattern in allowed_hosts
     )

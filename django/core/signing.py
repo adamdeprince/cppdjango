@@ -40,6 +40,7 @@ import json
 import time
 import zlib
 
+from django import native as _native
 from django.conf import settings
 from django.utils.crypto import constant_time_compare, salted_hmac
 from django.utils.encoding import force_bytes
@@ -63,6 +64,8 @@ class SignatureExpired(BadSignature):
 
 
 def b62_encode(s):
+    if _native.AVAILABLE and isinstance(s, int) and -(2**63) <= s < 2**63:
+        return _native.b62_encode(s)
     if s == 0:
         return "0"
     sign = "-" if s < 0 else ""
@@ -75,6 +78,11 @@ def b62_encode(s):
 
 
 def b62_decode(s):
+    if _native.AVAILABLE:
+        try:
+            return _native.b62_decode(s)
+        except ValueError:
+            pass
     if s == "0":
         return 0
     sign = 1
@@ -88,10 +96,18 @@ def b62_decode(s):
 
 
 def b64_encode(s):
+    if _native.AVAILABLE:
+        return _native.signing_b64_encode(s)
     return base64.urlsafe_b64encode(s).strip(b"=")
 
 
 def b64_decode(s):
+    if _native.AVAILABLE:
+        try:
+            data = s.decode("ascii") if isinstance(s, (bytes, bytearray)) else s
+            return _native.signing_b64_decode(data)
+        except ValueError:
+            pass
     pad = b"=" * (-len(s) % 4)
     return base64.urlsafe_b64decode(s + pad)
 
@@ -215,7 +231,9 @@ class Signer:
             self.__class__.__name__,
         )
         self.algorithm = algorithm or "sha256"
-        if _SEP_UNSAFE.match(self.sep):
+        if (
+            _native.AVAILABLE and _native.signer_sep_unsafe(self.sep)
+        ) or (not _native.AVAILABLE and _SEP_UNSAFE.match(self.sep)):
             raise ValueError(
                 "Unsafe Signer separator: %r (cannot be empty or consist of "
                 "only A-z0-9-_=)" % sep,
@@ -229,9 +247,17 @@ class Signer:
         return "%s%s%s" % (value, self.sep, self.signature(value))
 
     def unsign(self, signed_value):
-        if self.sep not in signed_value:
-            raise BadSignature('No "%s" found in value' % self.sep)
-        value, sig = signed_value.rsplit(self.sep, 1)
+        if _native.AVAILABLE:
+            parts = _native.signing_split(signed_value, self.sep)
+            if len(parts) < 2:
+                raise BadSignature('No "%s" found in value' % self.sep)
+            # rsplit semantics: last part is signature, rest rejoined is value
+            sig = parts[-1]
+            value = self.sep.join(parts[:-1])
+        else:
+            if self.sep not in signed_value:
+                raise BadSignature('No "%s" found in value' % self.sep)
+            value, sig = signed_value.rsplit(self.sep, 1)
         for key in [self.key, *self.fallback_keys]:
             if constant_time_compare(sig, self.signature(value, key)):
                 return value
@@ -258,6 +284,7 @@ class Signer:
                 data = compressed
                 is_compressed = True
         base64d = b64_encode(data).decode()
+        # compression flag applied below when is_compressed
         if is_compressed:
             base64d = "." + base64d
         return self.sign(base64d)
@@ -265,8 +292,12 @@ class Signer:
     def unsign_object(self, signed_obj, serializer=JSONSerializer, **kwargs):
         # Signer.unsign() returns str but base64 and zlib compression operate
         # on bytes.
-        base64d = self.unsign(signed_obj, **kwargs).encode()
-        decompress = base64d[:1] == b"."
+        base64d_str = self.unsign(signed_obj, **kwargs)
+        if _native.AVAILABLE:
+            decompress = _native.signing_is_compressed(base64d_str)
+        else:
+            decompress = base64d_str[:1] == "."
+        base64d = base64d_str.encode()
         if decompress:
             # It's compressed; uncompress it first.
             base64d = base64d[1:]

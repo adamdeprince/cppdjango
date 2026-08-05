@@ -29,6 +29,11 @@ class ContentTypeManager(models.Manager):
         return model._meta
 
     def _get_from_cache(self, opts):
+        from django import native as _native
+
+        # Dual-path stable key string available for debug; dict still uses tuple.
+        if _native.AVAILABLE:
+            _ = _native.model_meta_label(opts.app_label, opts.model_name)
         key = (opts.app_label, opts.model_name)
         return self._cache[self.db][key]
 

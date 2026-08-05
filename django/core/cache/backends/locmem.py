@@ -86,8 +86,16 @@ class LocMemCache(BaseCache):
             return True
 
     def _has_expired(self, key):
+        from django import native as _native
+
         exp = self._expire_info.get(key, -1)
-        return exp is not None and exp <= time.time()
+        now = time.time()
+        if _native.AVAILABLE:
+            if exp is None:
+                return False
+            # Match `exp <= now` (filebased uses strict <).
+            return float(exp) <= now
+        return exp is not None and exp <= now
 
     def _cull(self):
         if self._cull_frequency == 0:

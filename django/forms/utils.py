@@ -1,6 +1,7 @@
 import json
 from collections import UserList
 
+from django import native as _native
 from django.conf import settings
 from django.core.exceptions import ValidationError
 from django.forms.renderers import get_default_renderer
@@ -12,6 +13,8 @@ from django.utils.translation import gettext_lazy as _
 
 def pretty_name(name):
     """Convert 'first_name' to 'First name'."""
+    if _native.AVAILABLE:
+        return _native.pretty_name(name or "")
     if not name:
         return ""
     return name.replace("_", " ").capitalize()
@@ -36,6 +39,12 @@ def flatatt(attrs):
                 boolean_attrs.append((attr,))
         elif value is not None:
             key_value_attrs.append((attr, value))
+
+    if _native.AVAILABLE:
+        # Escape values like format_html_join does.
+        kvs = [(str(k), str(escape(v))) for k, v in sorted(key_value_attrs)]
+        bools = [str(a[0]) for a in sorted(boolean_attrs)]
+        return mark_safe(_native.flatatt_build(kvs, bools))
 
     return format_html_join("", ' {}="{}"', sorted(key_value_attrs)) + format_html_join(
         "", " {}", sorted(boolean_attrs)

@@ -77,6 +77,10 @@ class Permission(models.Model):
         ordering = ["content_type__app_label", "content_type__model", "codename"]
 
     def __str__(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.permission_str(str(self.content_type), self.name)
         return "%s | %s" % (self.content_type, self.name)
 
     def natural_key(self):

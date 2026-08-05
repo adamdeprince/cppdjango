@@ -32,11 +32,17 @@ __all__ = [
 
 def get_fixed_timezone(offset):
     """Return a tzinfo instance with a fixed offset from UTC."""
+    from django import native as _native
+
     if isinstance(offset, timedelta):
         offset = offset.total_seconds() // 60
-    sign = "-" if offset < 0 else "+"
-    hhmm = "%02d%02d" % divmod(abs(offset), 60)
-    name = sign + hhmm
+    offset = int(offset)
+    if _native.AVAILABLE:
+        name = _native.fixed_timezone_name(offset)
+    else:
+        sign = "-" if offset < 0 else "+"
+        hhmm = "%02d%02d" % divmod(abs(offset), 60)
+        name = sign + hhmm
     return timezone(timedelta(minutes=offset), name)
 
 
@@ -218,6 +224,10 @@ def is_aware(value):
     Assuming value.tzinfo is either None or a proper datetime.tzinfo,
     value.utcoffset() implements the appropriate logic.
     """
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.datetime_is_aware(value.utcoffset() is not None)
     return value.utcoffset() is not None
 
 
@@ -231,6 +241,10 @@ def is_naive(value):
     Assuming value.tzinfo is either None or a proper datetime.tzinfo,
     value.utcoffset() implements the appropriate logic.
     """
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.datetime_is_naive(value.utcoffset() is None)
     return value.utcoffset() is None
 
 

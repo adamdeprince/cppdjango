@@ -1,3 +1,4 @@
+from django import native as _native
 from django.conf import settings
 from django.contrib.sessions.backends.base import CreateError, SessionBase, UpdateError
 from django.core.cache import caches
@@ -18,10 +19,16 @@ class SessionStore(SessionBase):
 
     @property
     def cache_key(self):
-        return self.cache_key_prefix + self._get_or_create_session_key()
+        key = self._get_or_create_session_key()
+        if _native.AVAILABLE:
+            return _native.session_cache_key(self.cache_key_prefix, key)
+        return self.cache_key_prefix + key
 
     async def acache_key(self):
-        return self.cache_key_prefix + await self._aget_or_create_session_key()
+        key = await self._aget_or_create_session_key()
+        if _native.AVAILABLE:
+            return _native.session_cache_key(self.cache_key_prefix, key)
+        return self.cache_key_prefix + key
 
     def load(self):
         try:
@@ -112,14 +119,17 @@ class SessionStore(SessionBase):
         if must_create and not result:
             raise CreateError
 
+    def _prefixed_session_key(self, session_key):
+        if _native.AVAILABLE:
+            return _native.session_cache_key(self.cache_key_prefix, session_key)
+        return self.cache_key_prefix + session_key
+
     def exists(self, session_key):
-        return (
-            bool(session_key) and (self.cache_key_prefix + session_key) in self._cache
-        )
+        return bool(session_key) and self._prefixed_session_key(session_key) in self._cache
 
     async def aexists(self, session_key):
         return bool(session_key) and await self._cache.ahas_key(
-            self.cache_key_prefix + session_key
+            self._prefixed_session_key(session_key)
         )
 
     def delete(self, session_key=None):
@@ -127,14 +137,14 @@ class SessionStore(SessionBase):
             if self.session_key is None:
                 return
             session_key = self.session_key
-        self._cache.delete(self.cache_key_prefix + session_key)
+        self._cache.delete(self._prefixed_session_key(session_key))
 
     async def adelete(self, session_key=None):
         if session_key is None:
             if self.session_key is None:
                 return
             session_key = self.session_key
-        await self._cache.adelete(self.cache_key_prefix + session_key)
+        await self._cache.adelete(self._prefixed_session_key(session_key))
 
     @classmethod
     def clear_expired(cls):

@@ -67,6 +67,13 @@ class Approximate:
         return repr(self.val)
 
     def __eq__(self, other):
+        from django import native as _native
+
+        try:
+            if _native.AVAILABLE:
+                return _native.approximate_equal(self.val, other, self.places)
+        except (TypeError, ValueError):
+            pass
         return self.val == other or round(abs(self.val - other), self.places) == 0
 
 

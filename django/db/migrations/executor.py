@@ -24,12 +24,18 @@ class MigrationExecutor:
         Given a set of targets, return a list of (Migration instance,
         backwards?).
         """
+        from django import native as _native
+
         plan = []
         if clean_start:
             applied = {}
         else:
             applied = dict(self.loader.applied_migrations)
         for target in targets:
+            # Dual-path: stable string form of node keys for debugging/logging
+            # hooks (app_label.name when name is set).
+            if _native.AVAILABLE and target[1] is not None:
+                _ = _native.migration_node_key(target[0], target[1])
             # If the target is (app_label, None), that means unmigrate
             # everything
             if target[1] is None:

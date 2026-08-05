@@ -38,6 +38,10 @@ def default_key_func(key, key_prefix, version):
     the `key_prefix`. KEY_FUNCTION can be used to specify an alternate
     function with custom key making behavior.
     """
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.cache_default_key(str(key_prefix), int(version), str(key))
     return "%s:%s:%s" % (key_prefix, version, key)
 
 
@@ -89,6 +93,22 @@ class BaseCache:
         Return the timeout value usable by this backend based upon the provided
         timeout.
         """
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            kind = _native.cache_timeout_kind(
+                timeout is DEFAULT_TIMEOUT,
+                timeout is None,
+                0 if timeout is None or timeout is DEFAULT_TIMEOUT else int(timeout),
+            )
+            if kind == 0:
+                timeout = self.default_timeout
+                return None if timeout is None else time.time() + timeout
+            if kind == 1:
+                return time.time() + (-1)
+            if kind == 2:
+                return None
+            return time.time() + timeout
         if timeout == DEFAULT_TIMEOUT:
             timeout = self.default_timeout
         elif timeout == 0:

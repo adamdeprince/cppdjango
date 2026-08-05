@@ -290,9 +290,16 @@ class ChangeList:
                     del p[k]
             else:
                 p[k] = v
-        return "?%s" % urlencode(sorted(p.items()), doseq=True)
+        from django import native as _native
+
+        encoded = urlencode(sorted(p.items()), doseq=True)
+        if _native.AVAILABLE:
+            return _native.query_string_with_prefix(encoded)
+        return "?%s" % encoded
 
     def get_results(self, request):
+        from django import native as _native
+
         paginator = self.model_admin.get_paginator(
             request, self.queryset, self.list_per_page
         )
@@ -307,8 +314,16 @@ class ChangeList:
             full_result_count = self.root_queryset.count()
         else:
             full_result_count = None
-        can_show_all = result_count <= self.list_max_show_all
-        multi_page = result_count > self.list_per_page
+        if _native.AVAILABLE:
+            can_show_all = _native.admin_can_show_all(
+                result_count, self.list_max_show_all
+            )
+            multi_page = _native.admin_is_multi_page(
+                result_count, self.list_per_page
+            )
+        else:
+            can_show_all = result_count <= self.list_max_show_all
+            multi_page = result_count > self.list_per_page
 
         # Get the list of objects to display on this page.
         if (self.show_all and can_show_all) or not multi_page:

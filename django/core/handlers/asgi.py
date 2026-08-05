@@ -51,11 +51,18 @@ class ASGIRequest(HttpRequest):
         self._post_parse_error = False
         self._read_started = False
         self.resolver_match = None
+        from django import native as _native
+
         self.path = scope["path"]
         self.script_name = get_script_prefix(scope)
         if self.script_name:
             # TODO: Better is-prefix checking, slash handling?
-            self.path_info = scope["path"].removeprefix(self.script_name)
+            if _native.AVAILABLE:
+                self.path_info = _native.asgi_path_info(
+                    scope["path"], self.script_name
+                )
+            else:
+                self.path_info = scope["path"].removeprefix(self.script_name)
         else:
             self.path_info = scope["path"]
         # HTTP basics.

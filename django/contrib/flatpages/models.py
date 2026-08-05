@@ -38,6 +38,8 @@ class FlatPage(models.Model):
         return "%s -- %s" % (self.url, self.title)
 
     def get_absolute_url(self):
+        from django import native as _native
+
         from .views import flatpage
 
         for url in (self.url.lstrip("/"), self.url):
@@ -46,4 +48,9 @@ class FlatPage(models.Model):
             except NoReverseMatch:
                 pass
         # Handle script prefix manually because we bypass reverse()
-        return iri_to_uri(get_script_prefix().rstrip("/") + self.url)
+        prefix = get_script_prefix().rstrip("/")
+        if _native.AVAILABLE:
+            url = _native.ensure_leading_slash(self.url)
+            # Stock concatenates prefix + self.url (url already has leading /).
+            return iri_to_uri(prefix + self.url)
+        return iri_to_uri(prefix + self.url)

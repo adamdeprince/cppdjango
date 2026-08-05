@@ -33,10 +33,22 @@ class OperationDependency(
 
     @cached_property
     def model_name_lower(self):
+        from django import native as _native
+
+        if _native.AVAILABLE and isinstance(self.model_name, str):
+            return _native.ascii_lower(self.model_name)
         return self.model_name.lower()
 
     @cached_property
     def field_name_lower(self):
+        from django import native as _native
+
+        if (
+            _native.AVAILABLE
+            and isinstance(self.field_name, str)
+            and self.field_name is not None
+        ):
+            return _native.ascii_lower(self.field_name)
         return self.field_name.lower()
 
 

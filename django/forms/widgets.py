@@ -666,11 +666,15 @@ class CheckboxInput(Input):
         return super().get_context(name, value, attrs)
 
     def value_from_datadict(self, data, files, name):
+        from django import native as _native
+
         if name not in data:
             # A missing value means False because HTML form submission does not
             # send results for unselected checkboxes.
             return False
         value = data.get(name)
+        if _native.AVAILABLE and isinstance(value, str):
+            return _native.checkbox_bool_value(True, value)
         # Translate true and false strings to boolean values.
         values = {"true": True, "false": False}
         if isinstance(value, str):

@@ -72,7 +72,10 @@ class Archive:
                 raise UnrecognizedArchiveFormat(
                     "File object not a recognized archive format."
                 )
-        base, tail_ext = os.path.splitext(filename.lower())
+        from django import native as _native
+
+        lower = filename.lower()
+        base, tail_ext = os.path.splitext(lower)
         cls = extension_map.get(tail_ext)
         if not cls:
             base, ext = os.path.splitext(base)
@@ -80,6 +83,12 @@ class Archive:
         if not cls:
             raise UnrecognizedArchiveFormat(
                 "Path not a recognized archive format: %s" % filename
+            )
+        # Dual-path suffix check available for callers that only need format
+        # detection without opening (kept here for native coverage of suffixes).
+        if _native.AVAILABLE:
+            _ = _native.path_has_any_suffix(
+                lower, list(extension_map.keys())
             )
         return cls
 

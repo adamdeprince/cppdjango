@@ -171,6 +171,10 @@ class DatabaseOperations(BaseDatabaseOperations):
         return 18446744073709551615
 
     def quote_name(self, name):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.sql_quote_name(name, "backtick")
         if name.startswith("`") and name.endswith("`"):
             return name  # Quoting once is enough.
         return "`%s`" % name

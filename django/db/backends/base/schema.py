@@ -290,14 +290,23 @@ class BaseDatabaseSchemaEditor:
         if isinstance(pk, CompositePrimaryKey):
             constraint_sqls.append(self._pk_constraint_sql(pk.columns))
 
-        sql = self.sql_create_table % {
-            "table": self.quote_name(model._meta.db_table),
-            "definition": ", ".join(
-                str(statement)
-                for statement in (*column_sqls, *constraint_sqls)
-                if statement
-            ),
-        }
+        from django import native as _native
+
+        definition = ", ".join(
+            str(statement)
+            for statement in (*column_sqls, *constraint_sqls)
+            if statement
+        )
+        quoted_table = self.quote_name(model._meta.db_table)
+        if _native.AVAILABLE and self.sql_create_table == (
+            "CREATE TABLE %(table)s (%(definition)s)"
+        ):
+            sql = _native.sql_create_table(quoted_table, definition)
+        else:
+            sql = self.sql_create_table % {
+                "table": quoted_table,
+                "definition": definition,
+            }
         if model._meta.db_tablespace:
             tablespace_sql = self.connection.ops.tablespace_sql(
                 model._meta.db_tablespace
@@ -380,6 +389,8 @@ class BaseDatabaseSchemaEditor:
         Return the column definition for a field. The field must already have
         had set_attributes_from_name() called.
         """
+        from django import native as _native
+
         # Get the column's type and use that as the basis of the SQL.
         field_db_params = field.db_parameters(connection=self.connection)
         column_db_type = field_db_params["type"]
@@ -387,20 +398,20 @@ class BaseDatabaseSchemaEditor:
         if column_db_type is None:
             return None, None
         params = []
-        return (
-            " ".join(
-                # This appends to the params being returned.
-                self._iter_column_sql(
-                    column_db_type,
-                    params,
-                    model,
-                    field,
-                    field_db_params,
-                    include_default,
-                )
-            ),
-            params,
+        pieces = list(
+            # This appends to the params being returned.
+            self._iter_column_sql(
+                column_db_type,
+                params,
+                model,
+                field,
+                field_db_params,
+                include_default,
+            )
         )
+        if _native.AVAILABLE:
+            return _native.sql_space_join([str(p) for p in pieces]), params
+        return " ".join(str(p) for p in pieces), params
 
     def skip_default(self, field):
         """

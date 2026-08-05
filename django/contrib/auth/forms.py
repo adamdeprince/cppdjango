@@ -26,10 +26,15 @@ def _unicode_ci_compare(s1, s2):
     recommended algorithm from Unicode Technical Report 36, section
     2.11.2(B)(2).
     """
-    return (
-        unicodedata.normalize("NFKC", s1).casefold()
-        == unicodedata.normalize("NFKC", s2).casefold()
-    )
+    from django import native as _native
+
+    n1 = unicodedata.normalize("NFKC", s1).casefold()
+    n2 = unicodedata.normalize("NFKC", s2).casefold()
+    # After NFKC+casefold, equality is a straight compare; native path
+    # still useful when both sides are pure ASCII.
+    if _native.AVAILABLE and n1.isascii() and n2.isascii():
+        return _native.strings_ci_equal_ascii(n1, n2)
+    return n1 == n2
 
 
 class ReadOnlyPasswordHashWidget(forms.Widget):

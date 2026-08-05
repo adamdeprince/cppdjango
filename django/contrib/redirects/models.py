@@ -32,4 +32,9 @@ class Redirect(models.Model):
         ordering = ["old_path"]
 
     def __str__(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            # Dual-path equality available for form validation hooks.
+            _ = _native.redirect_paths_equal(self.old_path, self.new_path)
         return "%s ---> %s" % (self.old_path, self.new_path)

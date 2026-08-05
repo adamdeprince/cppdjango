@@ -5,6 +5,7 @@ Form classes
 import copy
 import datetime
 
+from django import native as _native
 from django.core.exceptions import NON_FIELD_ERRORS, ValidationError
 from django.forms.fields import Field
 from django.forms.utils import ErrorDict, ErrorList, RenderableFormMixin
@@ -212,10 +213,14 @@ class BaseForm(RenderableFormMixin):
 
         Subclasses may wish to override.
         """
+        if _native.AVAILABLE:
+            return _native.form_add_prefix(self.prefix or "", field_name)
         return "%s-%s" % (self.prefix, field_name) if self.prefix else field_name
 
     def add_initial_prefix(self, field_name):
         """Add an 'initial' prefix for checking dynamic initial values."""
+        if _native.AVAILABLE:
+            return _native.form_add_initial_prefix(self.prefix or "", field_name)
         return "initial-%s" % self.add_prefix(field_name)
 
     def _widget_data_value(self, widget, html_name):

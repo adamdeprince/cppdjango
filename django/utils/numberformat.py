@@ -1,5 +1,6 @@
 from decimal import Decimal
 
+from django import native as _native
 from django.conf import settings
 from django.utils.safestring import mark_safe
 
@@ -35,8 +36,6 @@ def format(
     # Make the common case fast
     if isinstance(number, int) and not use_grouping and not decimal_pos:
         return mark_safe(number)
-    # sign
-    sign = ""
     # Treat potentially very large/small floats as Decimals.
     if isinstance(number, float) and "e" in str(number).lower():
         number = Decimal(str(number))
@@ -69,6 +68,21 @@ def format(
             str_number = "{:f}".format(number)
     else:
         str_number = str(number)
+
+    if _native.AVAILABLE:
+        return mark_safe(
+            _native.format_number(
+                str_number,
+                decimal_sep,
+                decimal_pos,
+                grouping,
+                thousand_sep,
+                use_grouping,
+            )
+        )
+
+    # sign
+    sign = ""
     if str_number[0] == "-":
         sign = "-"
         str_number = str_number[1:]

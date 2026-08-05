@@ -132,13 +132,20 @@ class SimpleListFilter(FacetsMixin, ListFilter):
         return [self.parameter_name]
 
     def get_facet_counts(self, pk_attname, filtered_qs):
+        from django import native as _native
+
         original_value = self.used_parameters.get(self.parameter_name)
         counts = {}
         for i, choice in enumerate(self.lookup_choices):
             self.used_parameters[self.parameter_name] = choice[0]
             lookup_qs = self.queryset(self.request, filtered_qs)
             if lookup_qs is not None:
-                counts[f"{i}__c"] = models.Count(
+                key = (
+                    _native.admin_facet_count_key(i)
+                    if _native.AVAILABLE
+                    else f"{i}__c"
+                )
+                counts[key] = models.Count(
                     pk_attname,
                     filter=models.Q(pk__in=lookup_qs),
                 )
@@ -153,9 +160,16 @@ class SimpleListFilter(FacetsMixin, ListFilter):
             "query_string": changelist.get_query_string(remove=[self.parameter_name]),
             "display": _("All"),
         }
+        from django import native as _native
+
         for i, (lookup, title) in enumerate(self.lookup_choices):
             if add_facets:
-                if (count := facet_counts.get(f"{i}__c", -1)) != -1:
+                facet_key = (
+                    _native.admin_facet_count_key(i)
+                    if _native.AVAILABLE
+                    else f"{i}__c"
+                )
+                if (count := facet_counts.get(facet_key, -1)) != -1:
                     title = f"{title} ({count})"
                 else:
                     title = f"{title} (-)"

@@ -226,10 +226,17 @@ class DatabaseWrapper(BaseDatabaseWrapper):
             kwargs["database"] = settings_dict["NAME"]
         if settings_dict["PASSWORD"]:
             kwargs["password"] = settings_dict["PASSWORD"]
-        if settings_dict["HOST"].startswith("/"):
-            kwargs["unix_socket"] = settings_dict["HOST"]
-        elif settings_dict["HOST"]:
-            kwargs["host"] = settings_dict["HOST"]
+        from django import native as _native
+
+        host = settings_dict["HOST"]
+        if _native.AVAILABLE:
+            is_socket = _native.db_host_is_unix_socket(host or "")
+        else:
+            is_socket = bool(host) and host.startswith("/")
+        if is_socket:
+            kwargs["unix_socket"] = host
+        elif host:
+            kwargs["host"] = host
         if settings_dict["PORT"]:
             kwargs["port"] = int(settings_dict["PORT"])
         # We need the number of potentially affected rows after an
@@ -240,7 +247,11 @@ class DatabaseWrapper(BaseDatabaseWrapper):
         isolation_level = options.pop("isolation_level", "read committed")
         if isolation_level:
             isolation_level = isolation_level.lower()
-            if isolation_level not in self.isolation_levels:
+            if _native.AVAILABLE:
+                valid = _native.mysql_isolation_level_valid(isolation_level)
+            else:
+                valid = isolation_level in self.isolation_levels
+            if not valid:
                 raise ImproperlyConfigured(
                     "Invalid transaction isolation level '%s' specified.\n"
                     "Use one of %s, or None."

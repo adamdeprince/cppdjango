@@ -75,6 +75,10 @@ class DateTimeSerializer(BaseSerializer):
     """For datetime.*, except datetime.datetime."""
 
     def serialize(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return repr(self.value), {_native.serializer_datetime_import()}
         return repr(self.value), {"import datetime"}
 
 

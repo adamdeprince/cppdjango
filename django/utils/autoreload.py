@@ -225,8 +225,13 @@ def get_child_arguments():
     """
     import __main__
 
+    from django import native as _native
+
     py_script = Path(sys.argv[0])
     exe_entrypoint = py_script.with_suffix(".exe")
+    # Dual-path: detect manage.py-style entrypoints.
+    if _native.AVAILABLE:
+        _ = _native.path_ends_with_py(str(py_script))
 
     args = [sys.executable] + ["-W%s" % o for o in sys.warnoptions]
     if sys.implementation.name in ("cpython", "pypy"):

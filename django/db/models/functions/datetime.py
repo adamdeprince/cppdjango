@@ -43,8 +43,13 @@ class Extract(TimezoneMixin, Transform):
     output_field = IntegerField()
 
     def __init__(self, expression, lookup_name=None, tzinfo=None, **extra):
+        from django import native as _native
+
         if self.lookup_name is None:
-            self.lookup_name = lookup_name
+            if lookup_name is not None and _native.AVAILABLE:
+                self.lookup_name = _native.extract_lookup_name(lookup_name)
+            else:
+                self.lookup_name = lookup_name
         if self.lookup_name is None:
             raise ValueError("lookup_name must be provided")
         self.tzinfo = tzinfo
@@ -220,9 +225,14 @@ class Now(Func):
         # PostgreSQL's CURRENT_TIMESTAMP means "the time at the start of the
         # transaction". Use STATEMENT_TIMESTAMP to be cross-compatible with
         # other databases.
-        return self.as_sql(
-            compiler, connection, template="STATEMENT_TIMESTAMP()", **extra_context
+        from django import native as _native
+
+        template = (
+            _native.sql_now_postgresql()
+            if _native.AVAILABLE
+            else "STATEMENT_TIMESTAMP()"
         )
+        return self.as_sql(compiler, connection, template=template, **extra_context)
 
     def as_mysql(self, compiler, connection, **extra_context):
         return self.as_sql(

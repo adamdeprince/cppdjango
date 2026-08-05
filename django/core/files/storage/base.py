@@ -52,6 +52,15 @@ class Storage:
         return name
 
     def is_name_available(self, name, max_length=None):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.storage_name_available(
+                self.exists(name),
+                max_length is not None,
+                len(name),
+                0 if max_length is None else int(max_length),
+            )
         exceeds_max_length = max_length and len(name) > max_length
         return not self.exists(name) and not exceeds_max_length
 
@@ -70,16 +79,31 @@ class Storage:
         character alphanumeric string (before the file extension, if one
         exists) to the filename.
         """
-        return "%s_%s%s" % (file_root, get_random_string(7), file_ext)
+        from django import native as _native
+
+        rnd = get_random_string(7)
+        if _native.AVAILABLE:
+            return _native.storage_alternative_name(file_root, rnd, file_ext)
+        return "%s_%s%s" % (file_root, rnd, file_ext)
 
     def get_available_name(self, name, max_length=None):
         """
         Return a filename that's free on the target storage system and
         available for new content to be written to.
         """
-        name = str(name).replace("\\", "/")
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            name = _native.storage_normalize_name(str(name))
+        else:
+            name = str(name).replace("\\", "/")
         dir_name, file_name = os.path.split(name)
-        if ".." in pathlib.PurePath(dir_name).parts:
+        if _native.AVAILABLE:
+            if _native.path_has_dotdot(dir_name):
+                raise SuspiciousFileOperation(
+                    "Detected path traversal attempt in '%s'" % dir_name
+                )
+        elif ".." in pathlib.PurePath(dir_name).parts:
             raise SuspiciousFileOperation(
                 "Detected path traversal attempt in '%s'" % dir_name
             )

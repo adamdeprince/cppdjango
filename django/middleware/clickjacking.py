@@ -45,4 +45,9 @@ class XFrameOptionsMiddleware(MiddlewareMixin):
         This method can be overridden if needed, allowing it to vary based on
         the request or response.
         """
-        return getattr(settings, "X_FRAME_OPTIONS", "DENY").upper()
+        from django import native as _native
+
+        raw = getattr(settings, "X_FRAME_OPTIONS", "DENY")
+        if _native.AVAILABLE:
+            return _native.xframe_options_value(raw or "")
+        return raw.upper()

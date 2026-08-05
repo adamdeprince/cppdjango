@@ -2,6 +2,7 @@ import logging
 
 from asgiref.sync import sync_to_async
 
+from django import native as _native
 from django.contrib.sessions.backends.base import CreateError, SessionBase, UpdateError
 from django.core.exceptions import SuspiciousOperation
 from django.db import DatabaseError, IntegrityError, router, transaction
@@ -53,16 +54,31 @@ class SessionStore(SessionBase):
 
     def load(self):
         s = self._get_session_from_db()
-        return self.decode(s.session_data) if s else {}
+        if not s:
+            return {}
+        # decode() is already dual-path via signing.loads.
+        return self.decode(s.session_data)
 
     async def aload(self):
         s = await self._aget_session_from_db()
-        return self.decode(s.session_data) if s else {}
+        if not s:
+            return {}
+        return self.decode(s.session_data)
 
     def exists(self, session_key):
+        if _native.AVAILABLE:
+            if _native.session_key_missing(session_key or ""):
+                return False
+        elif not session_key:
+            return False
         return self.model.objects.filter(session_key=session_key).exists()
 
     async def aexists(self, session_key):
+        if _native.AVAILABLE:
+            if _native.session_key_missing(session_key or ""):
+                return False
+        elif not session_key:
+            return False
         return await self.model.objects.filter(session_key=session_key).aexists()
 
     def create(self):
@@ -97,18 +113,32 @@ class SessionStore(SessionBase):
         current session state. Intended to be used for saving the session data
         to the database.
         """
+        session_key = self._get_or_create_session_key()
+        # encode() uses signing.dumps (dual-path HMAC/b64).
+        session_data = self.encode(data)
+        expire_date = self.get_expiry_date()
+        if _native.AVAILABLE and not _native.is_valid_session_key(session_key, 8, False):
+            # Defensive: generated keys always pass; reject corrupt assignments.
+            session_key = self._get_new_session_key()
+            session_data = self.encode(data)
         return self.model(
-            session_key=self._get_or_create_session_key(),
-            session_data=self.encode(data),
-            expire_date=self.get_expiry_date(),
+            session_key=session_key,
+            session_data=session_data,
+            expire_date=expire_date,
         )
 
     async def acreate_model_instance(self, data):
         """See create_model_instance()."""
+        session_key = await self._aget_or_create_session_key()
+        session_data = self.encode(data)
+        expire_date = await self.aget_expiry_date()
+        if _native.AVAILABLE and not _native.is_valid_session_key(session_key, 8, False):
+            session_key = await self._aget_new_session_key()
+            session_data = self.encode(data)
         return self.model(
-            session_key=await self._aget_or_create_session_key(),
-            session_data=self.encode(data),
-            expire_date=await self.aget_expiry_date(),
+            session_key=session_key,
+            session_data=session_data,
+            expire_date=expire_date,
         )
 
     def save(self, must_create=False):
@@ -171,6 +201,8 @@ class SessionStore(SessionBase):
             if self.session_key is None:
                 return
             session_key = self.session_key
+        if _native.AVAILABLE and _native.session_key_missing(session_key or ""):
+            return
         try:
             self.model.objects.get(session_key=session_key).delete()
         except self.model.DoesNotExist:
@@ -181,6 +213,8 @@ class SessionStore(SessionBase):
             if self.session_key is None:
                 return
             session_key = self.session_key
+        if _native.AVAILABLE and _native.session_key_missing(session_key or ""):
+            return
         try:
             obj = await self.model.objects.aget(session_key=session_key)
             await obj.adelete()

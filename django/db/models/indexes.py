@@ -260,12 +260,22 @@ class Index:
             model._meta.get_field(field_name).column
             for field_name, order in self.fields_orders
         ]
-        column_names_with_order = [
-            (("-%s" if order else "%s") % column_name)
-            for column_name, (field_name, order) in zip(
-                column_names, self.fields_orders
-            )
-        ]
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            column_names_with_order = [
+                _native.index_column_with_order(column_name, bool(order))
+                for column_name, (field_name, order) in zip(
+                    column_names, self.fields_orders
+                )
+            ]
+        else:
+            column_names_with_order = [
+                (("-%s" if order else "%s") % column_name)
+                for column_name, (field_name, order) in zip(
+                    column_names, self.fields_orders
+                )
+            ]
         # The length of the parts of the name is based on the default max
         # length of 30 characters.
         hash_data = [table_name, *column_names_with_order, self.suffix]
@@ -279,7 +289,9 @@ class Index:
                 "Index too long for multiple database support. Is self.suffix "
                 "longer than 3 characters?"
             )
-        if self.name[0] == "_" or self.name[0].isdigit():
+        if _native.AVAILABLE:
+            self.name = _native.index_name_fix_leading(self.name)
+        elif self.name[0] == "_" or self.name[0].isdigit():
             self.name = "D%s" % self.name[1:]
 
     def __repr__(self):

@@ -13,6 +13,7 @@ from urllib.parse import urlsplit
 
 from asgiref.sync import async_to_sync, sync_to_async
 
+from django import native as _native
 from django.conf import settings
 from django.core import signals, signing
 from django.core.exceptions import DisallowedRedirect
@@ -62,7 +63,12 @@ class ResponseHeaders(CaseInsensitiveMapping):
                 value = str(value)
                 # Ensure string is valid in given charset.
                 value.encode(charset)
-            if "\n" in value or "\r" in value:
+            if _native.AVAILABLE:
+                if not _native.header_value_no_newlines(value):
+                    raise BadHeaderError(
+                        f"Header values can't contain newlines (got {value!r})"
+                    )
+            elif "\n" in value or "\r" in value:
                 raise BadHeaderError(
                     f"Header values can't contain newlines (got {value!r})"
                 )
@@ -140,7 +146,12 @@ class HttpResponseBase:
             except (ValueError, TypeError):
                 raise TypeError("HTTP status code must be an integer.")
 
-            if not 100 <= self.status_code <= 599:
+            if _native.AVAILABLE:
+                if not _native.http_status_code_valid(self.status_code):
+                    raise ValueError(
+                        "HTTP status code must be an integer from 100 to 599."
+                    )
+            elif not 100 <= self.status_code <= 599:
                 raise ValueError("HTTP status code must be an integer from 100 to 599.")
         self._reason_phrase = reason
 
@@ -163,7 +174,11 @@ class HttpResponseBase:
         # The Content-Type header may not yet be set, because the charset is
         # being inserted *into* it.
         if content_type := self.headers.get("Content-Type"):
-            if matched := _charset_from_content_type_re.search(content_type):
+            if _native.AVAILABLE:
+                cs = _native.charset_from_content_type(content_type)
+                if cs:
+                    return cs
+            elif matched := _charset_from_content_type_re.search(content_type):
                 # Extract the charset and strip its double quotes.
                 # Note that having parsed it from the Content-Type, we don't
                 # store it back into the _charset for later intentionally, to
@@ -177,6 +192,9 @@ class HttpResponseBase:
 
     def serialize_headers(self):
         """HTTP headers as a bytestring."""
+        if _native.AVAILABLE:
+            lines = _native.serialize_header_lines(list(self.headers.items()))
+            return b"\r\n".join(line.encode("latin-1") for line in lines)
         return b"\r\n".join(
             [
                 key.encode("ascii") + b": " + value.encode("latin-1")
@@ -262,7 +280,11 @@ class HttpResponseBase:
         if max_age is not None:
             if isinstance(max_age, datetime.timedelta):
                 max_age = max_age.total_seconds()
-            self.cookies[key]["max-age"] = int(max_age)
+            if _native.AVAILABLE:
+                max_age = _native.cookie_max_age_seconds(float(max_age))
+            else:
+                max_age = int(max_age)
+            self.cookies[key]["max-age"] = max_age
             # IE requires expires, so set it if hasn't been already.
             if not expires:
                 self.cookies[key]["expires"] = http_date(time.time() + max_age)
@@ -275,7 +297,10 @@ class HttpResponseBase:
         if httponly:
             self.cookies[key]["httponly"] = True
         if samesite:
-            if samesite.lower() not in ("lax", "none", "strict"):
+            if _native.AVAILABLE:
+                if not _native.is_valid_samesite(samesite):
+                    raise ValueError('samesite must be "lax", "none", or "strict".')
+            elif samesite.lower() not in ("lax", "none", "strict"):
                 raise ValueError('samesite must be "lax", "none", or "strict".')
             self.cookies[key]["samesite"] = samesite
 
@@ -294,9 +319,12 @@ class HttpResponseBase:
         # the secure flag and:
         # - the cookie name starts with "__Host-" or "__Secure-", or
         # - the samesite is "none".
-        secure = key.startswith(("__Secure-", "__Host-")) or (
-            samesite and samesite.lower() == "none"
-        )
+        if _native.AVAILABLE:
+            secure = _native.cookie_delete_secure(key, samesite or "")
+        else:
+            secure = key.startswith(("__Secure-", "__Host-")) or (
+                samesite and samesite.lower() == "none"
+            )
         self.set_cookie(
             key,
             max_age=0,

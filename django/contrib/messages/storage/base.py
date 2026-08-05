@@ -39,6 +39,12 @@ class Message:
 
     @property
     def tags(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.message_tags_join(
+                self.extra_tags or "", self.level_tag or ""
+            )
         return " ".join(tag for tag in [self.extra_tags, self.level_tag] if tag)
 
     @property

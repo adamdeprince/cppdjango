@@ -40,6 +40,11 @@ multiple_spaces_re = _lazy_re_compile(r"\s{2,}")
 
 def normalize_spaces(val):
     """Convert multiple spaces to single and strip from both sides."""
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        out = _native.postgres_normalize_spaces(val)
+        return out if out else None
     if not (val := val.strip()):
         return None
     return multiple_spaces_re.sub(" ", val)
@@ -47,6 +52,11 @@ def normalize_spaces(val):
 
 def psql_escape(query):
     """Replace chars not fit for use in search queries with a single space."""
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        out = _native.postgres_psql_escape(query)
+        return out if out else None
     query = spec_chars_re.sub(" ", query)
     return normalize_spaces(query)
 
@@ -62,9 +72,13 @@ class SearchVectorExact(Lookup):
         return rhs, rhs_params
 
     def as_sql(self, qn, connection):
+        from django import native as _native
+
         lhs, lhs_params = self.process_lhs(qn, connection)
         rhs, rhs_params = self.process_rhs(qn, connection)
         params = (*lhs_params, *rhs_params)
+        if _native.AVAILABLE:
+            return _native.search_vector_match_sql(lhs, rhs), params
         return "%s @@ %s" % (lhs, rhs), params
 
 

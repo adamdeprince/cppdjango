@@ -30,6 +30,8 @@ class Engine:
         builtins=None,
         autoescape=True,
     ):
+        from django import native as _native
+
         if dirs is None:
             dirs = []
         if context_processors is None:
@@ -40,7 +42,12 @@ class Engine:
                 loaders += ["django.template.loaders.app_directories.Loader"]
             loaders = [("django.template.loaders.cached.Loader", loaders)]
         else:
-            if app_dirs:
+            if _native.AVAILABLE:
+                if _native.engine_loaders_app_dirs_conflict(app_dirs, True):
+                    raise ImproperlyConfigured(
+                        "app_dirs must not be set when loaders is defined."
+                    )
+            elif app_dirs:
                 raise ImproperlyConfigured(
                     "app_dirs must not be set when loaders is defined."
                 )

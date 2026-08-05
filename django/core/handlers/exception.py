@@ -61,17 +61,25 @@ def convert_exception_to_response(get_response):
 
 
 def response_for_exception(request, exc):
+    from django import native as _native
+
     if isinstance(exc, Http404):
+        status = (
+            _native.exception_status_code("http404") if _native.AVAILABLE else 404
+        )
         if settings.DEBUG:
             response = debug.technical_404_response(request, exc)
         else:
             response = get_exception_response(
-                request, get_resolver(get_urlconf()), 404, exc
+                request, get_resolver(get_urlconf()), status, exc
             )
 
     elif isinstance(exc, PermissionDenied):
+        status = (
+            _native.exception_status_code("permission") if _native.AVAILABLE else 403
+        )
         response = get_exception_response(
-            request, get_resolver(get_urlconf()), 403, exc
+            request, get_resolver(get_urlconf()), status, exc
         )
         log_response(
             "Forbidden (Permission denied): %s",
@@ -82,8 +90,11 @@ def response_for_exception(request, exc):
         )
 
     elif isinstance(exc, MultiPartParserError):
+        status = (
+            _native.exception_status_code("multipart") if _native.AVAILABLE else 400
+        )
         response = get_exception_response(
-            request, get_resolver(get_urlconf()), 400, exc
+            request, get_resolver(get_urlconf()), status, exc
         )
         log_response(
             "Bad request (Unable to parse request body): %s",
@@ -94,13 +105,14 @@ def response_for_exception(request, exc):
         )
 
     elif isinstance(exc, BadRequest):
+        status = _native.exception_status_code("bad") if _native.AVAILABLE else 400
         if settings.DEBUG:
             response = debug.technical_500_response(
-                request, *sys.exc_info(), status_code=400
+                request, *sys.exc_info(), status_code=status
             )
         else:
             response = get_exception_response(
-                request, get_resolver(get_urlconf()), 400, exc
+                request, get_resolver(get_urlconf()), status, exc
             )
         log_response(
             "%s: %s",
@@ -111,6 +123,9 @@ def response_for_exception(request, exc):
             exception=exc,
         )
     elif isinstance(exc, SuspiciousOperation):
+        status = (
+            _native.exception_status_code("suspicious") if _native.AVAILABLE else 400
+        )
         if isinstance(exc, (RequestDataTooBig, TooManyFieldsSent, TooManyFilesSent)):
             # POST data can't be accessed again, otherwise the original
             # exception would be raised.
@@ -118,11 +133,11 @@ def response_for_exception(request, exc):
 
         if settings.DEBUG:
             response = debug.technical_500_response(
-                request, *sys.exc_info(), status_code=400
+                request, *sys.exc_info(), status_code=status
             )
         else:
             response = get_exception_response(
-                request, get_resolver(get_urlconf()), 400, exc
+                request, get_resolver(get_urlconf()), status, exc
             )
         # The logger is set to django.security, which specifically captures
         # SuspiciousOperation events, unlike the default django.request logger.

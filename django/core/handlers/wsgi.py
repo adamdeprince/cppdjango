@@ -55,6 +55,8 @@ class LimitedStream(IOBase):
 
 class WSGIRequest(HttpRequest):
     def __init__(self, environ):
+        from django import native as _native
+
         script_name = get_script_name(environ)
         # If PATH_INFO is empty (e.g. accessing the SCRIPT_NAME URL without a
         # trailing slash), operate as if '/' was requested.
@@ -64,7 +66,13 @@ class WSGIRequest(HttpRequest):
         # be careful to only replace the first slash in the path because of
         # http://test/something and http://test//something being different as
         # stated in RFC 3986.
-        self.path = "%s/%s" % (script_name.rstrip("/"), path_info.replace("/", "", 1))
+        if _native.AVAILABLE:
+            self.path = _native.wsgi_request_path(script_name, path_info)
+        else:
+            self.path = "%s/%s" % (
+                script_name.rstrip("/"),
+                path_info.replace("/", "", 1),
+            )
         self.META = environ
         self.META["PATH_INFO"] = path_info
         self.META["SCRIPT_NAME"] = script_name

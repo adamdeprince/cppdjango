@@ -1,6 +1,8 @@
 from contextlib import contextmanager
 from copy import copy
 
+from django import native as _native
+
 # Hard-coded processor for easier use of CSRF protection.
 _builtin_context_processors = ("django.template.context_processors.csrf",)
 
@@ -85,6 +87,11 @@ class BaseContext:
         Get a variable's value, starting at the current context and going
         upward
         """
+        if _native.AVAILABLE:
+            found, value = _native.context_lookup(self.dicts, key)
+            if found:
+                return value
+            raise KeyError(key)
         for d in reversed(self.dicts):
             if key in d:
                 return d[key]
@@ -98,6 +105,11 @@ class BaseContext:
         return any(key in d for d in self.dicts)
 
     def get(self, key, otherwise=None):
+        if _native.AVAILABLE:
+            found, value = _native.context_lookup(self.dicts, key)
+            if found:
+                return value
+            return otherwise
         for d in reversed(self.dicts):
             if key in d:
                 return d[key]

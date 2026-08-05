@@ -556,7 +556,19 @@ class SQLCompiler:
         """
         if name in self.quote_cache:
             return self.quote_cache[name]
-        if (
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            is_alias = _native.quote_name_is_alias(
+                name in self.query.alias_map and name not in self.query.table_map,
+                name in self.query.extra_select,
+                bool(self.query.external_aliases.get(name))
+                and name not in self.query.table_map,
+            )
+            if is_alias:
+                self.quote_cache[name] = name
+                return name
+        elif (
             (name in self.query.alias_map and name not in self.query.table_map)
             or name in self.query.extra_select
             or (
@@ -616,16 +628,27 @@ class SQLCompiler:
             # the creation of an union.
             empty_compiler.elide_empty = False
             parts.append(self._get_combinator_part_sql(empty_compiler))
+        from django import native as _native
+
         combinator_sql = self.connection.ops.set_operators[combinator]
         if all and combinator == "union":
             combinator_sql += " ALL"
         braces = "{}"
+        wrap_parens = False
         if not self.query.subquery and features.supports_slicing_ordering_in_compound:
             braces = "({})"
+            wrap_parens = True
         sql_parts, args_parts = zip(
             *((braces.format(sql), args) for sql, args in parts)
         )
-        result = [" {} ".format(combinator_sql).join(sql_parts)]
+        if _native.AVAILABLE:
+            # sql_parts already have braces applied when wrap_parens; join only.
+            joined = _native.sql_combinator_join(
+                combinator_sql, list(sql_parts), wrap_parens=False
+            )
+            result = [joined]
+        else:
+            result = [" {} ".format(combinator_sql).join(sql_parts)]
         params = []
         for part in args_parts:
             params.extend(part)
@@ -821,16 +844,22 @@ class SQLCompiler:
                     params += distinct_params
 
                 out_cols = []
+                from django import native as _native
+
                 for _, (s_sql, s_params), alias in self.select + extra_select:
                     if alias:
-                        s_sql = "%s AS %s" % (
-                            s_sql,
-                            self.connection.ops.quote_name(alias),
-                        )
+                        quoted_alias = self.connection.ops.quote_name(alias)
+                        if _native.AVAILABLE:
+                            s_sql = _native.sql_expr_as(s_sql, quoted_alias)
+                        else:
+                            s_sql = "%s AS %s" % (s_sql, quoted_alias)
                     params.extend(s_params)
                     out_cols.append(s_sql)
 
-                result += [", ".join(out_cols)]
+                if _native.AVAILABLE:
+                    result += [_native.sql_comma_join(out_cols)]
+                else:
+                    result += [", ".join(out_cols)]
                 if from_:
                     result += ["FROM", *from_]
                 elif self.connection.features.bare_select_suffix:
@@ -904,7 +933,12 @@ class SQLCompiler:
                             "annotate() + distinct(fields) is not implemented."
                         )
                     order_by = order_by or self.connection.ops.force_no_ordering()
-                    result.append("GROUP BY %s" % ", ".join(grouping))
+                    from django import native as _native
+
+                    if _native.AVAILABLE:
+                        result.append(_native.sql_group_by_clause(grouping))
+                    else:
+                        result.append("GROUP BY %s" % ", ".join(grouping))
                     if self._meta_ordering:
                         order_by = None
                 if having:
@@ -927,7 +961,12 @@ class SQLCompiler:
                 for _, (o_sql, o_params, _) in order_by:
                     ordering.append(o_sql)
                     params.extend(o_params)
-                order_by_sql = "ORDER BY %s" % ", ".join(ordering)
+                from django import native as _native
+
+                if _native.AVAILABLE:
+                    order_by_sql = _native.sql_order_by_clause(ordering)
+                else:
+                    order_by_sql = "ORDER BY %s" % ", ".join(ordering)
                 if combinator and features.requires_compound_order_by_subquery:
                     result = ["SELECT * FROM (", *result, ")", order_by_sql]
                 else:
@@ -1067,7 +1106,12 @@ class SQLCompiler:
         """
         name, order = get_order_dir(name, default_order)
         descending = order == "DESC"
-        pieces = name.split(LOOKUP_SEP)
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            pieces = _native.split_lookup_path(name)
+        else:
+            pieces = name.split(LOOKUP_SEP)
         (
             field,
             targets,
@@ -1846,7 +1890,13 @@ class SQLInsertCompiler(SQLCompiler):
                 ]
                 value_cols.append(field_values)
             value_rows = list(zip(*value_cols))
-            result.append("(%s)" % ", ".join(qn(f.column) for f in fields))
+            from django import native as _native
+
+            cols = [qn(f.column) for f in fields]
+            if _native.AVAILABLE:
+                result.append(_native.sql_parenthesized_list(cols))
+            else:
+                result.append("(%s)" % ", ".join(cols))
         else:
             # No fields were specified but an INSERT statement must include at
             # least one column. This can only happen when the model's primary
@@ -1856,7 +1906,12 @@ class SQLInsertCompiler(SQLCompiler):
                 [self.connection.ops.pk_default_value()] for _ in self.query.objs
             ]
             fields = [None]
-            result.append("(%s)" % qn(opts.pk.column))
+            from django import native as _native
+
+            if _native.AVAILABLE:
+                result.append(_native.sql_parenthesized_list([qn(opts.pk.column)]))
+            else:
+                result.append("(%s)" % qn(opts.pk.column))
 
         # Currently the backends just accept values when generating bulk
         # queries and generate their own placeholders. Doing that isn't
@@ -1874,6 +1929,8 @@ class SQLInsertCompiler(SQLCompiler):
             (f.column for f in self.query.update_fields),
             (f.column for f in self.query.unique_fields),
         )
+        from django import native as _native
+
         if (
             self.returning_fields
             and self.connection.features.can_return_columns_from_insert
@@ -1884,7 +1941,11 @@ class SQLInsertCompiler(SQLCompiler):
                 )
                 params = param_rows
             else:
-                result.append("VALUES (%s)" % ", ".join(placeholder_rows[0]))
+                ph = ", ".join(placeholder_rows[0])
+                if _native.AVAILABLE:
+                    result.append(_native.sql_values_row(ph))
+                else:
+                    result.append("VALUES (%s)" % ph)
                 params = [param_rows[0]]
             if on_conflict_suffix_sql:
                 result.append(on_conflict_suffix_sql)
@@ -1896,16 +1957,36 @@ class SQLInsertCompiler(SQLCompiler):
             if r_sql:
                 result.append(r_sql)
                 params += [self.returning_params]
-            return [(" ".join(result), tuple(chain.from_iterable(params)))]
+            joined = (
+                _native.sql_space_join(result)
+                if _native.AVAILABLE
+                else " ".join(result)
+            )
+            return [(joined, tuple(chain.from_iterable(params)))]
 
         if can_bulk:
             result.append(self.connection.ops.bulk_insert_sql(fields, placeholder_rows))
             if on_conflict_suffix_sql:
                 result.append(on_conflict_suffix_sql)
-            return [(" ".join(result), tuple(p for ps in param_rows for p in ps))]
+            joined = (
+                _native.sql_space_join(result)
+                if _native.AVAILABLE
+                else " ".join(result)
+            )
+            return [(joined, tuple(p for ps in param_rows for p in ps))]
         else:
             if on_conflict_suffix_sql:
                 result.append(on_conflict_suffix_sql)
+            if _native.AVAILABLE:
+                return [
+                    (
+                        _native.sql_space_join(
+                            [*result, _native.sql_values_row(", ".join(p))]
+                        ),
+                        vals,
+                    )
+                    for p, vals in zip(placeholder_rows, param_rows)
+                ]
             return [
                 (" ".join([*result, "VALUES (%s)" % ", ".join(p)]), vals)
                 for p, vals in zip(placeholder_rows, param_rows)
@@ -2070,19 +2151,38 @@ class SQLUpdateCompiler(SQLCompiler):
             else:
                 placeholder = "%s"
             name = field.column
+            from django import native as _native
+
             if hasattr(val, "as_sql"):
                 sql, params = self.compile(val)
-                values.append("%s = %s" % (qn(name), placeholder % sql))
+                rhs = placeholder % sql
+                if _native.AVAILABLE:
+                    values.append(_native.sql_assignment(qn(name), rhs))
+                else:
+                    values.append("%s = %s" % (qn(name), rhs))
                 update_params.extend(params)
             elif val is not None:
-                values.append("%s = %s" % (qn(name), placeholder))
+                if _native.AVAILABLE:
+                    values.append(_native.sql_assignment(qn(name), placeholder))
+                else:
+                    values.append("%s = %s" % (qn(name), placeholder))
                 update_params.append(val)
             else:
-                values.append("%s = NULL" % qn(name))
+                if _native.AVAILABLE:
+                    values.append(_native.sql_null_assignment(qn(name)))
+                else:
+                    values.append("%s = NULL" % qn(name))
         table = self.query.base_table
+        from django import native as _native
+
+        set_sql = (
+            _native.sql_update_set_clause(values)
+            if _native.AVAILABLE
+            else ", ".join(values)
+        )
         result = [
             "UPDATE %s SET" % qn(table),
-            ", ".join(values),
+            set_sql,
         ]
         try:
             where, params = self.compile(self.query.where)
@@ -2099,6 +2199,8 @@ class SQLUpdateCompiler(SQLCompiler):
             if r_sql:
                 result.append(r_sql)
                 params.extend(self.returning_params)
+        if _native.AVAILABLE:
+            return _native.sql_space_join(result), tuple(update_params + params)
         return " ".join(result), tuple(update_params + params)
 
     def execute_sql(self, result_type):
@@ -2108,9 +2210,16 @@ class SQLUpdateCompiler(SQLCompiler):
         non-empty query that is executed. Row counts for any subsequent,
         related queries are not available.
         """
+        from django import native as _native
+
         row_count = super().execute_sql(result_type)
         is_empty = row_count is None
-        row_count = row_count or 0
+        if _native.AVAILABLE:
+            row_count = _native.row_count_or_zero(
+                is_empty, 0 if row_count is None else int(row_count)
+            )
+        else:
+            row_count = row_count or 0
 
         for query in self.query.get_related_updates():
             # If the result_type is NO_RESULTS then the aux_row_count is None.
@@ -2226,6 +2335,8 @@ class SQLAggregateCompiler(SQLCompiler):
         Create the SQL for this query. Return the SQL string and list of
         parameters.
         """
+        from django import native as _native
+
         sql, params = [], []
         for annotation in self.query.annotation_select.values():
             ann_sql, ann_params = self.compile(annotation)
@@ -2233,14 +2344,20 @@ class SQLAggregateCompiler(SQLCompiler):
             sql.append(ann_sql)
             params.extend(ann_params)
         self.col_count = len(self.query.annotation_select)
-        sql = ", ".join(sql)
+        if _native.AVAILABLE:
+            select_sql = _native.sql_comma_join(sql)
+        else:
+            select_sql = ", ".join(sql)
         params = tuple(params)
 
         inner_query_sql, inner_query_params = self.query.inner_query.get_compiler(
             self.using,
             elide_empty=self.elide_empty,
         ).as_sql(with_col_aliases=True)
-        sql = "SELECT %s FROM (%s) subquery" % (sql, inner_query_sql)
+        if _native.AVAILABLE:
+            sql = _native.sql_aggregate_subquery(select_sql, inner_query_sql)
+        else:
+            sql = "SELECT %s FROM (%s) subquery" % (select_sql, inner_query_sql)
         params += inner_query_params
         return sql, params
 

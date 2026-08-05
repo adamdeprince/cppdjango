@@ -105,7 +105,15 @@ class MinimumLengthValidator:
         self.min_length = min_length
 
     def validate(self, password, user=None):
-        if len(password) < self.min_length:
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            too_short = not _native.password_meets_min_length(
+                len(password), self.min_length
+            )
+        else:
+            too_short = len(password) < self.min_length
+        if too_short:
             raise ValidationError(
                 self.get_error_message(),
                 code="password_too_short",
@@ -267,7 +275,13 @@ class NumericPasswordValidator:
     """
 
     def validate(self, password, user=None):
-        if password.isdigit():
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            numeric = _native.password_is_numeric_only(password)
+        else:
+            numeric = password.isdigit()
+        if numeric:
             raise ValidationError(
                 self.get_error_message(),
                 code="password_entirely_numeric",

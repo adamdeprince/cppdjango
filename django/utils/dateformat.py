@@ -15,6 +15,7 @@ import calendar
 from datetime import date, datetime, time
 from email.utils import format_datetime as format_datetime_rfc5322
 
+from django import native as _native
 from django.utils.dates import (
     MONTHS,
     MONTHS_3,
@@ -34,6 +35,90 @@ from django.utils.translation import gettext as _
 
 re_formatchars = _lazy_re_compile(r"(?<!\\)([aAbcdDeEfFgGhHiIjlLmMnNoOPrsStTUuwWyYzZ])")
 re_escaped = _lazy_re_compile(r"\\(.)")
+
+
+def _native_date_format_parts(obj):
+    """Build the parts dict for django.native.php_date_format."""
+    has_time = not (type(obj) is date)
+    parts = {
+        "year": obj.year,
+        "month": obj.month,
+        "day": obj.day,
+        "has_time": has_time,
+        "has_tz": False,
+        "is_aware": False,
+        "months": [""] + [str(MONTHS[i]) for i in range(1, 13)],
+        "months_3": [""] + [str(MONTHS_3[i]) for i in range(1, 13)],
+        "months_alt": [""] + [str(MONTHS_ALT[i]) for i in range(1, 13)],
+        "months_ap": [""] + [str(MONTHS_AP[i]) for i in range(1, 13)],
+        "weekdays": [str(WEEKDAYS[i]) for i in range(7)],
+        "weekdays_abbr": [str(WEEKDAYS_ABBR[i]) for i in range(7)],
+        "am": _("a.m."),
+        "pm": _("p.m."),
+        "AM": _("AM"),
+        "PM": _("PM"),
+        "midnight": _("midnight"),
+        "noon": _("noon"),
+    }
+    if has_time:
+        parts["hour"] = obj.hour
+        parts["minute"] = obj.minute
+        parts["second"] = obj.second
+        parts["microsecond"] = getattr(obj, "microsecond", 0)
+    if isinstance(obj, datetime):
+        timezone = None
+        try:
+            if is_naive(obj):
+                timezone = get_default_timezone()
+                parts["is_aware"] = False
+            else:
+                timezone = obj.tzinfo
+                parts["is_aware"] = True
+            if timezone is not None and not _datetime_ambiguous_or_imaginary(
+                obj, timezone
+            ):
+                parts["has_tz"] = True
+                # 'T' / O / Z / I use the active timezone (default for naive).
+                try:
+                    parts["tz_name"] = str(timezone.tzname(obj) or "")
+                except (NotImplementedError, AttributeError, TypeError):
+                    parts["tz_name"] = ""
+                # 'e' only reports the instance's own tzinfo name (empty if naive).
+                parts["e_name"] = ""
+                if getattr(obj, "tzinfo", None) is not None:
+                    try:
+                        parts["e_name"] = obj.tzname() or ""
+                    except (NotImplementedError, AttributeError, TypeError):
+                        parts["e_name"] = ""
+                try:
+                    offset = timezone.utcoffset(obj)
+                    if offset is not None:
+                        parts["utc_offset_seconds"] = (
+                            offset.days * 86400 + offset.seconds
+                        )
+                except (NotImplementedError, TypeError):
+                    pass
+                try:
+                    dst = timezone.dst(obj)
+                    parts["is_dst"] = 1 if dst else 0
+                except Exception:
+                    parts["is_dst"] = -1
+        except Exception:
+            # Broken tzinfo (e.g. utcoffset returns None) — leave has_tz false.
+            parts["has_tz"] = False
+            parts["is_aware"] = False
+        # Unix timestamp for 'U'
+        try:
+            parts["unix_timestamp"] = int(obj.timestamp())
+        except (OSError, OverflowError, ValueError, TypeError):
+            parts["unix_timestamp"] = None
+    elif type(obj) is date:
+        try:
+            value = datetime.combine(obj, time.min)
+            parts["unix_timestamp"] = int(value.timestamp())
+        except (OSError, OverflowError, ValueError, TypeError):
+            parts["unix_timestamp"] = None
+    return parts
 
 
 class Formatter:
@@ -325,11 +410,36 @@ class DateFormat(TimeFormat):
 
 def format(value, format_string):
     "Convenience function"
+    if _native.AVAILABLE:
+        # 'r' (RFC 5322) stays on the pure-Python path.
+        if "r" in str(format_string).replace("\\r", ""):
+            return DateFormat(value).format(format_string)
+        try:
+            result = _native.php_date_format(
+                _native_date_format_parts(value), str(format_string)
+            )
+            if result is not None:
+                return result
+        except TypeError:
+            raise
+        except Exception:
+            pass
     df = DateFormat(value)
     return df.format(format_string)
 
 
 def time_format(value, format_string):
     "Convenience function"
+    if _native.AVAILABLE:
+        try:
+            result = _native.php_date_format(
+                _native_date_format_parts(value), str(format_string)
+            )
+            if result is not None:
+                return result
+        except TypeError:
+            raise
+        except Exception:
+            pass
     tf = TimeFormat(value)
     return tf.format(format_string)

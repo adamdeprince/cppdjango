@@ -31,14 +31,25 @@ class DeleteQuery(Query):
         More than one physical query may be executed if there are a
         lot of values in pk_list.
         """
+        from django import native as _native
+
         # number of objects deleted
         num_deleted = 0
         field = self.get_meta().pk
-        for offset in range(0, len(pk_list), GET_ITERATOR_CHUNK_SIZE):
+        if _native.AVAILABLE:
+            ranges = _native.in_bulk_batch_ranges(
+                len(pk_list), GET_ITERATOR_CHUNK_SIZE
+            )
+        else:
+            ranges = [
+                (offset, min(offset + GET_ITERATOR_CHUNK_SIZE, len(pk_list)))
+                for offset in range(0, len(pk_list), GET_ITERATOR_CHUNK_SIZE)
+            ]
+        for offset, end in ranges:
             self.clear_where()
             self.add_filter(
                 f"{field.attname}__in",
-                pk_list[offset : offset + GET_ITERATOR_CHUNK_SIZE],
+                pk_list[offset:end],
             )
             num_deleted += self.do_query(
                 self.get_meta().db_table, self.where, using=using
@@ -70,12 +81,21 @@ class UpdateQuery(Query):
         return obj
 
     def update_batch(self, pk_list, values, using):
+        from django import native as _native
+
         self.add_update_values(values)
-        for offset in range(0, len(pk_list), GET_ITERATOR_CHUNK_SIZE):
-            self.clear_where()
-            self.add_filter(
-                "pk__in", pk_list[offset : offset + GET_ITERATOR_CHUNK_SIZE]
+        if _native.AVAILABLE:
+            ranges = _native.in_bulk_batch_ranges(
+                len(pk_list), GET_ITERATOR_CHUNK_SIZE
             )
+        else:
+            ranges = [
+                (offset, min(offset + GET_ITERATOR_CHUNK_SIZE, len(pk_list)))
+                for offset in range(0, len(pk_list), GET_ITERATOR_CHUNK_SIZE)
+            ]
+        for offset, end in ranges:
+            self.clear_where()
+            self.add_filter("pk__in", pk_list[offset:end])
             self.get_compiler(using).execute_sql(NO_RESULTS)
 
     def add_update_values(self, values):

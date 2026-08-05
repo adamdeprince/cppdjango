@@ -398,6 +398,10 @@ def get_permission_codename(action, opts):
     """
     Return the codename of the permission for the specified action.
     """
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.perm_codename(action, opts.model_name)
     return "%s_%s" % (action, opts.model_name)
 
 

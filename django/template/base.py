@@ -56,6 +56,7 @@ import re
 import warnings
 from enum import Enum
 
+from django import native as _native
 from django.template.context import BaseContext
 from django.utils.deprecation import django_file_prefixes
 from django.utils.formats import localize
@@ -419,14 +420,45 @@ class Lexer:
         """
         Return a list of tokens from a given template_string.
         """
+        if _native.AVAILABLE:
+            return self._tokenize_native(with_position=False)
+        return self._tokenize_python(with_position=False)
+
+    def _tokenize_native(self, with_position):
+        token_types = (
+            TokenType.TEXT,
+            TokenType.VAR,
+            TokenType.BLOCK,
+            TokenType.COMMENT,
+        )
+        result = []
+        for typ, contents, lineno, pos_start, pos_end in _native.template_tokenize(
+            str(self.template_string), with_position
+        ):
+            position = None if pos_start is None else (pos_start, pos_end)
+            result.append(Token(token_types[typ], contents, position, lineno))
+        return result
+
+    def _tokenize_python(self, with_position):
         in_tag = False
         lineno = 1
         result = []
-        for token_string in tag_re.split(self.template_string):
-            if token_string:
-                result.append(self.create_token(token_string, None, lineno, in_tag))
-                lineno += token_string.count("\n")
-            in_tag = not in_tag
+        if with_position:
+            for token_string, position in self._tag_re_split():
+                if token_string:
+                    result.append(
+                        self.create_token(token_string, position, lineno, in_tag)
+                    )
+                    lineno += token_string.count("\n")
+                in_tag = not in_tag
+        else:
+            for token_string in tag_re.split(self.template_string):
+                if token_string:
+                    result.append(
+                        self.create_token(token_string, None, lineno, in_tag)
+                    )
+                    lineno += token_string.count("\n")
+                in_tag = not in_tag
         return result
 
     def create_token(self, token_string, position, lineno, in_tag):
@@ -485,17 +517,9 @@ class DebugLexer(Lexer):
         start and end position in the source. This is slower than the default
         lexer so only use it when debug is True.
         """
-        # For maintainability, it is helpful if the implementation below can
-        # continue to closely parallel Lexer.tokenize()'s implementation.
-        in_tag = False
-        lineno = 1
-        result = []
-        for token_string, position in self._tag_re_split():
-            if token_string:
-                result.append(self.create_token(token_string, position, lineno, in_tag))
-                lineno += token_string.count("\n")
-            in_tag = not in_tag
-        return result
+        if _native.AVAILABLE:
+            return self._tokenize_native(with_position=True)
+        return self._tokenize_python(with_position=True)
 
 
 class Parser:
@@ -738,6 +762,46 @@ class FilterExpression:
 
     def __init__(self, token, parser):
         self.token = token
+        if _native.AVAILABLE:
+            try:
+                matches = _native.parse_filter_expression(token)
+            except ValueError:
+                # Fall back for exact Django error messages on odd inputs.
+                matches = None
+            if matches is not None:
+                var_obj = None
+                filters = []
+                for match in matches:
+                    kind = match["kind"]
+                    if kind in (0, 1):  # Constant, Var
+                        if kind == 0:
+                            try:
+                                var_obj = Variable(match["token"]).resolve({})
+                            except VariableDoesNotExist:
+                                var_obj = None
+                        else:
+                            var_obj = Variable(match["token"])
+                    else:  # Filter
+                        filter_name = match["token"]
+                        args = []
+                        if match["arg_token"] is not None:
+                            if match["arg_is_var"]:
+                                args.append((True, Variable(match["arg_token"])))
+                            else:
+                                args.append(
+                                    (
+                                        False,
+                                        Variable(match["arg_token"]).resolve({}),
+                                    )
+                                )
+                        filter_func = parser.find_filter(filter_name)
+                        self.args_check(filter_name, filter_func, args)
+                        filters.append((filter_func, args))
+                self.filters = filters
+                self.var = var_obj
+                self.is_var = isinstance(var_obj, Variable)
+                return
+
         matches = filter_re.finditer(token)
         var_obj = None
         filters = []
@@ -877,6 +941,43 @@ class Variable:
 
         if not isinstance(var, str):
             raise TypeError("Variable must be a string or number, got %s" % type(var))
+
+        if _native.AVAILABLE:
+            parsed = _native.parse_variable(var)
+            kind = parsed["kind"]
+            # 0=int, 1=float, 2=string, 3=lookup, 4=error
+            if kind == 0:
+                # Big integers are returned as string_value for Python int().
+                if parsed["string_value"]:
+                    self.literal = int(parsed["string_value"])
+                else:
+                    self.literal = parsed["int_value"]
+                return
+            if kind == 1:
+                self.literal = parsed["float_value"]
+                return
+            if kind == 2:
+                self.literal = mark_safe(parsed["string_value"])
+                self.translate = parsed["translate"]
+                return
+            if kind == 3:
+                self.lookups = tuple(parsed["lookups"])
+                self.translate = parsed["translate"]
+                return
+            if kind == 4:
+                err = parsed["error"]
+                if err == "underscore":
+                    raise TemplateSyntaxError(
+                        "Variables and attributes may "
+                        "not begin with underscores: '%s'" % var
+                    )
+                if err == "invalid_char":
+                    raise TemplateSyntaxError(
+                        "Invalid character ('%s') in variable name: '%s'"
+                        % (parsed["error_detail"], var)
+                    )
+                # Fall through to Python for other edge cases.
+
         try:
             # First try to treat this variable as a number.
             #
@@ -924,7 +1025,11 @@ class Variable:
     def resolve(self, context):
         """Resolve this variable against a given context."""
         if self.lookups is not None:
-            # We're dealing with a variable that needs to be resolved
+            # Fast path: nested dict/list lookups without callables.
+            if _native.AVAILABLE and not self.translate:
+                ok, value = _native.resolve_dict_lookups(context, list(self.lookups))
+                if ok:
+                    return value
             value = self._resolve_lookup(context)
         else:
             # We're dealing with a literal, so it's already been "resolved"

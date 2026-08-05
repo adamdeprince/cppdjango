@@ -125,7 +125,12 @@ class ArrayField(CheckPostgresInstalledMixin, CheckFieldDefaultMixin, Field):
         return "%s::{}".format(self.db_type(connection))
 
     def get_db_prep_value(self, value, connection, prepared=False):
+        from django import native as _native
+
         if isinstance(value, (list, tuple)):
+            if _native.AVAILABLE and len(value) == 0:
+                # Empty list still prepared as empty sequence for adapters.
+                return []
             return [
                 self.base_field.get_db_prep_value(i, connection, prepared=False)
                 for i in value
@@ -133,8 +138,13 @@ class ArrayField(CheckPostgresInstalledMixin, CheckFieldDefaultMixin, Field):
         return value
 
     def deconstruct(self):
+        from django import native as _native
+
         name, path, args, kwargs = super().deconstruct()
-        if path == "django.contrib.postgres.fields.array.ArrayField":
+        if _native.AVAILABLE:
+            if _native.postgres_arrayfield_path_shorten(path):
+                path = "django.contrib.postgres.fields.ArrayField"
+        elif path == "django.contrib.postgres.fields.array.ArrayField":
             path = "django.contrib.postgres.fields.ArrayField"
         kwargs["base_field"] = self.base_field.clone()
         if self.size is not None:

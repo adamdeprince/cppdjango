@@ -79,8 +79,15 @@ class LoginView(RedirectURLMixin, FormView):
 
     def dispatch(self, request, *args, **kwargs):
         if self.redirect_authenticated_user and self.request.user.is_authenticated:
+            from django import native as _native
+
             redirect_to = self.get_success_url()
-            if redirect_to == self.request.path:
+            same = (
+                _native.paths_equal(redirect_to, self.request.path)
+                if _native.AVAILABLE
+                else redirect_to == self.request.path
+            )
+            if same:
                 raise ValueError(
                     "Redirection loop for authenticated user detected. Check that "
                     "your LOGIN_REDIRECT_URL doesn't point to a login page."

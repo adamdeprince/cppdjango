@@ -107,14 +107,26 @@ class Operation:
         """
         Output a brief summary of what the action does.
         """
+        from django import native as _native
+
+        args = str(self._constructor_args)
+        if _native.AVAILABLE:
+            return _native.migration_describe(self.__class__.__name__, args)
         return "%s: %s" % (self.__class__.__name__, self._constructor_args)
 
     def formatted_description(self):
         """Output a description prefixed by a category symbol."""
+        from django import native as _native
+
         description = self.describe()
-        if self.category is None:
-            return f"{OperationCategory.MIXED.value} {description}"
-        return f"{self.category.value} {description}"
+        category = (
+            OperationCategory.MIXED.value
+            if self.category is None
+            else self.category.value
+        )
+        if _native.AVAILABLE:
+            return _native.migration_formatted_description(category, description)
+        return f"{category} {description}"
 
     @property
     def migration_name_fragment(self):

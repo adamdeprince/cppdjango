@@ -304,9 +304,16 @@ class BaseCommand:
         Create and return the ``ArgumentParser`` which will be used to
         parse the arguments to this command.
         """
+        from django import native as _native
+
         kwargs.setdefault("formatter_class", DjangoHelpFormatter)
+        base = os.path.basename(prog_name)
+        if _native.AVAILABLE:
+            prog = _native.management_prog(base, subcommand)
+        else:
+            prog = "%s %s" % (base, subcommand)
         parser = CommandParser(
-            prog="%s %s" % (os.path.basename(prog_name), subcommand),
+            prog=prog,
             description=self.help or None,
             missing_args_message=getattr(self, "missing_args_message", None),
             called_from_command_line=getattr(self, "_called_from_command_line", None),

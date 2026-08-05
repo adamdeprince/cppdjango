@@ -5,6 +5,7 @@ Code to manage the creation and SQL rendering of 'where' constraints.
 import operator
 from functools import reduce
 
+from django import native as _native
 from django.core.exceptions import EmptyResultSet, FullResultSet
 from django.db.models.expressions import Case, When
 from django.db.models.functions import Mod
@@ -122,7 +123,11 @@ class WhereNode(tree.Node):
         """
         result = []
         result_params = []
-        if self.connector == AND:
+        if _native.AVAILABLE:
+            full_needed, empty_needed = _native.where_needed_counts(
+                self.connector, len(self.children)
+            )
+        elif self.connector == AND:
             full_needed, empty_needed = len(self.children), 1
         else:
             full_needed, empty_needed = 1, len(self.children)
@@ -147,23 +152,34 @@ class WhereNode(tree.Node):
             )
 
         for child in self.children:
+            child_kind = 0  # ok sql
             try:
                 sql, params = compiler.compile(child)
             except EmptyResultSet:
-                empty_needed -= 1
+                child_kind = 1
             except FullResultSet:
-                full_needed -= 1
+                child_kind = 2
             else:
                 if sql:
                     result.append(sql)
                     result_params.extend(params)
+                    child_kind = 0
                 else:
-                    full_needed -= 1
+                    child_kind = 3
+            if _native.AVAILABLE:
+                code, full_needed, empty_needed = _native.where_child_outcome(
+                    child_kind, self.negated, full_needed, empty_needed
+                )
+                if code == 1:
+                    raise EmptyResultSet
+                if code == 2:
+                    raise FullResultSet
+                continue
+            if child_kind == 1:
+                empty_needed -= 1
+            elif child_kind in (2, 3):
+                full_needed -= 1
             # Check if this node matches nothing or everything.
-            # First check the amount of full nodes and empty nodes
-            # to make this node empty/full.
-            # Now, check if this node is full/empty using the
-            # counts.
             if empty_needed == 0:
                 if self.negated:
                     raise FullResultSet
@@ -174,6 +190,15 @@ class WhereNode(tree.Node):
                     raise EmptyResultSet
                 else:
                     raise FullResultSet
+        if not result:
+            raise FullResultSet
+        if _native.AVAILABLE:
+            sql_string = _native.where_combine_sql(
+                self.connector, result, self.negated, self.resolved
+            )
+            if not sql_string:
+                raise FullResultSet
+            return sql_string, result_params
         conn = " %s " % self.connector
         sql_string = conn.join(result)
         if not sql_string:

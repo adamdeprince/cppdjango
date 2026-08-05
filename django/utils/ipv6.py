@@ -1,5 +1,6 @@
 import ipaddress
 
+from django import native as _native
 from django.core.exceptions import ValidationError
 from django.utils.translation import gettext_lazy as _
 
@@ -36,6 +37,32 @@ def clean_ipv6_address(
 
     Return a compressed IPv6 address or the same value.
     """
+    if _native.AVAILABLE and isinstance(ip_str, str):
+        cleaned = _native.clean_ipv6_address(ip_str, unpack_ipv4, max_length)
+        if cleaned is not None:
+            return cleaned
+        # Distinguish oversize (ValueError in traceback tests) from invalid.
+        if len(ip_str) > max_length:
+            try:
+                _ipv6_address_from_str(ip_str, max_length)
+            except ValueError:
+                raise ValidationError(
+                    error_message, code="invalid", params={"protocol": _("IPv6")}
+                )
+        # Fall through to Python for exotic forms native rejected incorrectly,
+        # or raise if Python also rejects.
+        try:
+            addr = _ipv6_address_from_str(ip_str, max_length)
+        except ValueError:
+            raise ValidationError(
+                error_message, code="invalid", params={"protocol": _("IPv6")}
+            )
+        if unpack_ipv4 and addr.ipv4_mapped:
+            return str(addr.ipv4_mapped)
+        elif addr.ipv4_mapped:
+            return "::ffff:%s" % str(addr.ipv4_mapped)
+        return str(addr)
+
     try:
         addr = _ipv6_address_from_str(ip_str, max_length)
     except ValueError:

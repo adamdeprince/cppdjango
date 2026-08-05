@@ -126,13 +126,22 @@ class RelatedField(FieldCacheMixin, Field):
     def _check_related_name_is_valid(self):
         import keyword
 
+        from django import native as _native
+
         related_name = self.remote_field.related_name
         if related_name is None:
             return []
-        is_valid_id = (
-            not keyword.iskeyword(related_name) and related_name.isidentifier()
-        )
-        if not (is_valid_id or related_name.endswith("+")):
+        if _native.AVAILABLE:
+            is_valid_id = not keyword.iskeyword(related_name) and (
+                _native.related_name_is_identifier(related_name)
+            )
+            ends_plus = _native.related_name_ends_plus(related_name)
+        else:
+            is_valid_id = (
+                not keyword.iskeyword(related_name) and related_name.isidentifier()
+            )
+            ends_plus = related_name.endswith("+")
+        if not (is_valid_id or ends_plus):
             return [
                 checks.Error(
                     "The name '%s' is invalid related_name for field %s.%s"
@@ -152,11 +161,18 @@ class RelatedField(FieldCacheMixin, Field):
         return []
 
     def _check_related_query_name_is_valid(self):
+        from django import native as _native
+
         if self.remote_field.hidden:
             return []
         rel_query_name = self.related_query_name()
         errors = []
-        if rel_query_name.endswith("_"):
+        ends_us = (
+            _native.related_query_name_ends_underscore(rel_query_name)
+            if _native.AVAILABLE
+            else rel_query_name.endswith("_")
+        )
+        if ends_us:
             errors.append(
                 checks.Error(
                     "Reverse query name '%s' must not end with an underscore."
@@ -169,7 +185,12 @@ class RelatedField(FieldCacheMixin, Field):
                     id="fields.E308",
                 )
             )
-        if LOOKUP_SEP in rel_query_name:
+        has_sep = (
+            _native.related_query_name_has_lookup_sep(rel_query_name)
+            if _native.AVAILABLE
+            else LOOKUP_SEP in rel_query_name
+        )
+        if has_sep:
             errors.append(
                 checks.Error(
                     "Reverse query name '%s' must not contain '%s'."
@@ -415,6 +436,15 @@ class RelatedField(FieldCacheMixin, Field):
         returned by related descriptors. obj is an instance of
         self.related_field.model.
         """
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return {
+                _native.related_filter_key(self.name, rh_field.name): getattr(
+                    obj, rh_field.attname
+                )
+                for _, rh_field in self.related_fields
+            }
         return {
             "%s__%s" % (self.name, rh_field.name): getattr(obj, rh_field.attname)
             for _, rh_field in self.related_fields
@@ -456,11 +486,16 @@ class RelatedField(FieldCacheMixin, Field):
         return None
 
     def set_attributes_from_rel(self):
-        self.name = self.name or (
-            self.remote_field.model._meta.model_name
-            + "_"
-            + self.remote_field.model._meta.pk.name
-        )
+        from django import native as _native
+
+        if self.name is None:
+            meta = self.remote_field.model._meta
+            if _native.AVAILABLE:
+                self.name = _native.fk_default_name(
+                    meta.model_name, meta.pk.name
+                )
+            else:
+                self.name = meta.model_name + "_" + meta.pk.name
         if self.verbose_name is None:
             self.verbose_name = self.remote_field.model._meta.verbose_name
         self.remote_field.set_field_name()

@@ -231,8 +231,14 @@ class AppConfig:
             self.apps.check_models_ready()
         else:
             self.apps.check_apps_ready()
+        from django import native as _native
+
         try:
-            return self.models[model_name.lower()]
+            if _native.AVAILABLE:
+                key = _native.ascii_lower(model_name)
+            else:
+                key = model_name.lower()
+            return self.models[key]
         except KeyError:
             raise LookupError(
                 "App '%s' doesn't have a '%s' model." % (self.label, model_name)

@@ -25,6 +25,13 @@ from .utils import resolve_relation
 
 def _get_app_label_and_model_name(model, app_label=""):
     if isinstance(model, str):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            ok, module, attr = _native.split_dotted_path(model)
+            if ok:
+                return module, attr
+            return app_label, model
         split = model.split(".", 1)
         return tuple(split) if len(split) == 2 else (app_label, split[0])
     else:

@@ -113,8 +113,13 @@ class BaseConstraint:
         return errors
 
     def deconstruct(self):
+        from django import native as _native
+
         path = "%s.%s" % (self.__class__.__module__, self.__class__.__name__)
-        path = path.replace("django.db.models.constraints", "django.db.models")
+        if _native.AVAILABLE:
+            path = _native.constraint_deconstruct_path(path)
+        else:
+            path = path.replace("django.db.models.constraints", "django.db.models")
         kwargs = {"name": self.name}
         if (
             self.violation_error_message is not None

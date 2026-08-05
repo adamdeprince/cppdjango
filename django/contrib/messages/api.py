@@ -66,7 +66,14 @@ def set_level(request, level):
 
     If set to ``None``, use the default level (see the get_level() function).
     """
-    if not hasattr(request, "_messages"):
+    from django import native as _native
+
+    has_storage = hasattr(request, "_messages")
+    if _native.AVAILABLE:
+        # signal_has_receivers style: truthy attribute presence.
+        if not has_storage:
+            return False
+    elif not has_storage:
         return False
     request._messages.level = level
     return True

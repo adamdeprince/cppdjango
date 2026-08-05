@@ -70,7 +70,13 @@ class File(FileProxyMixin):
         always return ``False`` -- there's no good reason to read from memory
         in chunks.
         """
-        return self.size > (chunk_size or self.DEFAULT_CHUNK_SIZE)
+        from django import native as _native
+
+        size = self.size
+        chunk = chunk_size or self.DEFAULT_CHUNK_SIZE
+        if _native.AVAILABLE:
+            return _native.file_multiple_chunks(int(size), int(chunk))
+        return size > chunk
 
     def __iter__(self):
         # Iterate over this file-like object by newlines

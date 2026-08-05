@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 
 from asgiref.sync import sync_to_async
 
+from django import native as _native
 from django.conf import settings
 from django.core import signing
 from django.utils import timezone
@@ -195,6 +196,10 @@ class SessionBase:
         "Return session key that isn't being used."
         while True:
             session_key = get_random_string(32, VALID_KEY_CHARS)
+            if _native.AVAILABLE and not _native.is_valid_session_key(
+                session_key, 8, True
+            ):
+                continue
             if not self.exists(session_key):
                 return session_key
 
@@ -219,6 +224,8 @@ class SessionBase:
         Key must be truthy and at least 8 characters long. 8 characters is an
         arbitrary lower bound for some minimal key security.
         """
+        if _native.AVAILABLE and isinstance(key, str):
+            return _native.is_valid_session_key(key, 8, False)
         return key and len(key) >= 8
 
     def _get_session_key(self):
@@ -285,13 +292,21 @@ class SessionBase:
         except KeyError:
             expiry = self.get("_session_expiry")
 
+        cookie_age = self.get_session_cookie_age()
+        if _native.AVAILABLE and not isinstance(expiry, (datetime, str)):
+            # None / 0 / int remaining-seconds path.
+            if expiry is None or expiry == 0:
+                return _native.session_expiry_age_seconds(cookie_age, None, None)
+            return _native.session_expiry_age_seconds(cookie_age, None, int(expiry))
         if not expiry:  # Checks both None and 0 cases
-            return self.get_session_cookie_age()
+            return cookie_age
         if not isinstance(expiry, (datetime, str)):
             return expiry
         if isinstance(expiry, str):
             expiry = datetime.fromisoformat(expiry)
         delta = expiry - modification
+        if _native.AVAILABLE:
+            return _native.session_delta_seconds(delta.days, delta.seconds)
         return delta.days * 86400 + delta.seconds
 
     async def aget_expiry_age(self, **kwargs):
@@ -304,13 +319,20 @@ class SessionBase:
         except KeyError:
             expiry = await self.aget("_session_expiry")
 
+        cookie_age = self.get_session_cookie_age()
+        if _native.AVAILABLE and not isinstance(expiry, (datetime, str)):
+            if expiry is None or expiry == 0:
+                return _native.session_expiry_age_seconds(cookie_age, None, None)
+            return _native.session_expiry_age_seconds(cookie_age, None, int(expiry))
         if not expiry:  # Checks both None and 0 cases
-            return self.get_session_cookie_age()
+            return cookie_age
         if not isinstance(expiry, (datetime, str)):
             return expiry
         if isinstance(expiry, str):
             expiry = datetime.fromisoformat(expiry)
         delta = expiry - modification
+        if _native.AVAILABLE:
+            return _native.session_delta_seconds(delta.days, delta.seconds)
         return delta.days * 86400 + delta.seconds
 
     def get_expiry_date(self, **kwargs):

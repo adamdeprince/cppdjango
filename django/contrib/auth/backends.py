@@ -93,6 +93,13 @@ class ModelBackend(BaseBackend):
         Reject users with is_active=False. Custom user models that don't have
         that attribute are allowed.
         """
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            has = hasattr(user, "is_active")
+            return _native.user_can_authenticate(
+                has, bool(user.is_active) if has else True
+            )
         return getattr(user, "is_active", True)
 
     def _get_user_permissions(self, user_obj):

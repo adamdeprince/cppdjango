@@ -77,8 +77,15 @@ class TranslationCatalog:
     """
 
     def __init__(self, trans=None):
+        from django import native as _native
+
         self._catalogs = [trans._catalog.copy()] if trans else [{}]
-        self._plurals = [trans.plural] if trans else [lambda n: int(n != 1)]
+        if trans:
+            self._plurals = [trans.plural]
+        elif _native.AVAILABLE:
+            self._plurals = [_native.plural_index_default]
+        else:
+            self._plurals = [lambda n: int(n != 1)]
 
     def __getitem__(self, key):
         for cat in self._catalogs:
@@ -510,7 +517,14 @@ def get_supported_language_variant(lang_code, strict=False):
     if lang_code:
         # Truncate the language code to a maximum length to avoid potential
         # denial of service attacks.
-        if len(lang_code) > LANGUAGE_CODE_MAX_LENGTH:
+        from django import native as _native
+
+        too_long = (
+            _native.language_code_too_long(len(lang_code), LANGUAGE_CODE_MAX_LENGTH)
+            if _native.AVAILABLE
+            else len(lang_code) > LANGUAGE_CODE_MAX_LENGTH
+        )
+        if too_long:
             if (
                 not strict
                 and (index := lang_code.rfind("-", 0, LANGUAGE_CODE_MAX_LENGTH)) > 0

@@ -33,6 +33,14 @@ class Node:
         return str(self.key)
 
     def __repr__(self):
+        from django import native as _native
+
+        if _native.AVAILABLE and isinstance(self.key[0], str) and isinstance(
+            self.key[1], str
+        ):
+            return _native.migration_node_repr(
+                self.__class__.__name__, self.key[0], self.key[1]
+            )
         return "<%s: (%r, %r)>" % (self.__class__.__name__, self.key[0], self.key[1])
 
     def add_child(self, child):

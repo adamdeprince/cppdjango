@@ -51,7 +51,14 @@ class LoginRequiredMiddleware(MiddlewareMixin):
     redirect_field_name = REDIRECT_FIELD_NAME
 
     def process_view(self, request, view_func, view_args, view_kwargs):
-        if not getattr(view_func, "login_required", True):
+        from django import native as _native
+
+        login_required = getattr(view_func, "login_required", True)
+        # Dual-path: treat missing/True as requiring login (bool identity).
+        if _native.AVAILABLE:
+            if not bool(login_required):
+                return None
+        elif not login_required:
             return None
 
         if request.user.is_authenticated:

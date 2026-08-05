@@ -8,6 +8,7 @@ from urllib.parse import quote, unquote
 from urllib.parse import urlencode as original_urlencode
 from urllib.parse import urlsplit
 
+from django import native as _native
 from django.utils.datastructures import MultiValueDict
 from django.utils.regex_helper import _lazy_re_compile
 
@@ -94,6 +95,8 @@ def http_date(epoch_seconds=None):
 
     Output a string in the format 'Wdy, DD Mon YYYY HH:MM:SS GMT'.
     """
+    if _native.AVAILABLE:
+        return _native.http_date(epoch_seconds)
     return formatdate(epoch_seconds, usegmt=True)
 
 
@@ -106,6 +109,13 @@ def parse_http_date(date):
 
     Return an integer expressed in seconds since the epoch, in UTC.
     """
+    if _native.AVAILABLE:
+        try:
+            return _native.parse_http_date(date, datetime.now(tz=UTC).year)
+        except ValueError:
+            # Fall through to Python for edge cases (e.g. years outside
+            # timegm range such as year 0037).
+            pass
     # email.utils.parsedate() does the job for RFC 1123 dates; unfortunately
     # RFC 9110 makes it mandatory to support RFC 850 dates too. So we roll
     # our own RFC-compliant parsing.
@@ -160,6 +170,11 @@ def base36_to_int(s):
     # is sufficient to base36-encode any 64-bit integer)
     if len(s) > 13:
         raise ValueError("Base36 input too large")
+    if _native.AVAILABLE:
+        try:
+            return _native.base36_to_int(s)
+        except ValueError:
+            raise ValueError("invalid literal for int() with base 36: %r" % s)
     return int(s, 36)
 
 
@@ -168,6 +183,8 @@ def int_to_base36(i):
     char_set = "0123456789abcdefghijklmnopqrstuvwxyz"
     if i < 0:
         raise ValueError("Negative base36 conversion input.")
+    if _native.AVAILABLE and isinstance(i, int) and i <= 0xFFFFFFFFFFFFFFFF:
+        return _native.int_to_base36(i)
     if i < 36:
         return char_set[i]
     b36 = ""
@@ -182,6 +199,8 @@ def urlsafe_base64_encode(s):
     Encode a bytestring to a base64 string for use in URLs. Strip any trailing
     equal signs.
     """
+    if _native.AVAILABLE:
+        return _native.urlsafe_base64_encode(s)
     return base64.urlsafe_b64encode(s).rstrip(b"\n=").decode("ascii")
 
 
@@ -190,6 +209,11 @@ def urlsafe_base64_decode(s):
     Decode a base64 encoded string. Add back any trailing equal signs that
     might have been stripped.
     """
+    if _native.AVAILABLE:
+        try:
+            return _native.urlsafe_base64_decode(s)
+        except ValueError as e:
+            raise ValueError(e)
     s = s.encode()
     try:
         return base64.urlsafe_b64decode(s.ljust(len(s) + len(s) % 4, b"="))
@@ -203,6 +227,8 @@ def parse_etags(etag_str):
     defined by RFC 9110. Return a list of quoted ETags, or ['*'] if all ETags
     should be matched.
     """
+    if _native.AVAILABLE:
+        return _native.parse_etags(etag_str)
     if etag_str.strip() == "*":
         return ["*"]
     else:
@@ -216,6 +242,8 @@ def quote_etag(etag_str):
     If the provided string is already a quoted ETag, return it. Otherwise, wrap
     the string in quotes, making it a strong ETag.
     """
+    if _native.AVAILABLE:
+        return _native.quote_etag(etag_str)
     if ETAG_MATCH.match(etag_str):
         return etag_str
     else:
@@ -233,6 +261,9 @@ def is_same_domain(host, pattern):
     """
     if not pattern:
         return False
+
+    if _native.AVAILABLE:
+        return _native.is_same_domain(host, pattern)
 
     pattern = pattern.lower()
     return (
@@ -311,6 +342,8 @@ def escape_leading_slashes(url):
     escaped to prevent browsers from handling the path as schemaless and
     redirecting to another host.
     """
+    if _native.AVAILABLE:
+        return _native.escape_leading_slashes(url)
     if url.startswith("//"):
         url = "/%2F{}".format(url.removeprefix("//"))
     return url
@@ -335,9 +368,14 @@ def parse_header_parameters(line, max_length=MAX_HEADER_LENGTH):
     Return the main content-type and a dictionary of options.
 
     If `line` is longer than `max_length`, `ValueError` is raised.
+
+    Uses the C++ acceleration layer when available (see ``django.native``).
     """
     if not line:
         return "", {}
+
+    if _native.AVAILABLE:
+        return _native.parse_header_parameters(line, max_length)
 
     if max_length is not None and len(line) > max_length:
         raise ValueError("Unable to parse header parameters (value too long).")
@@ -372,6 +410,8 @@ def content_disposition_header(as_attachment, filename):
     Construct a Content-Disposition HTTP header value from the given filename
     as specified by RFC 6266.
     """
+    if _native.AVAILABLE:
+        return _native.content_disposition_header(as_attachment, filename)
     if filename:
         disposition = "attachment" if as_attachment else "inline"
         try:

@@ -1,3 +1,4 @@
+from django import native as _native
 from django.utils.cache import patch_vary_headers
 from django.utils.deprecation import MiddlewareMixin
 from django.utils.regex_helper import _lazy_re_compile
@@ -17,8 +18,13 @@ class GZipMiddleware(MiddlewareMixin):
 
     def process_response(self, request, response):
         # It's not worth attempting to compress really short responses.
-        if not response.streaming and len(response.content) < 200:
-            return response
+        if not response.streaming:
+            content_len = len(response.content)
+            if _native.AVAILABLE:
+                if _native.gzip_content_too_short(content_len, 200):
+                    return response
+            elif content_len < 200:
+                return response
 
         # Avoid gzipping if we've already got a content-encoding.
         if response.has_header("Content-Encoding"):
@@ -27,7 +33,10 @@ class GZipMiddleware(MiddlewareMixin):
         patch_vary_headers(response, ("Accept-Encoding",))
 
         ae = request.META.get("HTTP_ACCEPT_ENCODING", "")
-        if not re_accepts_gzip.search(ae):
+        if _native.AVAILABLE:
+            if not _native.accepts_gzip(ae):
+                return response
+        elif not re_accepts_gzip.search(ae):
             return response
 
         if response.streaming:
@@ -59,8 +68,11 @@ class GZipMiddleware(MiddlewareMixin):
         # of RFC 9110 Section 8.8.1 while also allowing conditional request
         # matches on ETags.
         etag = response.get("ETag")
-        if etag and etag.startswith('"'):
-            response.headers["ETag"] = "W/" + etag
+        if etag:
+            if _native.AVAILABLE:
+                response.headers["ETag"] = _native.weak_etag_if_strong(etag)
+            elif etag.startswith('"'):
+                response.headers["ETag"] = "W/" + etag
         response.headers["Content-Encoding"] = "gzip"
 
         return response

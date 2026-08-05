@@ -58,17 +58,27 @@ def construct_instance(form, instance, fields=None, exclude=None):
 
     cleaned_data = form.cleaned_data
     file_field_list = []
+    from django import native as _native
+
     for f in opts.fields:
-        if (
-            not f.editable
-            or isinstance(f, models.AutoField)
-            or f.name not in cleaned_data
-        ):
+        if isinstance(f, models.AutoField) or f.name not in cleaned_data:
             continue
-        if fields is not None and f.name not in fields:
-            continue
-        if exclude and f.name in exclude:
-            continue
+        if _native.AVAILABLE:
+            if not _native.form_field_included(
+                f.editable,
+                fields is None,
+                fields is not None and f.name in fields,
+                bool(exclude),
+                bool(exclude) and f.name in exclude,
+            ):
+                continue
+        else:
+            if not f.editable:
+                continue
+            if fields is not None and f.name not in fields:
+                continue
+            if exclude and f.name in exclude:
+                continue
         # Leave defaults for fields that aren't in POST data, except for
         # checkbox inputs because they don't appear in POST data if not
         # checked.
@@ -110,13 +120,26 @@ def model_to_dict(instance, fields=None, exclude=None):
     """
     opts = instance._meta
     data = {}
+    from django import native as _native
+
     for f in chain(opts.concrete_fields, opts.private_fields, opts.many_to_many):
-        if not getattr(f, "editable", False):
-            continue
-        if fields is not None and f.name not in fields:
-            continue
-        if exclude and f.name in exclude:
-            continue
+        editable = getattr(f, "editable", False)
+        if _native.AVAILABLE:
+            if not _native.form_field_included(
+                editable,
+                fields is None,
+                fields is not None and f.name in fields,
+                bool(exclude),
+                bool(exclude) and f.name in exclude,
+            ):
+                continue
+        else:
+            if not editable:
+                continue
+            if fields is not None and f.name not in fields:
+                continue
+            if exclude and f.name in exclude:
+                continue
         data[f.name] = f.value_from_object(instance)
     return data
 
@@ -660,7 +683,12 @@ def modelform_factory(
     if formfield_callback:
         Meta.formfield_callback = staticmethod(formfield_callback)
     # Give this new form class a reasonable name.
-    class_name = model.__name__ + "Form"
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        class_name = _native.modelform_class_name(model.__name__)
+    else:
+        class_name = model.__name__ + "Form"
 
     # Class attributes for the new form class.
     form_class_attrs = {"Meta": Meta}

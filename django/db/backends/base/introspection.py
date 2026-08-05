@@ -49,10 +49,17 @@ class BaseDatabaseIntrospection:
         """
 
         def get_names(cursor):
+            from django import native as _native
+
             return sorted(
                 ti.name
                 for ti in self.get_table_list(cursor)
-                if include_views or ti.type == "t"
+                if include_views
+                or (
+                    _native.introspection_is_table(ti.type)
+                    if _native.AVAILABLE
+                    else ti.type == "t"
+                )
             )
 
         if cursor is None:

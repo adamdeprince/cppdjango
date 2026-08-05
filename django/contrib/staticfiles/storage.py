@@ -158,7 +158,18 @@ class HashedFilesMixin:
         path, filename = os.path.split(clean_name)
         root, ext = os.path.splitext(filename)
         file_hash = (".%s" % file_hash) if file_hash else ""
-        hashed_name = os.path.join(path, "%s%s%s" % (root, file_hash, ext))
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            base = _native.hashed_static_basename(root, file_hash, ext)
+            if path:
+                hashed_name = _native.posix_path_join(
+                    path.replace("\\", "/"), base
+                )
+            else:
+                hashed_name = base
+        else:
+            hashed_name = os.path.join(path, "%s%s%s" % (root, file_hash, ext))
         unparsed_name = list(parsed_name)
         unparsed_name[2] = hashed_name
         # Special casing for a @font-face hack, like url(myfont.eot?#iefix")

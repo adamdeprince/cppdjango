@@ -1,43 +1,61 @@
 import functools
 import uuid
 
+from django import native as _native
+
 
 class IntConverter:
     regex = "[0-9]+"
 
     def to_python(self, value):
-        return int(value)
+        return _native.converter_int_to_python(value)
 
     def to_url(self, value):
-        return str(value)
+        return _native.converter_int_to_url(value)
 
 
 class StringConverter:
     regex = "[^/]+"
 
     def to_python(self, value):
-        return value
+        return _native.converter_str_to_python(value)
 
     def to_url(self, value):
-        return value
+        return _native.converter_str_to_url(value)
 
 
 class UUIDConverter:
     regex = "[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"
 
     def to_python(self, value):
-        return uuid.UUID(value)
+        try:
+            return _native.converter_uuid_to_python(value)
+        except ValueError:
+            # Alternate UUID forms (e.g. from reverse/user input).
+            return uuid.UUID(value)
 
     def to_url(self, value):
-        return str(value)
+        return _native.converter_uuid_to_url(value)
 
 
 class SlugConverter(StringConverter):
     regex = "[-a-zA-Z0-9_]+"
 
+    def to_python(self, value):
+        return _native.converter_slug_to_python(value)
+
+    def to_url(self, value):
+        return _native.converter_slug_to_url(value)
+
 
 class PathConverter(StringConverter):
     regex = ".+"
+
+    def to_python(self, value):
+        return _native.converter_path_to_python(value)
+
+    def to_url(self, value):
+        return _native.converter_path_to_url(value)
 
 
 DEFAULT_CONVERTERS = {
@@ -47,7 +65,6 @@ DEFAULT_CONVERTERS = {
     "str": StringConverter(),
     "uuid": UUIDConverter(),
 }
-
 
 REGISTERED_CONVERTERS = {}
 

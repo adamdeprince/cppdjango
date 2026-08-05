@@ -164,10 +164,18 @@ class Options:
 
     @property
     def label(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.model_meta_label(self.app_label, self.object_name)
         return "%s.%s" % (self.app_label, self.object_name)
 
     @property
     def label_lower(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.model_meta_label(self.app_label, self.model_name)
         return "%s.%s" % (self.app_label, self.model_name)
 
     @property

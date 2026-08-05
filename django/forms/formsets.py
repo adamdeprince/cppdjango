@@ -170,16 +170,25 @@ class BaseFormSet(RenderableFormMixin):
 
     def total_form_count(self):
         """Return the total number of forms in this FormSet."""
+        from django import native as _native
+
         if self.is_bound:
             # return absolute_max if it is lower than the actual total form
             # count in the data; this is DoS protection to prevent clients
             # from forcing the server to instantiate arbitrary numbers of
             # forms
-            return min(
-                self.management_form.cleaned_data[TOTAL_FORM_COUNT], self.absolute_max
-            )
+            submitted = self.management_form.cleaned_data[TOTAL_FORM_COUNT]
+            if _native.AVAILABLE:
+                return _native.formset_total_forms_bound(
+                    submitted, self.absolute_max
+                )
+            return min(submitted, self.absolute_max)
         else:
             initial_forms = self.initial_form_count()
+            if _native.AVAILABLE:
+                return _native.formset_total_forms_unbound(
+                    initial_forms, self.min_num, self.extra, self.max_num
+                )
             total_forms = max(initial_forms, self.min_num) + self.extra
             # Allow all existing related objects/inlines to be displayed,
             # but don't allow extra beyond max_num.

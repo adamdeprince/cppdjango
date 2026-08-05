@@ -132,6 +132,12 @@ def iri_to_uri(iri):
         return iri
     elif isinstance(iri, Promise):
         iri = str(iri)
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        if isinstance(iri, bytes):
+            iri = iri.decode("utf-8")
+        return _native.iri_to_uri(iri)
     return quote(iri, safe="/#%[]=:;$&()+,!?*@'~")
 
 
@@ -164,6 +170,10 @@ def uri_to_iri(uri):
     """
     if uri is None:
         return uri
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.uri_to_iri(force_bytes(uri))
     uri = force_bytes(uri)
     # Fast selective unquote: First, split on '%' and then starting with the
     # second block, decode the first 2 bytes if they represent a hex code to
@@ -202,6 +212,10 @@ def escape_uri_path(path):
     # and "?" according to RFC 3986 Section 3.3.
     # The reason for not subtracting and escaping "/" is that we are escaping
     # the entire path, not a path segment.
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.escape_uri_path(str(path))
     return quote(path, safe="/:@&+$,-_.!~*'()")
 
 
@@ -242,7 +256,12 @@ def filepath_to_uri(path):
         return path
     # I know about `os.sep` and `os.altsep` but I want to leave
     # some flexibility for hardcoding separators.
-    return quote(str(path).replace("\\", "/"), safe="/~!*()'")
+    from django import native as _native
+
+    path_s = str(path).replace("\\", "/")
+    if _native.AVAILABLE:
+        return _native.filepath_to_uri(path_s)
+    return quote(path_s, safe="/~!*()'")
 
 
 def get_system_encoding():

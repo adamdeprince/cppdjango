@@ -445,6 +445,12 @@ def partition(predicate, values):
         >>> partition(lambda x: x > 3, range(5))
         [0, 1, 2, 3], [4]
     """
+    # Predicate is Python-callable; dual-path only for empty sized collections.
+    from django import native as _native
+
+    if _native.AVAILABLE and isinstance(values, (list, tuple)):
+        if _native.collector_add_empty(len(values)):
+            return [], []
     results = ([], [])
     for item in values:
         results[predicate(item)].append(item)

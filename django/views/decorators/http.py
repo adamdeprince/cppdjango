@@ -35,7 +35,16 @@ def require_http_methods(request_method_list):
 
             @wraps(func)
             async def inner(request, *args, **kwargs):
-                if request.method not in request_method_list:
+                from django import native as _native
+
+                method = request.method
+                if _native.AVAILABLE:
+                    allowed = _native.http_method_in_names(
+                        method, list(request_method_list)
+                    )
+                else:
+                    allowed = method in request_method_list
+                if not allowed:
                     response = HttpResponseNotAllowed(request_method_list)
                     log_response(
                         "Method Not Allowed (%s): %s",
@@ -51,7 +60,16 @@ def require_http_methods(request_method_list):
 
             @wraps(func)
             def inner(request, *args, **kwargs):
-                if request.method not in request_method_list:
+                from django import native as _native
+
+                method = request.method
+                if _native.AVAILABLE:
+                    allowed = _native.http_method_in_names(
+                        method, list(request_method_list)
+                    )
+                else:
+                    allowed = method in request_method_list
+                if not allowed:
                     response = HttpResponseNotAllowed(request_method_list)
                     log_response(
                         "Method Not Allowed (%s): %s",

@@ -55,10 +55,17 @@ class PasswordResetTokenGenerator:
         if not (user and token):
             return False
         # Parse the token
-        try:
-            ts_b36, _ = token.split("-")
-        except ValueError:
-            return False
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            ok, ts_b36, _ = _native.password_reset_token_split(token)
+            if not ok:
+                return False
+        else:
+            try:
+                ts_b36, _ = token.split("-")
+            except ValueError:
+                return False
 
         try:
             ts = base36_to_int(ts_b36)
@@ -84,6 +91,8 @@ class PasswordResetTokenGenerator:
     def _make_token_with_timestamp(self, user, timestamp, secret):
         # timestamp is number of seconds since 2001-1-1. Converted to base 36,
         # this gives us a 6 digit string until about 2069.
+        from django import native as _native
+
         ts_b36 = int_to_base36(timestamp)
         hash_string = salted_hmac(
             self.key_salt,
@@ -93,6 +102,8 @@ class PasswordResetTokenGenerator:
         ).hexdigest()[
             ::2
         ]  # Limit to shorten the URL.
+        if _native.AVAILABLE:
+            return _native.password_reset_token_join(ts_b36, hash_string)
         return "%s-%s" % (ts_b36, hash_string)
 
     def _make_hash_value(self, user, timestamp):

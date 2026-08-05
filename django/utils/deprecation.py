@@ -41,12 +41,19 @@ class warn_about_renamed_method:
 
     def __call__(self, f):
         def wrapper(*args, **kwargs):
-            warnings.warn(
-                "`%s.%s` is deprecated, use `%s` instead."
-                % (self.class_name, self.old_method_name, self.new_method_name),
-                self.deprecation_warning,
-                2,
-            )
+            from django import native as _native
+
+            if _native.AVAILABLE:
+                msg = _native.renamed_method_warning(
+                    self.class_name, self.old_method_name, self.new_method_name
+                )
+            else:
+                msg = "`%s.%s` is deprecated, use `%s` instead." % (
+                    self.class_name,
+                    self.old_method_name,
+                    self.new_method_name,
+                )
+            warnings.warn(msg, self.deprecation_warning, 2)
             return f(*args, **kwargs)
 
         return wrapper

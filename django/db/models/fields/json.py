@@ -94,6 +94,10 @@ class JSONField(CheckFieldDefaultMixin, Field):
             return value
 
     def get_internal_type(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.jsonfield_internal_type()
         return "JSONField"
 
     def get_db_prep_value(self, value, connection, prepared=False):

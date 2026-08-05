@@ -6,8 +6,10 @@ include LICENSE.python
 include MANIFEST.in
 include package.json
 include tox.ini
+include CMakeLists.txt
 include *.rst
 graft django
+graft cpp
 graft docs
 graft extras
 graft js_tests

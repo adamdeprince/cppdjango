@@ -1,5 +1,7 @@
 from http import cookies
 
+from django import native as _native
+
 # For backwards compatibility in Django 2.1.
 SimpleCookie = cookies.SimpleCookie
 
@@ -8,6 +10,8 @@ def parse_cookie(cookie):
     """
     Return a dictionary parsed from a `Cookie:` header string.
     """
+    if _native.AVAILABLE:
+        return _native.parse_cookie(cookie)
     cookiedict = {}
     for chunk in cookie.split(";"):
         if "=" in chunk:

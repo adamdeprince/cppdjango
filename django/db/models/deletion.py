@@ -122,7 +122,14 @@ class Collector:
 
         Return a list of all objects that were not already collected.
         """
-        if not objs:
+        from django import native as _native
+
+        # Prefer sized collections for the native empty check; otherwise use
+        # truthiness (QuerySet.__bool__ uses EXISTS, not full evaluation).
+        if _native.AVAILABLE and isinstance(objs, (list, tuple)):
+            if _native.collector_add_empty(len(objs)):
+                return []
+        elif not objs:
             return []
         new_objs = []
         model = objs[0].__class__
@@ -194,46 +201,70 @@ class Collector:
         skipping parent -> child -> parent chain preventing fast delete of
         the child.
         """
-        if from_field and from_field.remote_field.on_delete is not CASCADE:
-            return False
+        from django import native as _native
+
+        from_field_blocks = bool(
+            from_field and from_field.remote_field.on_delete is not CASCADE
+        )
         if hasattr(objs, "_meta"):
             model = objs._meta.model
+            model_ok = True
         elif hasattr(objs, "model") and hasattr(objs, "_raw_delete"):
             model = objs.model
+            model_ok = True
         else:
+            model = None
+            model_ok = False
+        if not model_ok:
+            if _native.AVAILABLE:
+                return _native.can_fast_delete_result(
+                    from_field_blocks, False, False, False, False, False
+                )
             return False
-        if self._has_signal_listeners(model):
+        if from_field_blocks:
+            if _native.AVAILABLE:
+                return _native.can_fast_delete_result(
+                    True, True, False, False, False, False
+                )
             return False
+        has_signals = self._has_signal_listeners(model)
         # The use of from_field comes from the need to avoid cascade back to
         # parent when parent delete is cascading to child.
         opts = model._meta
-        return (
-            all(
-                link == from_field
-                for link in opts.concrete_model._meta.parents.values()
-            )
-            and
-            # Foreign keys pointing to this model.
-            all(
-                related.field.remote_field.on_delete is DO_NOTHING
-                for related in get_candidate_relations_to_delete(opts)
-            )
-            and (
-                # Something like generic foreign key.
-                not any(
-                    hasattr(field, "bulk_related_objects")
-                    for field in opts.private_fields
-                )
-            )
+        parents_ok = all(
+            link == from_field for link in opts.concrete_model._meta.parents.values()
         )
+        relations_ok = all(
+            related.field.remote_field.on_delete is DO_NOTHING
+            for related in get_candidate_relations_to_delete(opts)
+        )
+        no_bulk_related = not any(
+            hasattr(field, "bulk_related_objects") for field in opts.private_fields
+        )
+        if _native.AVAILABLE:
+            return _native.can_fast_delete_result(
+                False, True, has_signals, parents_ok, relations_ok, no_bulk_related
+            )
+        if has_signals:
+            return False
+        return parents_ok and relations_ok and no_bulk_related
 
     def get_del_batches(self, objs, fields):
         """
         Return the objs in suitably sized batches for the used connection.
         """
+        from django import native as _native
+
         conn_batch_size = max(
             connections[self.using].ops.bulk_batch_size(fields, objs), 1
         )
+        if _native.AVAILABLE:
+            return [
+                objs[start:end]
+                for start, end in _native.in_bulk_batch_ranges(
+                    len(objs), conn_batch_size
+                )
+            ]
         if len(objs) > conn_batch_size:
             return [
                 objs[i : i + conn_batch_size]
@@ -433,6 +464,8 @@ class Collector:
         self.data = {model: self.data[model] for model in sorted_models}
 
     def delete(self):
+        from django import native as _native
+
         # sort instance collections
         for model, instances in self.data.items():
             self.data[model] = sorted(instances, key=attrgetter("pk"))
@@ -444,8 +477,19 @@ class Collector:
         # number of objects deleted for each model label
         deleted_counter = Counter()
 
+        if _native.AVAILABLE and _native.collector_delete_empty(
+            len(self.data), len(self.fast_deletes)
+        ):
+            return 0, {}
+
         # Optimize for the case with a single obj and no dependencies
-        if len(self.data) == 1 and len(instances) == 1:
+        if _native.AVAILABLE:
+            single_fast = _native.collector_single_fast_path(
+                len(self.data), len(instances) if self.data else 0
+            )
+        else:
+            single_fast = len(self.data) == 1 and len(instances) == 1
+        if single_fast:
             instance = list(instances)[0]
             if self.can_fast_delete(instance):
                 with transaction.mark_for_rollback_on_error(self.using):

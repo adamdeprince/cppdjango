@@ -1,6 +1,8 @@
 import copy
 from collections.abc import Mapping
 
+from django import native as _native
+
 
 class OrderedSet:
     """
@@ -86,6 +88,11 @@ class MultiValueDict(dict):
             list_ = super().__getitem__(key)
         except KeyError:
             raise MultiValueDictKeyError(key)
+        if not list_:
+            return []
+        # Native path only when all values are str (QueryDict / form data).
+        if _native.AVAILABLE and list_ and all(isinstance(v, str) for v in list_):
+            return _native.mvd_last_value(list_)
         try:
             return list_[-1]
         except IndexError:

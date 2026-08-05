@@ -904,15 +904,27 @@ class Query(BaseExpression):
         If 'create' is true, a new alias is always created. Otherwise, the
         most recently created alias for the table (if one exists) is reused.
         """
+        from django import native as _native
+
         alias_list = self.table_map.get(table_name)
         if not create and alias_list:
             alias = alias_list[0]
-            self.alias_refcount[alias] += 1
+            if _native.AVAILABLE:
+                self.alias_refcount[alias] = _native.alias_refcount_add(
+                    self.alias_refcount[alias], 1
+                )
+            else:
+                self.alias_refcount[alias] += 1
             return alias, False
 
         # Create a new alias for this table.
         if alias_list:
-            alias = "%s%d" % (self.alias_prefix, len(self.alias_map) + 1)
+            if _native.AVAILABLE:
+                alias = _native.next_numbered_alias(
+                    self.alias_prefix, len(self.alias_map)
+                )
+            else:
+                alias = "%s%d" % (self.alias_prefix, len(self.alias_map) + 1)
             alias_list.append(alias)
         else:
             # The first occurrence of a table uses the table name directly.
@@ -925,11 +937,25 @@ class Query(BaseExpression):
 
     def ref_alias(self, alias):
         """Increases the reference count for this alias."""
-        self.alias_refcount[alias] += 1
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            self.alias_refcount[alias] = _native.alias_refcount_add(
+                self.alias_refcount[alias], 1
+            )
+        else:
+            self.alias_refcount[alias] += 1
 
     def unref_alias(self, alias, amount=1):
         """Decreases the reference count for this alias."""
-        self.alias_refcount[alias] -= amount
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            self.alias_refcount[alias] = _native.alias_refcount_add(
+                self.alias_refcount[alias], -amount
+            )
+        else:
+            self.alias_refcount[alias] -= amount
 
     def promote_joins(self, aliases):
         """
@@ -1350,7 +1376,12 @@ class Query(BaseExpression):
         """
         Solve the lookup type from the lookup (e.g.: 'foobar__id__icontains').
         """
-        lookup_splitted = lookup.split(LOOKUP_SEP)
+        from django import native as _native
+
+        if _native.AVAILABLE and isinstance(lookup, str):
+            lookup_splitted = _native.split_lookup_path(lookup)
+        else:
+            lookup_splitted = lookup.split(LOOKUP_SEP)
         if self.annotations:
             annotation, expression_lookups = refs_expression(
                 lookup_splitted, self.annotations
@@ -1361,12 +1392,24 @@ class Query(BaseExpression):
                     expression = Ref(annotation, expression)
                 return expression_lookups, (), expression
         _, field, _, lookup_parts = self.names_to_path(lookup_splitted, self.get_meta())
-        field_parts = lookup_splitted[0 : len(lookup_splitted) - len(lookup_parts)]
-        if len(lookup_parts) > 1 and not field_parts:
-            raise FieldError(
-                'Invalid lookup "%s" for model %s".'
-                % (lookup, self.get_meta().model.__name__)
+        if _native.AVAILABLE:
+            field_parts = _native.lookup_field_parts(
+                lookup_splitted, len(lookup_parts)
             )
+            if _native.lookup_invalid_without_field(
+                len(lookup_parts), len(field_parts)
+            ):
+                raise FieldError(
+                    'Invalid lookup "%s" for model %s".'
+                    % (lookup, self.get_meta().model.__name__)
+                )
+        else:
+            field_parts = lookup_splitted[0 : len(lookup_splitted) - len(lookup_parts)]
+            if len(lookup_parts) > 1 and not field_parts:
+                raise FieldError(
+                    'Invalid lookup "%s" for model %s".'
+                    % (lookup, self.get_meta().model.__name__)
+                )
         return lookup_parts, field_parts, False
 
     def check_query_object_type(self, value, opts, field):
@@ -1426,8 +1469,14 @@ class Query(BaseExpression):
         The lookups is a list of names to extract using get_lookup()
         and get_transform().
         """
+        from django import native as _native
+
         # __exact is the default lookup if one isn't given.
-        *transforms, lookup_name = lookups or ["exact"]
+        if _native.AVAILABLE:
+            lookups = _native.lookup_or_exact(lookups or [])
+        else:
+            lookups = lookups or ["exact"]
+        *transforms, lookup_name = lookups
         for name in transforms:
             lhs = self.try_transform(lhs, name, lookups)
         # First try get_lookup() so that the lookup takes precedence if the lhs
@@ -1563,9 +1612,16 @@ class Query(BaseExpression):
 
         pre_joins = self.alias_refcount.copy()
         value = self.resolve_lookup_value(value, can_reuse, allow_joins, summarize)
-        used_joins = {
-            k for k, v in self.alias_refcount.items() if v > pre_joins.get(k, 0)
-        }
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            used_joins = set(
+                _native.alias_refcount_increased(pre_joins, self.alias_refcount)
+            )
+        else:
+            used_joins = {
+                k for k, v in self.alias_refcount.items() if v > pre_joins.get(k, 0)
+            }
 
         if check_filterable:
             self.check_filterable(value)
@@ -2329,18 +2385,27 @@ class Query(BaseExpression):
         If 'ordering' is empty, clear all ordering from the query.
         """
         errors = []
+        from django import native as _native
+
         for item in ordering:
             if isinstance(item, str):
                 if item == "?":
                     continue
-                item = item.removeprefix("-")
+                if _native.AVAILABLE:
+                    item, _desc = _native.split_order_by_item(item)
+                else:
+                    item = item.removeprefix("-")
                 if item in self.annotations:
                     continue
                 if self.extra and item in self.extra:
                     continue
                 # names_to_path() validates the lookup. A descriptive
                 # FieldError will be raise if it's not.
-                self.names_to_path(item.split(LOOKUP_SEP), self.model._meta)
+                if _native.AVAILABLE:
+                    path = _native.split_lookup_path(item)
+                else:
+                    path = item.split(LOOKUP_SEP)
+                self.names_to_path(path, self.model._meta)
             elif not hasattr(item, "resolve_expression"):
                 errors.append(item)
             if getattr(item, "contains_aggregate", False):
@@ -2755,7 +2820,14 @@ def get_order_dir(field, default="ASC"):
     The 'default' param is used to indicate which way no prefix (or a '+'
     prefix) should sort. The '-' prefix always sorts the opposite way.
     """
+    from django import native as _native
+
     dirn = ORDER_DIR[default]
+    if _native.AVAILABLE and isinstance(field, str):
+        if field[:1] == "+":
+            return field[1:], dirn[0]
+        name, descending = _native.split_order_by_item(field)
+        return name, dirn[1] if descending else dirn[0]
     if field[0] == "-":
         return field[1:], dirn[1]
     return field, dirn[0]
@@ -2768,9 +2840,15 @@ class JoinPromoter:
     """
 
     def __init__(self, connector, num_children, negated):
+        from django import native as _native
+
         self.connector = connector
         self.negated = negated
-        if self.negated:
+        if _native.AVAILABLE:
+            self.effective_connector = _native.join_promoter_effective_connector(
+                connector, negated
+            )
+        elif self.negated:
             if connector == AND:
                 self.effective_connector = OR
             else:
@@ -2804,6 +2882,8 @@ class JoinPromoter:
         """
         to_promote = set()
         to_demote = set()
+        from django import native as _native
+
         # The effective_connector is used so that NOT (a AND b) is treated
         # similarly to (a OR b) for join promotion.
         for table, votes in self.votes.items():
@@ -2817,22 +2897,32 @@ class JoinPromoter:
             # to rel_a would remove a valid match from the query. So, we need
             # to promote any existing INNER to LOUTER (it is possible this
             # promotion in turn will be demoted later on).
-            if self.effective_connector == OR and votes < self.num_children:
-                to_promote.add(table)
-            # If connector is AND and there is a filter that can match only
-            # when there is a joinable row, then use INNER. For example, in
-            # rel_a__col=1 & rel_b__col=2, if either of the rels produce NULL
-            # as join output, then the col=1 or col=2 can't match (as
-            # NULL=anything is always false).
-            # For the OR case, if all children voted for a join to be inner,
-            # then we can use INNER for the join. For example:
-            #     (rel_a__col__icontains=Alex | rel_a__col__icontains=Russell)
-            # then if rel_a doesn't produce any rows, the whole condition
-            # can't match. Hence we can safely use INNER join.
-            if self.effective_connector == AND or (
-                self.effective_connector == OR and votes == self.num_children
-            ):
-                to_demote.add(table)
+            if _native.AVAILABLE:
+                if _native.join_promoter_should_promote(
+                    self.effective_connector, votes, self.num_children
+                ):
+                    to_promote.add(table)
+                if _native.join_promoter_should_demote(
+                    self.effective_connector, votes, self.num_children
+                ):
+                    to_demote.add(table)
+            else:
+                if self.effective_connector == OR and votes < self.num_children:
+                    to_promote.add(table)
+                # If connector is AND and there is a filter that can match only
+                # when there is a joinable row, then use INNER. For example, in
+                # rel_a__col=1 & rel_b__col=2, if either of the rels produce NULL
+                # as join output, then the col=1 or col=2 can't match (as
+                # NULL=anything is always false).
+                # For the OR case, if all children voted for a join to be inner,
+                # then we can use INNER for the join. For example:
+                #     (rel_a__col__icontains=Alex | rel_a__col__icontains=Russell)
+                # then if rel_a doesn't produce any rows, the whole condition
+                # can't match. Hence we can safely use INNER join.
+                if self.effective_connector == AND or (
+                    self.effective_connector == OR and votes == self.num_children
+                ):
+                    to_demote.add(table)
             # Finally, what happens in cases where we have:
             #    (rel_a__col=1|rel_b__col=2) & rel_a__col__gte=0
             # Now, we first generate the OR clause, and promote joins for it

@@ -71,6 +71,10 @@ class AdminSite:
         all_sites.add(self)
 
     def __repr__(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.admin_site_repr(self.__class__.__name__, self.name)
         return f"{self.__class__.__name__}(name={self.name!r})"
 
     def check(self, app_configs):

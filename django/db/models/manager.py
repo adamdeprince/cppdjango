@@ -34,6 +34,10 @@ class BaseManager:
 
     def __str__(self):
         """Return "app_label.model_label.manager_name"."""
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.manager_str(self.model._meta.label, self.name)
         return "%s.%s" % (self.model._meta.label, self.name)
 
     def __class_getitem__(cls, *args, **kwargs):
@@ -106,8 +110,15 @@ class BaseManager:
 
     @classmethod
     def from_queryset(cls, queryset_class, class_name=None):
+        from django import native as _native
+
         if class_name is None:
-            class_name = "%sFrom%s" % (cls.__name__, queryset_class.__name__)
+            if _native.AVAILABLE:
+                class_name = _native.from_queryset_class_name(
+                    cls.__name__, queryset_class.__name__
+                )
+            else:
+                class_name = "%sFrom%s" % (cls.__name__, queryset_class.__name__)
         return type(
             class_name,
             (cls,),

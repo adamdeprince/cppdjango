@@ -104,8 +104,22 @@ class FileBasedCache(BaseCache):
         of num_entries / cull_frequency. A value of 0 for CULL_FREQUENCY means
         that the entire cache will be purged.
         """
+        from django import native as _native
+
         filelist = self._list_cache_files()
         num_entries = len(filelist)
+        if _native.AVAILABLE:
+            if not _native.cache_cull_needed(num_entries, self._max_entries):
+                return
+            sample = _native.cache_cull_sample_size(
+                num_entries, self._cull_frequency
+            )
+            if sample == 0:
+                return self.clear()
+            filelist = random.sample(filelist, sample)
+            for fname in filelist:
+                self._delete(fname)
+            return
         if num_entries < self._max_entries:
             return  # return early if no culling is required
         if self._cull_frequency == 0:
@@ -126,16 +140,15 @@ class FileBasedCache(BaseCache):
         Convert a key into a cache file path. Basically this is the
         root cache path joined with the md5sum of the key and a suffix.
         """
+        from django import native as _native
+
         key = self.make_and_validate_key(key, version=version)
-        return os.path.join(
-            self._dir,
-            "".join(
-                [
-                    md5(key.encode(), usedforsecurity=False).hexdigest(),
-                    self.cache_suffix,
-                ]
-            ),
-        )
+        digest = md5(key.encode(), usedforsecurity=False).hexdigest()
+        if _native.AVAILABLE:
+            fname = _native.cache_file_name(digest, self.cache_suffix)
+        else:
+            fname = "".join([digest, self.cache_suffix])
+        return os.path.join(self._dir, fname)
 
     def clear(self):
         """
@@ -148,11 +161,20 @@ class FileBasedCache(BaseCache):
         """
         Take an open cache file `f` and delete it if it's expired.
         """
+        from django import native as _native
+
         try:
             exp = pickle.load(f)
         except EOFError:
             exp = 0  # An empty file is considered expired.
-        if exp is not None and exp < time.time():
+        now = time.time()
+        if _native.AVAILABLE:
+            expired = _native.cache_timestamp_expired(
+                exp is None, 0.0 if exp is None else float(exp), now
+            )
+        else:
+            expired = exp is not None and exp < now
+        if expired:
             f.close()  # On Windows a file has to be closed before deleting
             self._delete(f.name)
             return True

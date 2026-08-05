@@ -21,10 +21,19 @@ def import_string(dotted_path):
     Import a dotted module path and return the attribute/class designated by
     the last name in the path. Raise ImportError if the import failed.
     """
-    try:
-        module_path, class_name = dotted_path.rsplit(".", 1)
-    except ValueError as err:
-        raise ImportError("%s doesn't look like a module path" % dotted_path) from err
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        ok, module_path, class_name = _native.split_dotted_path(dotted_path)
+        if not ok:
+            raise ImportError("%s doesn't look like a module path" % dotted_path)
+    else:
+        try:
+            module_path, class_name = dotted_path.rsplit(".", 1)
+        except ValueError as err:
+            raise ImportError(
+                "%s doesn't look like a module path" % dotted_path
+            ) from err
 
     try:
         return cached_import(module_path, class_name)
@@ -55,7 +64,15 @@ def autodiscover_modules(*args, **kwargs):
                 if register_to:
                     before_import_registry = copy.copy(register_to._registry)
 
-                import_module("%s.%s" % (app_config.name, module_to_search))
+                from django import native as _native
+
+                if _native.AVAILABLE:
+                    mod_path = _native.app_module_path(
+                        app_config.name, module_to_search
+                    )
+                else:
+                    mod_path = "%s.%s" % (app_config.name, module_to_search)
+                import_module(mod_path)
             except Exception:
                 # Reset the registry to the state before the last import
                 # as this import will have to reoccur on the next request and

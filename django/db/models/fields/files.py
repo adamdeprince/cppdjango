@@ -264,7 +264,12 @@ class FileField(Field):
                 )
         self.upload_to = upload_to
 
-        kwargs.setdefault("max_length", 100)
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            kwargs.setdefault("max_length", _native.filefield_default_max_length())
+        else:
+            kwargs.setdefault("max_length", 100)
         super().__init__(verbose_name, name, **kwargs)
 
     def check(self, **kwargs):

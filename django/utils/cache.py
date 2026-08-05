@@ -19,6 +19,7 @@ import time
 from collections import defaultdict
 from hashlib import md5
 
+from django import native as _native
 from django.conf import settings
 from django.core.cache import caches
 from django.http import HttpResponse, HttpResponseNotModified
@@ -43,6 +44,18 @@ def patch_cache_control(response, **kwargs):
     * All other parameters are added with their value, after applying
       str() to it.
     """
+    if _native.AVAILABLE and kwargs:
+        existing = response.get("Cache-Control") or ""
+        triples = []
+        for k, v in kwargs.items():
+            if v is True:
+                triples.append((k, "", True))
+            else:
+                triples.append((k, str(v), False))
+        response.headers["Cache-Control"] = _native.merge_cache_control(
+            existing, triples
+        )
+        return
 
     def dictitem(s):
         t = s.split("=", 1)
@@ -107,6 +120,8 @@ def get_max_age(response):
     """
     if not response.has_header("Cache-Control"):
         return
+    if _native.AVAILABLE:
+        return _native.get_max_age_from_cc(response.headers["Cache-Control"])
     cc = dict(
         _to_tuple(el) for el in cc_delim_re.split(response.headers["Cache-Control"])
     )
@@ -216,6 +231,8 @@ def _if_match_passes(target_etag, etags):
     """
     Test the If-Match comparison as defined in RFC 9110 Section 13.1.1.
     """
+    if _native.AVAILABLE:
+        return _native.if_match_passes(target_etag, etags)
     if not target_etag:
         # If there isn't an ETag, then there can't be a match.
         return False
@@ -238,6 +255,8 @@ def _if_unmodified_since_passes(last_modified, if_unmodified_since):
     Test the If-Unmodified-Since comparison as defined in RFC 9110 Section
     13.1.4.
     """
+    if _native.AVAILABLE:
+        return _native.if_unmodified_since_passes(last_modified, if_unmodified_since)
     return last_modified and last_modified <= if_unmodified_since
 
 
@@ -245,6 +264,8 @@ def _if_none_match_passes(target_etag, etags):
     """
     Test the If-None-Match comparison as defined in RFC 9110 Section 13.1.2.
     """
+    if _native.AVAILABLE:
+        return _native.if_none_match_passes(target_etag, etags)
     if not target_etag:
         # If there isn't an ETag, then there isn't a match.
         return True
@@ -265,6 +286,8 @@ def _if_modified_since_passes(last_modified, if_modified_since):
     Test the If-Modified-Since comparison as defined in RFC 9110 Section
     13.1.3.
     """
+    if _native.AVAILABLE:
+        return _native.if_modified_since_passes(last_modified, if_modified_since)
     return not last_modified or last_modified > if_modified_since
 
 
@@ -307,6 +330,12 @@ def patch_vary_headers(response, newheaders):
     # Note that we need to keep the original order intact, because cache
     # implementations may rely on the order of the Vary contents in, say,
     # computing an MD5 hash.
+    if _native.AVAILABLE:
+        existing = response.headers["Vary"] if response.has_header("Vary") else ""
+        response.headers["Vary"] = _native.patch_vary_headers_value(
+            existing, list(newheaders)
+        )
+        return
     if response.has_header("Vary"):
         vary_headers = cc_delim_re.split(response.headers["Vary"])
     else:
@@ -331,6 +360,10 @@ def has_vary_header(response, header_query):
     """
     if not response.has_header("Vary"):
         return False
+    if _native.AVAILABLE:
+        return _native.has_vary_header_value(
+            response.headers["Vary"], header_query
+        )
     vary_headers = cc_delim_re.split(response.headers["Vary"])
     existing_headers = {header.lower().strip() for header in vary_headers}
     return header_query.lower().strip() in existing_headers

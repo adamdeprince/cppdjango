@@ -187,6 +187,10 @@ class DatabaseOperations(BaseDatabaseOperations):
         return [sql]
 
     def quote_name(self, name):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.sql_quote_name(name, "double")
         if name.startswith('"') and name.endswith('"'):
             return name  # Quoting once is enough.
         return '"%s"' % name
@@ -195,6 +199,10 @@ class DatabaseOperations(BaseDatabaseOperations):
         return mogrify(sql, params, self.connection)
 
     def set_time_zone_sql(self):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.postgres_set_timezone_sql()
         return "SELECT set_config('TimeZone', %s, false)"
 
     def sql_flush(self, style, tables, *, reset_sequences=False, allow_cascade=False):
@@ -289,10 +297,16 @@ class DatabaseOperations(BaseDatabaseOperations):
         return 63
 
     def distinct_sql(self, fields, params):
+        from django import native as _native
+
         if fields:
             params = [param for param_list in params for param in param_list]
+            if _native.AVAILABLE:
+                return ([_native.sql_distinct_clause(list(fields), allow_on=True)], params)
             return (["DISTINCT ON (%s)" % ", ".join(fields)], params)
         else:
+            if _native.AVAILABLE:
+                return [_native.sql_distinct_clause([], allow_on=True)], []
             return ["DISTINCT"], []
 
     if is_psycopg3:

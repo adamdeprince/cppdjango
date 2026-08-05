@@ -63,7 +63,14 @@ class MultipleObjectMixin(ContextMixin):
         try:
             page_number = int(page)
         except ValueError:
-            if page == "last":
+            from django import native as _native
+
+            is_last = (
+                _native.page_token_is_last(str(page))
+                if _native.AVAILABLE
+                else page == "last"
+            )
+            if is_last:
                 page_number = paginator.num_pages
             else:
                 raise Http404(
@@ -115,7 +122,12 @@ class MultipleObjectMixin(ContextMixin):
         if self.context_object_name:
             return self.context_object_name
         elif hasattr(object_list, "model"):
-            return "%s_list" % object_list.model._meta.model_name
+            from django import native as _native
+
+            name = object_list.model._meta.model_name
+            if _native.AVAILABLE:
+                return _native.list_context_object_name(name)
+            return "%s_list" % name
         else:
             return None
 
@@ -201,11 +213,20 @@ class MultipleObjectTemplateResponseMixin(TemplateResponseMixin):
         # name list so that user-supplied names override the automatically-
         # generated ones.
         if hasattr(self.object_list, "model"):
+            from django import native as _native
+
             opts = self.object_list.model._meta
-            names.append(
-                "%s/%s%s.html"
-                % (opts.app_label, opts.model_name, self.template_name_suffix)
-            )
+            if _native.AVAILABLE:
+                names.append(
+                    _native.model_template_name(
+                        opts.app_label, opts.model_name, self.template_name_suffix
+                    )
+                )
+            else:
+                names.append(
+                    "%s/%s%s.html"
+                    % (opts.app_label, opts.model_name, self.template_name_suffix)
+                )
         elif not names:
             raise ImproperlyConfigured(
                 "%(cls)s requires either a 'template_name' attribute "

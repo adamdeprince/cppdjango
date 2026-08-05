@@ -10,6 +10,7 @@ from operator import itemgetter
 from pprint import pformat
 from urllib.parse import quote
 
+from django import native as _native
 from django.utils import formats
 from django.utils.dateformat import format, time_format
 from django.utils.encoding import iri_to_uri
@@ -65,6 +66,8 @@ def addslashes(value):
     example. Less useful for escaping JavaScript; use the ``escapejs``
     filter instead.
     """
+    if _native.AVAILABLE:
+        return _native.filter_addslashes(value)
     return value.replace("\\", "\\\\").replace('"', '\\"').replace("'", "\\'")
 
 
@@ -72,7 +75,11 @@ def addslashes(value):
 @stringfilter
 def capfirst(value):
     """Capitalize the first character of the value."""
-    return value and value[0].upper() + value[1:]
+    if not value:
+        return value
+    if _native.AVAILABLE and value[0].isascii():
+        return _native.filter_capfirst(value)
+    return value[0].upper() + value[1:]
 
 
 @register.filter("escapejs")
@@ -162,6 +169,12 @@ def floatformat(text, arg=-1):
     except ValueError:
         return input_val
 
+    # Fast unlocalized path for simple decimals (no grouping).
+    if _native.AVAILABLE and not force_grouping and not use_l10n:
+        simple = _native.floatformat_ascii(input_val, p)
+        if simple is not None:
+            return mark_safe(simple)
+
     _, digits, exponent = d.as_tuple()
     try:
         number_of_digits_and_exponent_sum = len(digits) + abs(exponent)
@@ -224,6 +237,7 @@ def floatformat(text, arg=-1):
 @stringfilter
 def iriencode(value):
     """Escape an IRI value for use in a URL."""
+    # iri_to_uri is already dual-path (native C++ when available).
     return iri_to_uri(value)
 
 
@@ -231,11 +245,14 @@ def iriencode(value):
 @stringfilter
 def linenumbers(value, autoescape=True):
     """Display text with line numbers."""
+    do_escape = autoescape and not isinstance(value, SafeData)
+    if _native.AVAILABLE:
+        return mark_safe(_native.linenumbers(value, do_escape))
     lines = value.split("\n")
     # Find the maximum width of the line count, for use with zero padding
     # string format command
     width = str(len(str(len(lines))))
-    if not autoescape or isinstance(value, SafeData):
+    if not do_escape:
         for i, line in enumerate(lines):
             lines[i] = ("%0" + width + "d. %s") % (i + 1, line)
     else:
@@ -248,6 +265,8 @@ def linenumbers(value, autoescape=True):
 @stringfilter
 def lower(value):
     """Convert a string into all lowercase."""
+    if _native.AVAILABLE and value.isascii():
+        return _native.filter_lower(value)
     return value.lower()
 
 
@@ -260,6 +279,8 @@ def make_list(value):
     For an integer, it's a list of digits.
     For a string, it's a list of characters.
     """
+    if _native.AVAILABLE:
+        return _native.make_list_chars(value)
     return list(value)
 
 
@@ -288,6 +309,10 @@ def stringformat(value, arg):
     """
     if isinstance(value, tuple):
         value = str(value)
+    if _native.AVAILABLE and not isinstance(value, (list, dict, tuple)):
+        simple = _native.stringformat_simple(str(value), str(arg))
+        if simple is not None:
+            return simple
     try:
         return ("%" + str(arg)) % value
     except (ValueError, TypeError):
@@ -298,6 +323,8 @@ def stringformat(value, arg):
 @stringfilter
 def title(value):
     """Convert a string into titlecase."""
+    if _native.AVAILABLE and value.isascii():
+        return _native.filter_title(value)
     t = re.sub("([a-z])'([A-Z])", lambda m: m[0].lower(), value.title())
     return re.sub(r"\d([A-Z])", lambda m: m[0].lower(), t)
 
@@ -359,6 +386,8 @@ def truncatewords_html(value, arg):
 @stringfilter
 def upper(value):
     """Convert a string into all uppercase."""
+    if _native.AVAILABLE and value.isascii():
+        return _native.filter_upper(value)
     return value.upper()
 
 
@@ -373,6 +402,9 @@ def urlencode(value, safe=None):
     characters (but an empty string can be provided when *all* characters
     should be escaped).
     """
+    if _native.AVAILABLE:
+        # urllib.parse.quote default safe is "/".
+        return _native.url_quote(value, "/" if safe is None else str(safe))
     kwargs = {}
     if safe is not None:
         kwargs["safe"] = safe
@@ -404,6 +436,8 @@ def urlizetrunc(value, limit, autoescape=True):
 @stringfilter
 def wordcount(value):
     """Return the number of words."""
+    if _native.AVAILABLE and value.isascii():
+        return _native.filter_wordcount(value)
     return len(value.split())
 
 
@@ -418,6 +452,8 @@ def wordwrap(value, arg):
 @stringfilter
 def ljust(value, arg):
     """Left-align the value in a field of a given width."""
+    if _native.AVAILABLE:
+        return _native.filter_ljust(value, int(arg))
     return value.ljust(int(arg))
 
 
@@ -425,6 +461,8 @@ def ljust(value, arg):
 @stringfilter
 def rjust(value, arg):
     """Right-align the value in a field of a given width."""
+    if _native.AVAILABLE:
+        return _native.filter_rjust(value, int(arg))
     return value.rjust(int(arg))
 
 
@@ -435,6 +473,8 @@ def center(value, arg):
     width = int(arg)
     if width <= 0:
         return value
+    if _native.AVAILABLE:
+        return _native.filter_center(value, width)
     return f"{value:^{width}}"
 
 
@@ -443,7 +483,10 @@ def center(value, arg):
 def cut(value, arg):
     """Remove all values of arg from the given string."""
     safe = isinstance(value, SafeData)
-    value = value.replace(arg, "")
+    if _native.AVAILABLE:
+        value = _native.filter_cut(value, arg)
+    else:
+        value = value.replace(arg, "")
     if safe and arg != ";":
         return mark_safe(value)
     return value
@@ -502,6 +545,8 @@ def linebreaksbr(value, autoescape=True):
     (``<br>``).
     """
     autoescape = autoescape and not isinstance(value, SafeData)
+    if _native.AVAILABLE:
+        return mark_safe(_native.linebreaksbr(str(value), autoescape))
     value = normalize_newlines(value)
     if autoescape:
         value = escape(value)
@@ -529,6 +574,7 @@ def safeseq(value):
 @stringfilter
 def striptags(value):
     """Strip all [X]HTML tags."""
+    # strip_tags is dual-path (native C++ when available).
     return strip_tags(value)
 
 
@@ -581,6 +627,11 @@ def dictsort(value, arg):
     Given a list of dicts, return that list sorted by the property given in
     the argument.
     """
+    if _native.AVAILABLE:
+        try:
+            return _native.dictsort(value, arg, False)
+        except (AttributeError, TypeError, ValueError, IndexError, KeyError):
+            return ""
     try:
         return sorted(value, key=_property_resolver(arg))
     except (AttributeError, TypeError):
@@ -593,6 +644,11 @@ def dictsortreversed(value, arg):
     Given a list of dicts, return that list sorted in reverse order by the
     property given in the argument.
     """
+    if _native.AVAILABLE:
+        try:
+            return _native.dictsort(value, arg, True)
+        except (AttributeError, TypeError, ValueError, IndexError, KeyError):
+            return ""
     try:
         return sorted(value, key=_property_resolver(arg), reverse=True)
     except (AttributeError, TypeError):
@@ -602,6 +658,8 @@ def dictsortreversed(value, arg):
 @register.filter(is_safe=False)
 def first(value):
     """Return the first item in a list."""
+    if _native.AVAILABLE and isinstance(value, str):
+        return _native.utf8_first(value)
     try:
         return value[0]
     except IndexError:
@@ -612,6 +670,14 @@ def first(value):
 def join(value, arg, autoescape=True):
     """Join a list with a string, like Python's ``str.join(list)``."""
     try:
+        if _native.AVAILABLE:
+            if autoescape:
+                parts = [str(conditional_escape(v)) for v in value]
+                sep = str(conditional_escape(arg))
+            else:
+                parts = [str(v) for v in value]
+                sep = str(arg)
+            return mark_safe(_native.join_strings(parts, sep))
         if autoescape:
             data = conditional_escape(arg).join([conditional_escape(v) for v in value])
         else:
@@ -624,6 +690,8 @@ def join(value, arg, autoescape=True):
 @register.filter(is_safe=True)
 def last(value):
     """Return the last item in a list."""
+    if _native.AVAILABLE and isinstance(value, str):
+        return _native.utf8_last(value)
     try:
         return value[-1]
     except IndexError:
@@ -633,6 +701,8 @@ def last(value):
 @register.filter(is_safe=False)
 def length(value):
     """Return the length of the value - useful for lists."""
+    if _native.AVAILABLE and isinstance(value, str):
+        return _native.utf8_length(value)
     try:
         return len(value)
     except (ValueError, TypeError):
@@ -642,6 +712,11 @@ def length(value):
 @register.filter(is_safe=True)
 def random(value):
     """Return a random item from the list."""
+    if _native.AVAILABLE:
+        try:
+            return _native.sequence_random(value)
+        except (TypeError, IndexError):
+            return ""
     try:
         return random_module.choice(value)
     except IndexError:
@@ -660,6 +735,15 @@ def slice_filter(value, arg):
                 bits.append(None)
             else:
                 bits.append(int(x))
+        # slice(*bits) semantics: one arg is stop; two are start,stop; three add step.
+        if _native.AVAILABLE and isinstance(value, str):
+            if len(bits) == 1:
+                return _native.filter_slice_string(value, None, bits[0], None)
+            if len(bits) == 2:
+                return _native.filter_slice_string(value, bits[0], bits[1], None)
+            return _native.filter_slice_string(
+                value, bits[0], bits[1], bits[2] if len(bits) > 2 else None
+            )
         return value[slice(*bits)]
 
     except (ValueError, TypeError, KeyError):
@@ -688,6 +772,9 @@ def unordered_list(value, autoescape=True):
         </ul>
         </li>
     """
+    if _native.AVAILABLE:
+        return mark_safe(_native.unordered_list(value, autoescape))
+
     if autoescape:
         escaper = conditional_escape
     else:
@@ -745,6 +832,10 @@ def unordered_list(value, autoescape=True):
 @register.filter(is_safe=False)
 def add(value, arg):
     """Add the arg to the value."""
+    if _native.AVAILABLE:
+        result = _native.filter_add_int(value, arg)
+        if result is not None:
+            return result
     try:
         return int(value) + int(arg)
     except (ValueError, TypeError):
@@ -762,6 +853,8 @@ def get_digit(value, arg):
     original value for invalid input (if input or argument is not an integer,
     or if argument is less than 1). Otherwise, output is always an integer.
     """
+    if _native.AVAILABLE:
+        return _native.get_digit(value, arg)
     try:
         arg = int(arg)
         value = int(value)
@@ -840,12 +933,16 @@ def timeuntil_filter(value, arg=None):
 @register.filter(is_safe=False)
 def default(value, arg):
     """If value is unavailable, use given default."""
+    if _native.AVAILABLE:
+        return _native.filter_default(value, arg)
     return value or arg
 
 
 @register.filter(is_safe=False)
 def default_if_none(value, arg):
     """If value is None, use given default."""
+    if _native.AVAILABLE:
+        return _native.filter_default_if_none(value, arg)
     if value is None:
         return arg
     return value
@@ -854,6 +951,8 @@ def default_if_none(value, arg):
 @register.filter(is_safe=False)
 def divisibleby(value, arg):
     """Return True if the value is divisible by the argument."""
+    if _native.AVAILABLE:
+        return _native.divisibleby(value, arg)
     return int(value) % int(arg) == 0
 
 
@@ -876,6 +975,14 @@ def yesno(value, arg=None):
     if arg is None:
         # Translators: Please do not add spaces around commas.
         arg = gettext("yes,no,maybe")
+    if _native.AVAILABLE:
+        arg = str(arg)
+        bits = arg.split(",")
+        if len(bits) < 2:
+            return value
+        tri = -1 if value is None else (1 if value else 0)
+        result = _native.yesno(tri, arg)
+        return result if result != "" else value
     bits = arg.split(",")
     if len(bits) < 2:
         return value  # Invalid arg.
@@ -902,14 +1009,39 @@ def filesizeformat(bytes_):
     Format the value like a 'human-readable' file size (i.e. 13 KB, 4.1 MB,
     102 bytes, etc.).
     """
+
+    def filesize_number_format(value):
+        return formats.number_format(round(value, 1), 1)
+
+    if _native.AVAILABLE:
+        parts = _native.filesize_parts(bytes_)
+        if parts is None:
+            value = ngettext("%(size)d byte", "%(size)d bytes", 0) % {"size": 0}
+            return avoid_wrapping(value)
+        unit = parts["unit"]
+        if unit == 0:
+            value = ngettext("%(size)d byte", "%(size)d bytes", parts["abs_bytes"]) % {
+                "size": parts["abs_bytes"]
+            }
+        else:
+            labels = (
+                None,
+                gettext("%s KB"),
+                gettext("%s MB"),
+                gettext("%s GB"),
+                gettext("%s TB"),
+                gettext("%s PB"),
+            )
+            value = labels[unit] % filesize_number_format(parts["scaled"])
+        if parts["negative"]:
+            value = "-%s" % value
+        return avoid_wrapping(value)
+
     try:
         bytes_ = int(bytes_)
     except (TypeError, ValueError, UnicodeDecodeError):
         value = ngettext("%(size)d byte", "%(size)d bytes", 0) % {"size": 0}
         return avoid_wrapping(value)
-
-    def filesize_number_format(value):
-        return formats.number_format(round(value, 1), 1)
 
     KB = 1 << 10
     MB = 1 << 20
@@ -962,6 +1094,17 @@ def pluralize(value, arg="s"):
     * If value is 1, cand{{ value|pluralize:"y,ies" }} display "candy".
     * If value is 2, cand{{ value|pluralize:"y,ies" }} display "candies".
     """
+    if _native.AVAILABLE:
+        try:
+            return _native.pluralize_suffix(float(value) == 1, arg)
+        except ValueError:
+            return ""
+        except TypeError:
+            try:
+                return _native.pluralize_suffix(len(value) == 1, arg)
+            except TypeError:
+                return ""
+
     if "," not in arg:
         arg = "," + arg
     bits = arg.split(",")

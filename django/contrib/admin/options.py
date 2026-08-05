@@ -562,9 +562,15 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
         Return True if the given request has permission to add an object.
         Can be overridden by the user in subclasses.
         """
+        from django import native as _native
+
         opts = self.opts
         codename = get_permission_codename("add", opts)
-        return request.user.has_perm("%s.%s" % (opts.app_label, codename))
+        if _native.AVAILABLE:
+            perm = _native.model_meta_label(opts.app_label, codename)
+        else:
+            perm = "%s.%s" % (opts.app_label, codename)
+        return request.user.has_perm(perm)
 
     def has_change_permission(self, request, obj=None):
         """
@@ -577,9 +583,15 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
         model instance. If `obj` is None, this should return True if the given
         request has permission to change *any* object of the given type.
         """
+        from django import native as _native
+
         opts = self.opts
         codename = get_permission_codename("change", opts)
-        return request.user.has_perm("%s.%s" % (opts.app_label, codename))
+        if _native.AVAILABLE:
+            perm = _native.model_meta_label(opts.app_label, codename)
+        else:
+            perm = "%s.%s" % (opts.app_label, codename)
+        return request.user.has_perm(perm)
 
     def has_delete_permission(self, request, obj=None):
         """
@@ -592,9 +604,15 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
         model instance. If `obj` is None, this should return True if the given
         request has permission to delete *any* object of the given type.
         """
+        from django import native as _native
+
         opts = self.opts
         codename = get_permission_codename("delete", opts)
-        return request.user.has_perm("%s.%s" % (opts.app_label, codename))
+        if _native.AVAILABLE:
+            perm = _native.model_meta_label(opts.app_label, codename)
+        else:
+            perm = "%s.%s" % (opts.app_label, codename)
+        return request.user.has_perm(perm)
 
     def has_view_permission(self, request, obj=None):
         """
@@ -607,12 +625,18 @@ class BaseModelAdmin(metaclass=forms.MediaDefiningClass):
         is None, it should return True if the request has permission to view
         any object of the given type.
         """
+        from django import native as _native
+
         opts = self.opts
         codename_view = get_permission_codename("view", opts)
         codename_change = get_permission_codename("change", opts)
-        return request.user.has_perm(
-            "%s.%s" % (opts.app_label, codename_view)
-        ) or request.user.has_perm("%s.%s" % (opts.app_label, codename_change))
+        if _native.AVAILABLE:
+            p_view = _native.model_meta_label(opts.app_label, codename_view)
+            p_change = _native.model_meta_label(opts.app_label, codename_change)
+        else:
+            p_view = "%s.%s" % (opts.app_label, codename_view)
+            p_change = "%s.%s" % (opts.app_label, codename_change)
+        return request.user.has_perm(p_view) or request.user.has_perm(p_change)
 
     def has_view_or_change_permission(self, request, obj=None):
         return self.has_view_permission(request, obj) or self.has_change_permission(

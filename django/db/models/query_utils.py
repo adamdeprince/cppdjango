@@ -12,6 +12,7 @@ import logging
 from collections import namedtuple
 from contextlib import nullcontext
 
+from django import native as _native
 from django.core.exceptions import FieldError
 from django.db import DEFAULT_DB_ALIAS, DatabaseError, connections, models, transaction
 from django.db.models.constants import LOOKUP_SEP
@@ -63,10 +64,19 @@ class Q(tree.Node):
     def _combine(self, other, conn):
         if getattr(other, "conditional", False) is False:
             raise TypeError(other)
-        if not self:
-            return other.copy()
-        if not other and isinstance(other, Q):
-            return self.copy()
+        if _native.AVAILABLE:
+            flags = _native.q_combine_empty_flags(
+                not bool(self), not bool(other) and isinstance(other, Q)
+            )
+            if flags == 1:
+                return other.copy()
+            if flags == 2:
+                return self.copy()
+        else:
+            if not self:
+                return other.copy()
+            if not other and isinstance(other, Q):
+                return self.copy()
 
         obj = self.create(connector=conn)
         obj.add(self, conn)
@@ -235,6 +245,11 @@ class Q(tree.Node):
         # Avoid circular imports.
         from django.db.models.sql import query
 
+        if _native.AVAILABLE:
+            return {
+                _native.lookup_path_head(child)
+                for child in query.get_children_from_q(self)
+            }
         return {
             child.split(LOOKUP_SEP, 1)[0] for child in query.get_children_from_q(self)
         }
@@ -450,6 +465,13 @@ def refs_expression(lookup_parts, annotations):
     Because the LOOKUP_SEP is contained in the default annotation names, check
     each prefix of the lookup_parts for a match.
     """
+    if _native.AVAILABLE and annotations:
+        annotation, remaining = _native.refs_expression_match(
+            list(lookup_parts), list(annotations.keys())
+        )
+        if annotation is not None and annotations.get(annotation):
+            return annotation, list(remaining)
+        return None, ()
     for n in range(1, len(lookup_parts) + 1):
         level_n_lookup = LOOKUP_SEP.join(lookup_parts[0:n])
         if annotations.get(level_n_lookup):

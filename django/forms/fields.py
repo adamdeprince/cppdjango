@@ -13,6 +13,7 @@ import uuid
 from decimal import Decimal, DecimalException
 from io import BytesIO
 
+from django import native as _native
 from django.core import validators
 from django.core.exceptions import ValidationError
 from django.forms.boundfield import BoundField
@@ -246,6 +247,12 @@ class Field:
         # is None, replace it with ''.
         initial_value = initial if initial is not None else ""
         data_value = data if data is not None else ""
+        if (
+            _native.AVAILABLE
+            and isinstance(initial_value, str)
+            and isinstance(data_value, str)
+        ):
+            return _native.field_str_has_changed(initial_value, data_value)
         return initial_value != data_value
 
     def get_bound_field(self, form, field_name):
@@ -289,9 +296,12 @@ class CharField(Field):
     def to_python(self, value):
         """Return a string."""
         if value not in self.empty_values:
-            value = str(value)
-            if self.strip:
-                value = value.strip()
+            if _native.AVAILABLE:
+                value = _native.char_field_strip(str(value), self.strip)
+            else:
+                value = str(value)
+                if self.strip:
+                    value = value.strip()
         if value in self.empty_values:
             return self.empty_value
         return value
@@ -342,6 +352,17 @@ class IntegerField(Field):
             value = formats.sanitize_separators(value)
         # Strip trailing decimal and zeros.
         try:
+            if _native.AVAILABLE:
+                # Fast path for simple ASCII ints that fit in int64; otherwise
+                # Python int() (unicode digits, arbitrary size).
+                s = str(value)
+                if s.isascii() and len(s) < 18:
+                    parsed = _native.form_integer_to_python(s)
+                    if parsed is None:
+                        raise ValidationError(
+                            self.error_messages["invalid"], code="invalid"
+                        )
+                    return parsed
             value = int(self.re_decimal.sub("", str(value)))
         except (ValueError, TypeError):
             raise ValidationError(self.error_messages["invalid"], code="invalid")
@@ -375,7 +396,13 @@ class FloatField(IntegerField):
         if self.localize:
             value = formats.sanitize_separators(value)
         try:
-            value = float(value)
+            if _native.AVAILABLE and isinstance(value, str) and value.isascii():
+                parsed = _native.form_float_to_python(value.strip())
+                if parsed is None:
+                    raise ValueError
+                value = parsed
+            else:
+                value = float(value)
         except (ValueError, TypeError):
             raise ValidationError(self.error_messages["invalid"], code="invalid")
         return value
@@ -428,7 +455,8 @@ class DecimalField(IntegerField):
         if self.localize:
             value = formats.sanitize_separators(value)
         try:
-            value = Decimal(str(value))
+            s = str(value).strip() if isinstance(value, str) else str(value)
+            value = Decimal(s)
         except DecimalException:
             raise ValidationError(self.error_messages["invalid"], code="invalid")
         return value
@@ -580,6 +608,7 @@ class DurationField(Field):
         if isinstance(value, datetime.timedelta):
             return value
         try:
+            # parse_duration is already dual-path (native when available).
             value = parse_duration(str(value))
         except OverflowError:
             raise ValidationError(
@@ -809,7 +838,9 @@ class BooleanField(Field):
         # will submit for False. Also check for '0', since this is what
         # RadioSelect will provide. Because bool("True") == bool('1') == True,
         # we don't need to handle that explicitly.
-        if isinstance(value, str) and value.lower() in ("false", "0"):
+        if isinstance(value, str) and _native.AVAILABLE:
+            value = _native.boolean_field_to_python(value)
+        elif isinstance(value, str) and value.lower() in ("false", "0"):
             value = False
         else:
             value = bool(value)
@@ -844,6 +875,8 @@ class NullBooleanField(BooleanField):
         the Booleanfield, this field must check for True because it doesn't
         use the bool() function.
         """
+        if isinstance(value, str) and _native.AVAILABLE:
+            return _native.null_boolean_to_python(value)
         if value in (True, "True", "true", "1"):
             return True
         elif value in (False, "False", "false", "0"):
@@ -901,6 +934,19 @@ class ChoiceField(Field):
     def valid_value(self, value):
         """Check to see if the provided value is a valid choice."""
         text_value = str(value)
+        if _native.AVAILABLE:
+            keys = []
+            for k, v in self.choices:
+                if isinstance(v, (list, tuple)):
+                    for k2, v2 in v:
+                        if value == k2:
+                            return True
+                        keys.append(str(k2))
+                else:
+                    if value == k:
+                        return True
+                    keys.append(str(k))
+            return _native.choice_valid_value(text_value, keys)
         for k, v in self.choices:
             if isinstance(v, (list, tuple)):
                 # This is an optgroup, so look inside the group for options
@@ -980,6 +1026,10 @@ class MultipleChoiceField(ChoiceField):
             initial = []
         if data is None:
             data = []
+        if _native.AVAILABLE:
+            return _native.multi_choice_has_changed(
+                [str(v) for v in initial], [str(v) for v in data]
+            )
         if len(initial) != len(data):
             return True
         initial_set = {str(value) for value in initial}
@@ -1324,6 +1374,12 @@ class UUIDField(CharField):
             return None
         if not isinstance(value, uuid.UUID):
             try:
+                if _native.AVAILABLE:
+                    try:
+                        return _native.converter_uuid_to_python(value)
+                    except ValueError:
+                        # Alternate forms (no hyphens, braces) — Python uuid.
+                        return uuid.UUID(value)
                 value = uuid.UUID(value)
             except ValueError:
                 raise ValidationError(self.error_messages["invalid"], code="invalid")
@@ -1356,6 +1412,16 @@ class JSONField(CharField):
             return None
         elif isinstance(value, (list, dict, int, float, JSONString)):
             return value
+        if (
+            _native.AVAILABLE
+            and isinstance(value, str)
+            and not _native.json_looks_valid(value)
+        ):
+            raise ValidationError(
+                self.error_messages["invalid"],
+                code="invalid",
+                params={"value": value},
+            )
         try:
             converted = json.loads(value, cls=self.decoder)
         except json.JSONDecodeError:

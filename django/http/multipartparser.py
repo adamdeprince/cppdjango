@@ -10,6 +10,7 @@ import binascii
 import collections
 import html
 
+from django import native as _native
 from django.conf import settings
 from django.core.exceptions import (
     RequestDataTooBig,
@@ -85,7 +86,13 @@ class MultiPartParser:
         # Parse the header to get the boundary to split the parts.
         _, opts = parse_header_parameters(content_type)
         boundary = opts.get("boundary")
-        if not boundary or not self.boundary_re.fullmatch(boundary):
+        # Streaming path keeps chunked reads; native only validates boundary
+        # shape (already used for header/boundary scan during parse).
+        if (
+            not boundary
+            or len(boundary) > 200
+            or not self.boundary_re.fullmatch(boundary)
+        ):
             raise MultiPartParserError(
                 "Invalid boundary in multipart: %s" % force_str(boundary)
             )
@@ -162,6 +169,9 @@ class MultiPartParser:
                 return result[0], result[1]
 
         # Create the data structures to be used later.
+        # Note: we keep the streaming Parser path (not a full-body buffer) so
+        # upload handlers see the same chunking/read pattern as stock Django,
+        # including base64 transfer-encoding edge cases.
         self._post = QueryDict(mutable=True)
         self._files = MultiValueDict()
 
@@ -396,6 +406,8 @@ class MultiPartParser:
         resulting filename should still be considered as untrusted user input.
         """
         file_name = html.unescape(file_name)
+        if _native.AVAILABLE:
+            return _native.sanitize_multipart_filename(file_name)
         file_name = file_name.rsplit("/")[-1]
         file_name = file_name.rsplit("\\")[-1]
         # Remove non-printable characters.
@@ -632,6 +644,16 @@ class BoundaryIter:
             raise StopIteration()
 
         chunk = b"".join(chunks)
+        if _native.AVAILABLE:
+            found, done, yield_end, unget_start = _native.boundary_chunk_slice(
+                chunk, self._boundary, rollback
+            )
+            if found or done:
+                self._done = True
+            if unget_start < len(chunk):
+                stream.unget(chunk[unget_start:])
+            return chunk[:yield_end]
+
         boundary = self._find_boundary(chunk)
 
         if boundary:
@@ -659,6 +681,8 @@ class BoundaryIter:
          * the end of current encapsulation
          * the start of the next encapsulation
         """
+        if _native.AVAILABLE:
+            return _native.find_multipart_boundary(data, self._boundary)
         index = data.find(self._boundary)
         if index < 0:
             return None
@@ -701,7 +725,12 @@ def parse_boundary_stream(stream, max_header_size):
         chunk = stream.read(headers_chunk_size)
         # 'find' returns the top of these four bytes, so munch them later to
         # prevent them from polluting the payload.
-        header_end = chunk.find(b"\r\n\r\n")
+        if _native.AVAILABLE:
+            header_end = _native.find_header_block_end(chunk)
+            if header_end is None:
+                header_end = -1
+        else:
+            header_end = chunk.find(b"\r\n\r\n")
         if header_end != -1:
             break
 
@@ -722,22 +751,26 @@ def parse_boundary_stream(stream, max_header_size):
     TYPE = RAW
     outdict = {}
 
-    # Eliminate blank lines
-    for line in header.split(b"\r\n"):
-        try:
-            header_name, value_and_params = line.decode().split(":", 1)
-            name = header_name.lower().rstrip(" ")
-            value, params = parse_header_parameters(value_and_params.lstrip(" "))
-            params = {k: v.encode() for k, v in params.items()}
-        except ValueError:  # Invalid header.
-            continue
+    if _native.AVAILABLE:
+        type_int, outdict = _native.parse_multipart_headers(header)
+        TYPE = (RAW, FIELD, FILE)[type_int]
+    else:
+        # Eliminate blank lines
+        for line in header.split(b"\r\n"):
+            try:
+                header_name, value_and_params = line.decode().split(":", 1)
+                name = header_name.lower().rstrip(" ")
+                value, params = parse_header_parameters(value_and_params.lstrip(" "))
+                params = {k: v.encode() for k, v in params.items()}
+            except ValueError:  # Invalid header.
+                continue
 
-        if name == "content-disposition":
-            TYPE = FIELD
-            if params.get("filename"):
-                TYPE = FILE
+            if name == "content-disposition":
+                TYPE = FIELD
+                if params.get("filename"):
+                    TYPE = FILE
 
-        outdict[name] = value, params
+            outdict[name] = value, params
 
     if TYPE == RAW:
         stream.unget(chunk)

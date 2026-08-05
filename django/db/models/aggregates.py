@@ -158,10 +158,16 @@ class Aggregate(Func):
 
     @property
     def default_alias(self):
+        from django import native as _native
+
         expressions = [
             expr for expr in self.get_source_expressions() if expr is not None
         ]
         if len(expressions) == 1 and hasattr(expressions[0], "name"):
+            if _native.AVAILABLE:
+                return _native.aggregate_default_alias(
+                    expressions[0].name, self.name
+                )
             return "%s__%s" % (expressions[0].name, self.name.lower())
         raise TypeError("Complex expressions require an alias")
 
@@ -179,7 +185,12 @@ class Aggregate(Func):
                 f"this database backend."
             )
 
-        distinct_sql = "DISTINCT " if self.distinct else ""
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            distinct_sql = _native.sql_distinct_prefix(self.distinct)
+        else:
+            distinct_sql = "DISTINCT " if self.distinct else ""
         order_by_sql = ""
         order_by_params = []
         filter_sql = ""

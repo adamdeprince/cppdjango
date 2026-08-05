@@ -29,7 +29,12 @@ class SQLiteNumericMixin:
         sql, params = self.as_sql(compiler, connection, **extra_context)
         try:
             if self.output_field.get_internal_type() == "DecimalField":
-                sql = "(CAST(%s AS NUMERIC))" % sql
+                from django import native as _native
+
+                if _native.AVAILABLE:
+                    sql = _native.sql_cast_as_numeric(sql)
+                else:
+                    sql = "(CAST(%s AS NUMERIC))" % sql
         except FieldError:
             pass
         return sql, params
@@ -767,8 +772,13 @@ class CombinedExpression(SQLiteNumericMixin, Expression):
         expressions.append(sql)
         expression_params.extend(params)
         # order of precedence
-        expression_wrapper = "(%s)"
+        from django import native as _native
+
         sql = connection.ops.combine_expression(self.connector, expressions)
+        if _native.AVAILABLE:
+            # Outer parentheses only (combine_expression already joined).
+            return _native.combined_expression_sql(sql, "", ""), expression_params
+        expression_wrapper = "(%s)"
         return expression_wrapper % sql, expression_params
 
     def resolve_expression(
@@ -1127,6 +1137,18 @@ class Func(SQLiteNumericMixin, Expression):
         template = template or data.get("template", self.template)
         arg_joiner = arg_joiner or data.get("arg_joiner", self.arg_joiner)
         data["expressions"] = data["field"] = arg_joiner.join(sql_parts)
+        from django import native as _native
+
+        # Dual-path default function call template packing.
+        if (
+            _native.AVAILABLE
+            and template == "%(function)s(%(expressions)s)"
+            and data.get("function") is not None
+        ):
+            return (
+                _native.sql_func_call(str(data["function"]), data["expressions"]),
+                tuple(params),
+            )
         return template % data, tuple(params)
 
     def copy(self):
@@ -1320,9 +1342,16 @@ class Col(Expression):
         return "{}({})".format(self.__class__.__name__, ", ".join(identifiers))
 
     def as_sql(self, compiler, connection):
+        from django import native as _native
+
         alias, column = self.alias, self.target.column
         identifiers = (alias, column) if alias else (column,)
-        sql = ".".join(map(compiler.quote_name_unless_alias, identifiers))
+        quoted = [compiler.quote_name_unless_alias(i) for i in identifiers]
+        if _native.AVAILABLE:
+            # Dual-path dotted Col SQL assembly.
+            sql = _native.sql_join_dotted(quoted)
+        else:
+            sql = ".".join(quoted)
         return sql, ()
 
     def relabeled_clone(self, relabels):

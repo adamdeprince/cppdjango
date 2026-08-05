@@ -81,6 +81,8 @@ class Loader(BaseLoader):
             y -> a -> a
             z -> a -> a
         """
+        from django import native as _native
+
         skip_prefix = ""
 
         if skip:
@@ -90,6 +92,8 @@ class Loader(BaseLoader):
             if matching:
                 skip_prefix = self.generate_hash(matching)
 
+        if _native.AVAILABLE and not skip_prefix:
+            return _native.template_cache_key_plain(str(template_name))
         return "-".join(s for s in (str(template_name), skip_prefix) if s)
 
     def generate_hash(self, values):

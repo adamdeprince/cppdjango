@@ -26,13 +26,34 @@ def ordinal(value):
     Convert an integer to its ordinal as a string. 1 is '1st', 2 is '2nd',
     3 is '3rd', etc. Works for any non-negative integer.
     """
+    from django import native as _native
+
     try:
         value = int(value)
     except (TypeError, ValueError):
         return value
     if value < 0:
         return str(value)
-    if value % 100 in (11, 12, 13):
+    if _native.AVAILABLE:
+        kind = _native.ordinal_suffix_kind(value)
+        if kind == 11:
+            # Translators: Ordinal format for 11 (11th), 12 (12th), and 13 (13th).
+            value = pgettext("ordinal 11, 12, 13", "{}th").format(value)
+        else:
+            templates = (
+                pgettext("ordinal 0", "{}th"),
+                pgettext("ordinal 1", "{}st"),
+                pgettext("ordinal 2", "{}nd"),
+                pgettext("ordinal 3", "{}rd"),
+                pgettext("ordinal 4", "{}th"),
+                pgettext("ordinal 5", "{}th"),
+                pgettext("ordinal 6", "{}th"),
+                pgettext("ordinal 7", "{}th"),
+                pgettext("ordinal 8", "{}th"),
+                pgettext("ordinal 9", "{}th"),
+            )
+            value = templates[kind].format(value)
+    elif value % 100 in (11, 12, 13):
         # Translators: Ordinal format for 11 (11th), 12 (12th), and 13 (13th).
         value = pgettext("ordinal 11, 12, 13", "{}th").format(value)
     else:
@@ -73,6 +94,18 @@ def intcomma(value, use_l10n=True):
     string containing commas every three digits. Format localization is
     respected. For example, 3000 becomes '3,000' and 45000 becomes '45,000'.
     """
+    from django import native as _native
+
+    if not use_l10n and _native.AVAILABLE:
+        # Only ASCII digit strings (optional sign/decimal) use the native path.
+        s = str(value)
+        if s and all(c.isdigit() or c in "+-." for c in s) and any(
+            c.isdigit() for c in s
+        ):
+            try:
+                return _native.intcomma_ascii(s)
+            except Exception:
+                pass
     if use_l10n:
         try:
             if not isinstance(value, (float, Decimal)):

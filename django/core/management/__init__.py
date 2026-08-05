@@ -45,7 +45,15 @@ def load_command_class(app_name, name):
     class instance. Allow all errors raised by the import process
     (ImportError, AttributeError) to propagate.
     """
-    module = import_module("%s.management.commands.%s" % (app_name, name))
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        module_path = _native.app_module_path(
+            _native.app_module_path(app_name, "management.commands"), name
+        )
+    else:
+        module_path = "%s.management.commands.%s" % (app_name, name)
+    module = import_module(module_path)
     return module.Command()
 
 

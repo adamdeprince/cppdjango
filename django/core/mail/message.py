@@ -72,9 +72,17 @@ def forbid_multi_line_headers(name, val, encoding):
         RemovedInDjango70Warning,
     )
 
+    from django import native as _native
+
     encoding = encoding or settings.DEFAULT_CHARSET
     val = str(val)  # val may be lazy
-    if "\n" in val or "\r" in val:
+    if _native.AVAILABLE:
+        if _native.string_has_newlines(val):
+            raise BadHeaderError(
+                "Header values can't contain newlines (got %r for header %r)"
+                % (val, name)
+            )
+    elif "\n" in val or "\r" in val:
         raise BadHeaderError(
             "Header values can't contain newlines (got %r for header %r)" % (val, name)
         )
@@ -125,12 +133,26 @@ def sanitize_address(addr, encoding):
             domain = token.domain or ""
     else:
         nm, address = addr
-        if "@" not in address:
-            raise ValueError(f'Invalid address "{address}"')
-        localpart, domain = address.rsplit("@", 1)
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            ok, localpart, domain = _native.split_email_address(address)
+            if not ok:
+                raise ValueError(f'Invalid address "{address}"')
+        else:
+            if "@" not in address:
+                raise ValueError(f'Invalid address "{address}"')
+            localpart, domain = address.rsplit("@", 1)
+
+    from django import native as _native
 
     address_parts = nm + localpart + domain
-    if "\n" in address_parts or "\r" in address_parts:
+    if _native.AVAILABLE:
+        if _native.string_has_newlines(address_parts):
+            raise ValueError(
+                "Invalid address; address parts cannot contain newlines."
+            )
+    elif "\n" in address_parts or "\r" in address_parts:
         raise ValueError("Invalid address; address parts cannot contain newlines.")
 
     # Avoid UTF-8 encode, if it's possible.

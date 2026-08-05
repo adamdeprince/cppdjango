@@ -148,15 +148,26 @@ class SingleObjectTemplateResponseMixin(TemplateResponseMixin):
             # <app>/<model>_detail.html; only use this if the object in
             # question is a model.
             if isinstance(self.object, models.Model):
+                from django import native as _native
+
                 object_meta = self.object._meta
-                names.append(
-                    "%s/%s%s.html"
-                    % (
-                        object_meta.app_label,
-                        object_meta.model_name,
-                        self.template_name_suffix,
+                if _native.AVAILABLE:
+                    names.append(
+                        _native.model_template_name(
+                            object_meta.app_label,
+                            object_meta.model_name,
+                            self.template_name_suffix,
+                        )
                     )
-                )
+                else:
+                    names.append(
+                        "%s/%s%s.html"
+                        % (
+                            object_meta.app_label,
+                            object_meta.model_name,
+                            self.template_name_suffix,
+                        )
+                    )
             elif getattr(self, "model", None) is not None and issubclass(
                 self.model, models.Model
             ):

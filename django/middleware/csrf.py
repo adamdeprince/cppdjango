@@ -61,7 +61,11 @@ def _mask_cipher_secret(secret):
     Given a secret (assumed to be a string of CSRF_ALLOWED_CHARS), generate a
     token by adding a mask and applying it to the secret.
     """
+    from django import native as _native
+
     mask = _get_new_csrf_string()
+    if _native.AVAILABLE:
+        return _native.csrf_mask_secret(str(secret), mask)
     chars = CSRF_ALLOWED_CHARS
     pairs = zip((chars.index(x) for x in secret), (chars.index(x) for x in mask))
     cipher = "".join(chars[(x + y) % len(chars)] for x, y in pairs)
@@ -74,6 +78,11 @@ def _unmask_cipher_token(token):
     CSRF_TOKEN_LENGTH, and that its first half is a mask), use it to decrypt
     the second half to produce the original secret.
     """
+    from django import native as _native
+
+    token = str(token)
+    if _native.AVAILABLE:
+        return _native.csrf_unmask_token(token, CSRF_SECRET_LENGTH)
     mask = token[:CSRF_SECRET_LENGTH]
     token = token[CSRF_SECRET_LENGTH:]
     chars = CSRF_ALLOWED_CHARS
@@ -133,6 +142,17 @@ def _check_token_format(token):
     characters that aren't allowed. The token argument can be a CSRF cookie
     secret or non-cookie CSRF token, and either masked or unmasked.
     """
+    from django import native as _native
+
+    token = str(token)
+    if _native.AVAILABLE:
+        if _native.csrf_token_length_ok(
+            len(token), CSRF_SECRET_LENGTH, CSRF_TOKEN_LENGTH
+        ):
+            raise InvalidTokenFormat(REASON_INCORRECT_LENGTH)
+        if not _native.csrf_token_chars_valid(token):
+            raise InvalidTokenFormat(REASON_INVALID_CHARACTERS)
+        return
     if len(token) not in (CSRF_TOKEN_LENGTH, CSRF_SECRET_LENGTH):
         raise InvalidTokenFormat(REASON_INCORRECT_LENGTH)
     # Make sure all characters are in CSRF_ALLOWED_CHARS.

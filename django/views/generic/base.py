@@ -136,10 +136,15 @@ class View:
         # Try to dispatch to the right method; if a method doesn't exist,
         # defer to the error handler. Also defer to the error handler if the
         # request method isn't on the approved list.
-        if request.method.lower() in self.http_method_names:
-            handler = getattr(
-                self, request.method.lower(), self.http_method_not_allowed
-            )
+        from django import native as _native
+
+        method = request.method.lower()
+        if _native.AVAILABLE:
+            allowed = _native.http_method_in_names(method, self.http_method_names)
+        else:
+            allowed = method in self.http_method_names
+        if allowed:
+            handler = getattr(self, method, self.http_method_not_allowed)
         else:
             handler = self.http_method_not_allowed
         return handler(request, *args, **kwargs)
@@ -165,8 +170,14 @@ class View:
 
     def options(self, request, *args, **kwargs):
         """Handle responding to requests for the OPTIONS HTTP verb."""
+        from django import native as _native
+
         response = HttpResponse()
-        response.headers["Allow"] = ", ".join(self._allowed_methods())
+        allowed = self._allowed_methods()
+        if _native.AVAILABLE:
+            response.headers["Allow"] = _native.http_allow_header(allowed)
+        else:
+            response.headers["Allow"] = ", ".join(allowed)
         response.headers["Content-Length"] = "0"
 
         if self.view_is_async:

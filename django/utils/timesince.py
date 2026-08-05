@@ -1,5 +1,6 @@
 import datetime
 
+from django import native as _native
 from django.utils.html import avoid_wrapping
 from django.utils.timezone import is_aware
 from django.utils.translation import gettext, ngettext_lazy
@@ -71,6 +72,22 @@ def timesince(d, now=None, reversed=False, time_strings=None, depth=2):
 
     if reversed:
         d, now = now, d
+
+    # Mixed aware/naive raises TypeError on subtraction (filters catch → "").
+    # Only use the native arithmetic path when awareness matches.
+    if _native.AVAILABLE and is_aware(d) == is_aware(now):
+        try:
+            pairs = _native.timesince_partials(d, now, depth)
+            if not pairs:
+                return avoid_wrapping(time_strings["minute"] % {"num": 0})
+            result = []
+            for unit_index, value in pairs:
+                name = TIME_STRINGS_KEYS[unit_index]
+                result.append(avoid_wrapping(time_strings[name] % {"num": value}))
+            return gettext(", ").join(result)
+        except Exception:
+            pass
+
     delta = now - d
 
     # Ignore microseconds.

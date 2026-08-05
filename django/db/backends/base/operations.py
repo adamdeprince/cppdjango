@@ -201,11 +201,21 @@ class BaseDatabaseOperations:
         result set. If any fields are given, only check the given fields for
         duplicates.
         """
+        from django import native as _native
+
         if fields:
+            if _native.AVAILABLE:
+                clause = _native.sql_distinct_clause(list(fields), allow_on=False)
+                if not clause:
+                    raise NotSupportedError(
+                        "DISTINCT ON fields is not supported by this database backend"
+                    )
             raise NotSupportedError(
                 "DISTINCT ON fields is not supported by this database backend"
             )
         else:
+            if _native.AVAILABLE:
+                return [_native.sql_distinct_clause([], allow_on=False)], []
             return ["DISTINCT"], []
 
     def force_group_by(self):
@@ -226,6 +236,10 @@ class BaseDatabaseOperations:
         """
         Return the FOR UPDATE SQL clause to lock rows for an update operation.
         """
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.sql_for_update(no_key, nowait, skip_locked, list(of))
         return "FOR%s UPDATE%s%s%s" % (
             " NO KEY" if no_key else "",
             " OF %s" % ", ".join(of) if of else "",
@@ -244,6 +258,12 @@ class BaseDatabaseOperations:
     def limit_offset_sql(self, low_mark, high_mark):
         """Return LIMIT/OFFSET SQL clause."""
         limit, offset = self._get_limit_offset_params(low_mark, high_mark)
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            # Match original: omit LIMIT when limit is falsy (None/0).
+            lim = limit if limit else None
+            return _native.sql_limit_offset_clause(lim, offset or 0)
         return " ".join(
             sql
             for sql in (
@@ -254,6 +274,13 @@ class BaseDatabaseOperations:
         )
 
     def bulk_insert_sql(self, fields, placeholder_rows):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            row_sqls = [
+                _native.bulk_placeholder_row(list(row)) for row in placeholder_rows
+            ]
+            return _native.bulk_insert_sql(row_sqls)
         placeholder_rows_sql = (", ".join(row) for row in placeholder_rows)
         values_sql = ", ".join([f"({sql})" for sql in placeholder_rows_sql])
         return f"VALUES {values_sql}"

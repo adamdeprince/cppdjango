@@ -43,10 +43,17 @@ class FilteredSelectMultiple(forms.SelectMultiple):
         super().__init__(attrs, choices)
 
     def get_context(self, name, value, attrs):
+        from django import native as _native
+
         context = super().get_context(name, value, attrs)
-        context["widget"]["attrs"]["class"] = "selectfilter"
-        if self.is_stacked:
-            context["widget"]["attrs"]["class"] += "stacked"
+        if _native.AVAILABLE:
+            context["widget"]["attrs"]["class"] = _native.admin_selectfilter_class(
+                self.is_stacked
+            )
+        else:
+            context["widget"]["attrs"]["class"] = "selectfilter"
+            if self.is_stacked:
+                context["widget"]["attrs"]["class"] += "stacked"
         context["widget"]["attrs"]["data-field-name"] = self.verbose_name
         context["widget"]["attrs"]["data-is-stacked"] = int(self.is_stacked)
         return context

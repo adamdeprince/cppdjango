@@ -68,15 +68,23 @@ def prepare_lookup_value(key, value, separator=","):
     """
     Return a lookup value prepared to be used in queryset filtering.
     """
+    from django import native as _native
+
     if isinstance(value, list):
         return [prepare_lookup_value(key, v, separator=separator) for v in value]
     # if key ends with __in, split parameter into separate values
-    if key.endswith("__in"):
-        value = value.split(separator)
-    # if key ends with __isnull, special case '' and the string literals
-    # 'false' and '0'
-    elif key.endswith("__isnull"):
-        value = value.lower() not in ("", "false", "0")
+    if _native.AVAILABLE:
+        if _native.lookup_key_endswith(key, "__in"):
+            value = value.split(separator)
+        elif _native.lookup_key_endswith(key, "__isnull"):
+            value = _native.prepare_lookup_isnull(value.lower())
+    else:
+        if key.endswith("__in"):
+            value = value.split(separator)
+        # if key ends with __isnull, special case '' and the string literals
+        # 'false' and '0'
+        elif key.endswith("__isnull"):
+            value = value.lower() not in ("", "false", "0")
     return value
 
 
@@ -94,7 +102,13 @@ def quote(s):
     Similar to urllib.parse.quote(), except that the quoting is slightly
     different so that it doesn't get automatically unquoted by the web browser.
     """
-    return s.translate(QUOTE_MAP) if isinstance(s, str) else s
+    if not isinstance(s, str):
+        return s
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.admin_quote(s)
+    return s.translate(QUOTE_MAP)
 
 
 def unquote(s):

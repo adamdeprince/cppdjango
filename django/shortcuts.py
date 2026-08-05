@@ -175,9 +175,15 @@ def resolve_url(to, *args, **kwargs):
         # further to some Python functions like urlparse.
         to = str(to)
 
+    from django import native as _native
+
     # Handle relative URLs
-    if isinstance(to, str) and to.startswith(("./", "../")):
-        return to
+    if isinstance(to, str):
+        if _native.AVAILABLE:
+            if _native.url_is_relative_path(to):
+                return to
+        elif to.startswith(("./", "../")):
+            return to
 
     # Next try a reverse URL resolution.
     try:
@@ -187,8 +193,12 @@ def resolve_url(to, *args, **kwargs):
         if callable(to):
             raise
         # If this doesn't "feel" like a URL, re-raise.
-        if "/" not in to and "." not in to:
-            raise
+        if isinstance(to, str):
+            if _native.AVAILABLE:
+                if not _native.url_feels_like_url(to):
+                    raise
+            elif "/" not in to and "." not in to:
+                raise
 
     # Finally, fall back and assume it's a URL
     return to

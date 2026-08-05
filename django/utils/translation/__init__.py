@@ -221,6 +221,10 @@ def check_for_language(lang_code):
 
 def to_language(locale):
     """Turn a locale name (en_US) into a language name (en-us)."""
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.to_language(locale)
     p = locale.find("_")
     if p >= 0:
         return locale[:p].lower() + "-" + locale[p + 1 :].lower()
@@ -230,6 +234,10 @@ def to_language(locale):
 
 def to_locale(language):
     """Turn a language name (en-us) into a locale name (en_US)."""
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        return _native.to_locale(language)
     lang, _, country = language.lower().partition("-")
     if not country:
         return language[:3].lower() + language[3:]

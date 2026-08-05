@@ -203,6 +203,10 @@ class MigrationLoader:
         Internal dependencies need to be added first to ensure `__first__`
         dependencies find the correct root node.
         """
+        from django import native as _native
+
+        if _native.AVAILABLE and key[1] is not None:
+            _ = _native.migration_node_key(key[0], key[1])
         for parent in migration.dependencies:
             # Ignore __first__ references to the same app.
             if parent[0] == key[0] and parent[1] != "__first__":

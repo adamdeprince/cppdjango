@@ -58,8 +58,13 @@ class YearMixin:
 
         The interval is defined by start date <= item date < next start date.
         """
+        from django import native as _native
+
+        next_year = date.year + 1
+        if _native.AVAILABLE and not _native.date_year_in_range(next_year):
+            raise Http404(_("Date out of range"))
         try:
-            return date.replace(year=date.year + 1, month=1, day=1)
+            return date.replace(year=next_year, month=1, day=1)
         except ValueError:
             raise Http404(_("Date out of range"))
 

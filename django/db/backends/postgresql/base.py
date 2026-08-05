@@ -82,7 +82,12 @@ from .schema import DatabaseSchemaEditor  # NOQA isort:skip
 
 
 def _get_varchar_column(data):
-    if data["max_length"] is None:
+    from django import native as _native
+
+    max_length = data["max_length"]
+    if _native.AVAILABLE:
+        return _native.sql_varchar_type(max_length is not None, max_length or 0)
+    if max_length is None:
         return "varchar"
     return "varchar(%(max_length)s)" % data
 

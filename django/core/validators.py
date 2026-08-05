@@ -4,6 +4,7 @@ import re
 from pathlib import Path
 from urllib.parse import urlsplit
 
+from django import native as _native
 from django.core.exceptions import ValidationError
 from django.utils.deconstruct import deconstructible
 from django.utils.http import MAX_URL_LENGTH
@@ -120,6 +121,11 @@ class DomainNameValidator(RegexValidator):
             raise ValidationError(self.message, code=self.code, params={"value": value})
         if not self.accept_idna and not value.isascii():
             raise ValidationError(self.message, code=self.code, params={"value": value})
+        # Native structural reject (oracle regex still runs on accept).
+        if _native.AVAILABLE and not _native.is_valid_domain_name(
+            value, self.accept_idna, self.max_length
+        ):
+            raise ValidationError(self.message, code=self.code, params={"value": value})
         super().__call__(value)
 
 
@@ -163,12 +169,24 @@ class URLValidator(RegexValidator):
     def __call__(self, value):
         if not isinstance(value, str) or len(value) > self.max_length:
             raise ValidationError(self.message, code=self.code, params={"value": value})
-        if self.unsafe_chars.intersection(value):
-            raise ValidationError(self.message, code=self.code, params={"value": value})
-        # Check if the scheme is valid.
-        scheme = value.split("://")[0].lower()
-        if scheme not in self.schemes:
-            raise ValidationError(self.message, code=self.code, params={"value": value})
+        if _native.AVAILABLE:
+            schemes_csv = ",".join(s.lower() for s in self.schemes)
+            if not _native.url_structure_precheck(
+                value, self.max_length, schemes_csv
+            ):
+                raise ValidationError(
+                    self.message, code=self.code, params={"value": value}
+                )
+        else:
+            if self.unsafe_chars.intersection(value):
+                raise ValidationError(
+                    self.message, code=self.code, params={"value": value}
+                )
+            scheme = value.split("://")[0].lower()
+            if scheme not in self.schemes:
+                raise ValidationError(
+                    self.message, code=self.code, params={"value": value}
+                )
 
         # Then check full URL
         try:
@@ -203,6 +221,14 @@ integer_validator = RegexValidator(
 
 
 def validate_integer(value):
+    if _native.AVAILABLE:
+        if not _native.is_valid_integer_string(str(value)):
+            raise ValidationError(
+                integer_validator.message,
+                code=integer_validator.code,
+                params={"value": value},
+            )
+        return
     return integer_validator(value)
 
 
@@ -247,6 +273,12 @@ class EmailValidator:
         if not value or "@" not in value or len(value) > 320:
             raise ValidationError(self.message, code=self.code, params={"value": value})
 
+        if _native.AVAILABLE and isinstance(value, str):
+            # Accept fast when native agrees; always fall through on reject so
+            # Python remains the oracle for edge cases (IDN, quoted local, etc.).
+            if _native.is_valid_email(value, list(self.domain_allowlist)):
+                return
+
         user_part, domain_part = value.rsplit("@", 1)
 
         if not self.user_regex.match(user_part):
@@ -283,7 +315,23 @@ class EmailValidator:
 validate_email = EmailValidator()
 
 slug_re = _lazy_re_compile(r"^[-a-zA-Z0-9_]+\Z")
-validate_slug = RegexValidator(
+
+
+@deconstructible
+class _SlugValidator(RegexValidator):
+    """ASCII slug validator with optional native fast path."""
+
+    def __call__(self, value):
+        if _native.AVAILABLE and isinstance(value, str):
+            if not _native.is_valid_slug(value):
+                raise ValidationError(
+                    self.message, code=self.code, params={"value": value}
+                )
+            return
+        super().__call__(value)
+
+
+validate_slug = _SlugValidator(
     slug_re,
     # Translators: "letters" means latin letters: a-z and A-Z.
     _("Enter a valid “slug” consisting of letters, numbers, underscores or hyphens."),
@@ -302,6 +350,19 @@ validate_unicode_slug = RegexValidator(
 
 
 def validate_ipv4_address(value):
+    if _native.AVAILABLE and isinstance(value, str):
+        if _native.is_valid_ipv4(value):
+            return
+        # Native rejects — confirm with ipaddress (edge-case parity).
+        try:
+            ipaddress.IPv4Address(value)
+            return
+        except ValueError:
+            raise ValidationError(
+                _("Enter a valid %(protocol)s address."),
+                code="invalid",
+                params={"protocol": _("IPv4"), "value": value},
+            )
     try:
         ipaddress.IPv4Address(value)
     except ValueError:
@@ -313,6 +374,8 @@ def validate_ipv4_address(value):
 
 
 def validate_ipv6_address(value):
+    # IPv6 compression/mapping edge cases stay on the Python/ipaddress path;
+    # native is_valid_ipv6 is available for call sites that want a fast probe.
     if not is_valid_ipv6_address(value):
         raise ValidationError(
             _("Enter a valid %(protocol)s address."),
@@ -541,12 +604,22 @@ class DecimalValidator:
             raise ValidationError(
                 self.messages["invalid"], code="invalid", params={"value": value}
             )
-        if exponent >= 0:
+        if _native.AVAILABLE and isinstance(exponent, int):
+            dig_s = "".join(str(d) for d in digit_tuple)
+            _inv, digits, decimals, whole_digits = _native.decimal_digit_counts(
+                dig_s, int(exponent)
+            )
+            if _inv:
+                raise ValidationError(
+                    self.messages["invalid"], code="invalid", params={"value": value}
+                )
+        elif exponent >= 0:
             digits = len(digit_tuple)
             if digit_tuple != (0,):
                 # A positive exponent adds that many trailing zeros.
                 digits += exponent
             decimals = 0
+            whole_digits = digits - decimals
         else:
             # If the absolute value of the negative exponent is larger than the
             # number of digits, then it's the same as the number of digits,
@@ -558,7 +631,7 @@ class DecimalValidator:
             else:
                 digits = len(digit_tuple)
                 decimals = abs(exponent)
-        whole_digits = digits - decimals
+            whole_digits = digits - decimals
 
         if self.max_digits is not None and digits > self.max_digits:
             raise ValidationError(
@@ -666,7 +739,14 @@ class ProhibitNullCharactersValidator:
             self.code = code
 
     def __call__(self, value):
-        if "\x00" in str(value):
+        text = str(value)
+        if _native.AVAILABLE:
+            if _native.has_null_characters(text) or "\x00" in text:
+                raise ValidationError(
+                    self.message, code=self.code, params={"value": value}
+                )
+            return
+        if "\x00" in text:
             raise ValidationError(self.message, code=self.code, params={"value": value})
 
     def __eq__(self, other):

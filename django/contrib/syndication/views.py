@@ -13,6 +13,16 @@ from django.utils.translation import get_language
 
 
 def add_domain(domain, url, secure=False):
+    from django import native as _native
+
+    if _native.AVAILABLE:
+        protocol = _native.feed_protocol(secure)
+        if _native.feed_url_is_network_path(url):
+            # Support network-path reference (see #16753) - RSS requires a protocol
+            return _native.feed_network_path_url(protocol, url)
+        if not _native.feed_url_has_scheme(url):
+            return iri_to_uri(_native.feed_absolute_url(protocol, domain, url))
+        return url
     protocol = "https" if secure else "http"
     if url.startswith("//"):
         # Support network-path reference (see #16753) - RSS requires a protocol

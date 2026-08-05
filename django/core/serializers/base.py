@@ -54,10 +54,16 @@ class ProgressBar:
         self.prev_done = 0
 
     def update(self, count):
+        from django import native as _native
+
         if not self.output:
             return
-        perc = count * 100 // self.total_count
-        done = perc * self.progress_width // 100
+        if _native.AVAILABLE:
+            perc = _native.progress_percent(count, self.total_count)
+            done = _native.progress_done_width(perc, self.progress_width)
+        else:
+            perc = count * 100 // self.total_count
+            done = perc * self.progress_width // 100
         if self.prev_done >= done:
             return
         self.prev_done = done

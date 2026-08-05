@@ -51,7 +51,13 @@ class Library:
             )
 
     def tag_function(self, func):
-        self.tags[func.__name__] = func
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            name = _native.template_register_name("", func.__name__)
+        else:
+            name = func.__name__
+        self.tags[name] = func
         return func
 
     def filter(self, name=None, filter_func=None, **flags):
@@ -99,7 +105,13 @@ class Library:
             )
 
     def filter_function(self, func, **flags):
-        return self.filter(func.__name__, func, **flags)
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            name = _native.template_register_name("", func.__name__)
+        else:
+            name = func.__name__
+        return self.filter(name, func, **flags)
 
     def simple_tag(self, func=None, takes_context=None, name=None):
         """

@@ -138,12 +138,21 @@ class BasePaginator:
 
     def _validate_number(self, number, num_pages):
         """Validate the given 1-based page number."""
+        from django import native as _native
+
         try:
             if isinstance(number, float) and not number.is_integer():
                 raise ValueError
             number = int(number)
         except (TypeError, ValueError):
             raise PageNotAnInteger(self.error_messages["invalid_page"])
+        if _native.AVAILABLE:
+            code = _native.paginator_number_range_code(number, num_pages)
+            if code == 2:
+                raise EmptyPage(self.error_messages["min_page"])
+            if code == 3:
+                raise EmptyPage(self.error_messages["no_results"])
+            return number
         if number < 1:
             raise EmptyPage(self.error_messages["min_page"])
         if number > num_pages:
@@ -174,11 +183,19 @@ class Paginator(BasePaginator):
 
     def page(self, number):
         """Return a Page object for the given 1-based page number."""
+        from django import native as _native
+
         number = self.validate_number(number)
-        bottom = (number - 1) * self.per_page
-        top = bottom + self.per_page
-        if top + self.orphans >= self.count:
-            top = self.count
+        if _native.AVAILABLE:
+            bottom = _native.paginator_page_bottom(number, self.per_page)
+            top = _native.paginator_page_top(
+                number, self.per_page, self.orphans, self.count
+            )
+        else:
+            bottom = (number - 1) * self.per_page
+            top = bottom + self.per_page
+            if top + self.orphans >= self.count:
+                top = self.count
         return self._get_page(self.object_list[bottom:top], number, self)
 
     @cached_property
@@ -192,6 +209,15 @@ class Paginator(BasePaginator):
     @cached_property
     def num_pages(self):
         """Return the total number of pages."""
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.paginator_num_pages(
+                self.count,
+                self.per_page,
+                self.orphans,
+                self.allow_empty_first_page,
+            )
         if self.count == 0 and not self.allow_empty_first_page:
             return 0
         hits = max(1, self.count - self.orphans)

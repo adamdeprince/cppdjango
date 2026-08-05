@@ -59,6 +59,10 @@ def get_callable(lookup_view):
 def get_mod_func(callback):
     # Convert 'django.views.news.stories.story_detail' to
     # ['django.views.news.stories', 'story_detail']
+    from django import native as _native
+
+    if _native.AVAILABLE and isinstance(callback, str):
+        return _native.get_mod_func(callback)
     try:
         dot = callback.rindex(".")
     except ValueError:

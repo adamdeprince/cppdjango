@@ -52,10 +52,16 @@ def get_tag_uri(url, date):
     See
     https://web.archive.org/web/20110514113830/http://diveintomark.org/archives/2004/05/28/howto-atom-id
     """
+    from django import native as _native
+
     bits = urlparse(url)
     d = ""
     if date is not None:
         d = ",%s" % date.strftime("%Y-%m-%d")
+    if _native.AVAILABLE:
+        return _native.feed_tag_uri(
+            bits.hostname or "", d, bits.path or "", bits.fragment or ""
+        )
     return "tag:%s%s:%s/%s" % (bits.hostname, d, bits.path, bits.fragment)
 
 

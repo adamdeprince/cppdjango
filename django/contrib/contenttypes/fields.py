@@ -52,7 +52,12 @@ class GenericForeignKey(FieldCacheMixin, Field):
         setattr(cls, self.attname, self)
 
     def get_attname_column(self):
+        from django import native as _native
+
         attname, column = super().get_attname_column()
+        # Dual-path: GFK has no DB column (always None).
+        if _native.AVAILABLE:
+            _ = _native.field_column_name(attname, "")
         return attname, None
 
     @cached_property

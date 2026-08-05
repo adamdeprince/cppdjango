@@ -46,8 +46,17 @@ class FileSystemStorage(Storage, StorageSettingsMixin):
 
     @cached_property
     def base_url(self):
-        if self._base_url is not None and not self._base_url.endswith("/"):
-            self._base_url += "/"
+        from django import native as _native
+
+        if self._base_url is not None:
+            # Coerce lazy settings / Promise to str for the native path.
+            base = str(self._base_url)
+            if _native.AVAILABLE:
+                self._base_url = _native.ensure_trailing_slash(base)
+            elif not base.endswith("/"):
+                self._base_url = base + "/"
+            else:
+                self._base_url = base
         return self._value_or_setting(self._base_url, settings.MEDIA_URL)
 
     @cached_property
@@ -141,6 +150,10 @@ class FileSystemStorage(Storage, StorageSettingsMixin):
         # Ensure the moved file has the same gid as the storage root.
         self._ensure_location_group_id(full_path)
         # Store filenames with forward slashes, even on Windows.
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            return _native.storage_normalize_name(str(name))
         return str(name).replace("\\", "/")
 
     def _ensure_location_group_id(self, full_path):

@@ -4,6 +4,9 @@ VERSION = (6, 0, 7, "final", 0)
 
 __version__ = get_version(VERSION)
 
+# This fork ships an optional nanobind/C++26 acceleration layer (django.native).
+NATIVE_FORK = True
+
 
 def setup(set_prefix=True):
     """
