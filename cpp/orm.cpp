@@ -3331,6 +3331,16 @@ bool mysql_isolation_level_valid(std::string_view level) noexcept {
          level == "repeatable read" || level == "serializable";
 }
 
+static void append_select_cols(std::string& out,
+                               const std::vector<std::string>& quoted_cols) {
+  for (std::size_t i = 0; i < quoted_cols.size(); ++i) {
+    if (i) {
+      out.append(", ");
+    }
+    out.append(quoted_cols[i]);
+  }
+}
+
 std::string simple_select_eq_limit_sql(std::string_view quoted_table,
                                        const std::vector<std::string>& quoted_cols,
                                        std::string_view quoted_where_col,
@@ -3340,18 +3350,46 @@ std::string simple_select_eq_limit_sql(std::string_view quoted_table,
     limit = 1;
   }
   std::string out = "SELECT ";
-  for (std::size_t i = 0; i < quoted_cols.size(); ++i) {
-    if (i) {
-      out.append(", ");
-    }
-    out.append(quoted_cols[i]);
-  }
+  append_select_cols(out, quoted_cols);
   out.append(" FROM ");
   out.append(quoted_table);
   out.append(" WHERE ");
   out.append(quoted_where_col);
   out.append(" = %s LIMIT ");
   out.append(std::to_string(limit));
+  return out;
+}
+
+std::string simple_select_all_sql(std::string_view quoted_table,
+                                  const std::vector<std::string>& quoted_cols,
+                                  int limit) {
+  std::string out = "SELECT ";
+  append_select_cols(out, quoted_cols);
+  out.append(" FROM ");
+  out.append(quoted_table);
+  if (limit > 0) {
+    out.append(" LIMIT ");
+    out.append(std::to_string(limit));
+  }
+  return out;
+}
+
+std::string simple_select_in_sql(std::string_view quoted_table,
+                                 const std::vector<std::string>& quoted_cols,
+                                 std::string_view quoted_where_col,
+                                 int n_placeholders) {
+  if (n_placeholders < 1) {
+    n_placeholders = 1;
+  }
+  std::string out = "SELECT ";
+  append_select_cols(out, quoted_cols);
+  out.append(" FROM ");
+  out.append(quoted_table);
+  out.append(" WHERE ");
+  out.append(quoted_where_col);
+  out.append(" IN (");
+  out.append(sql_in_placeholders(n_placeholders));
+  out.append(")");
   return out;
 }
 

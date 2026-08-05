@@ -46,9 +46,9 @@ REPR_OUTPUT_SIZE = 20
 
 PROHIBITED_FILTER_KWARGS = frozenset(["_connector", "_negated"])
 
-# Tier 1: process-local SQL templates for simple values_list().get(...) fast path.
-# Key: (vendor, db_table, select_columns, where_column, limit) -> SQL with %s placeholder.
-_SIMPLE_VALUES_GET_SQL_CACHE = {}
+# Tier 1+: process-local SQL templates for simple SELECT fast paths.
+# Keys vary by shape (eq/all/in); values are SQL strings with %s placeholders.
+_SIMPLE_SQL_CACHE = {}
 _FAST_PATH_MISS = object()
 
 
@@ -719,10 +719,9 @@ class QuerySet(AltersData):
                 "Calling QuerySet.get(...) with filters after %s() is not "
                 "supported." % self.query.combinator
             )
-        # Tier 1 fast path: values_list('a','b').get(exact_field=value) without
-        # building a full SQLCompiler / QuerySet clone when the query is empty.
+        # Tier 1+ fast paths: simple values_list/model get without full compiler.
         if not args and kwargs:
-            fast = self._fast_path_simple_values_get(kwargs)
+            fast = self._fast_path_simple_get(kwargs)
             if fast is not _FAST_PATH_MISS:
                 return fast
         clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
@@ -736,7 +735,6 @@ class QuerySet(AltersData):
             limit = MAX_GET_RESULTS
             clone.query.set_limits(high=limit)
         num = len(clone)
-        # Avoid dual-path hop for a trivial branch (net-negative on TE /db).
         if num == 1:
             return clone._result_cache[0]
         if not num:
@@ -751,22 +749,11 @@ class QuerySet(AltersData):
             )
         )
 
-    def _fast_path_simple_values_get(self, kwargs):
-        """
-        Optimized path for::
-
-            Model.objects.values_list('col1', 'col2').get(pk_or_col=value)
-
-        when the queryset has no prior filters/joins/annotations. Returns
-        ``_FAST_PATH_MISS`` when the pattern does not apply.
-        """
+    def _simple_base_eligible(self, *, require_empty_where=True):
+        """Shared guards for simple single-table SELECT fast paths."""
         query = self.query
         if (
-            self._fields is None
-            or self._iterable_class
-            not in (ValuesListIterable, FlatValuesListIterable)
-            or len(kwargs) != 1
-            or query.combinator
+            query.combinator
             or query.is_sliced
             or query.distinct
             or query.distinct_fields
@@ -774,84 +761,132 @@ class QuerySet(AltersData):
             or query.group_by
             or query.annotations
             or query.extra
-            or query.where.children
             or len(query.alias_map) > 1
         ):
-            return _FAST_PATH_MISS
+            return False
+        if require_empty_where and query.where.children:
+            return False
+        return True
 
-        field_names = self._fields
-        if not field_names:
-            return _FAST_PATH_MISS
-        for name in field_names:
-            if not isinstance(name, str) or LOOKUP_SEP in name:
-                return _FAST_PATH_MISS
-
-        lookup_name, value = next(iter(kwargs.items()))
-        if not isinstance(lookup_name, str) or LOOKUP_SEP in lookup_name:
-            return _FAST_PATH_MISS
-
+    def _resolve_lookup_field(self, lookup_name):
         opts = self.model._meta
         try:
             if lookup_name == "pk":
-                lookup_field = opts.pk
-            else:
-                lookup_field = opts.get_field(lookup_name)
+                return opts.pk
+            return opts.get_field(lookup_name)
         except exceptions.FieldDoesNotExist:
-            return _FAST_PATH_MISS
-        # Concrete columns only (incl. FK forward columns); skip M2M/reverse.
-        if not getattr(lookup_field, "concrete", False) or lookup_field.many_to_many:
-            return _FAST_PATH_MISS
-        if lookup_field.is_relation and not (
-            lookup_field.many_to_one or lookup_field.one_to_one
-        ):
-            return _FAST_PATH_MISS
+            return None
 
-        select_columns = []
+    def _resolve_select_columns(self, field_names):
+        """Return list of DB column names or None if any field is ineligible."""
+        opts = self.model._meta
+        cols = []
         for name in field_names:
+            if not isinstance(name, str) or LOOKUP_SEP in name:
+                return None
             try:
                 f = opts.get_field(name)
             except exceptions.FieldDoesNotExist:
-                return _FAST_PATH_MISS
+                return None
             if not getattr(f, "concrete", False) or not f.column:
-                return _FAST_PATH_MISS
-            select_columns.append(f.column)
+                return None
+            cols.append(f.column)
+        return cols
 
-        where_column = lookup_field.column
-        if not where_column:
+    def _concrete_field_ok(self, field):
+        if field is None:
+            return False
+        if not getattr(field, "concrete", False) or field.many_to_many:
+            return False
+        if field.is_relation and not (field.many_to_one or field.one_to_one):
+            return False
+        return bool(field.column)
+
+    def _cached_simple_sql(self, cache_key, builder):
+        sql = _SIMPLE_SQL_CACHE.get(cache_key)
+        if sql is None:
+            sql = builder()
+            _SIMPLE_SQL_CACHE[cache_key] = sql
+        return sql
+
+    def _fast_path_simple_get(self, kwargs):
+        """
+        Fast path for::
+
+            Model.objects.values_list('a','b').get(col=value)
+            Model.objects.get(pk=value)   # model instance
+
+        when the queryset has no prior filters/joins/annotations.
+        """
+        if len(kwargs) != 1 or not self._simple_base_eligible():
+            return _FAST_PATH_MISS
+        lookup_name, value = next(iter(kwargs.items()))
+        if not isinstance(lookup_name, str) or LOOKUP_SEP in lookup_name:
+            return _FAST_PATH_MISS
+        lookup_field = self._resolve_lookup_field(lookup_name)
+        if not self._concrete_field_ok(lookup_field):
             return _FAST_PATH_MISS
 
+        # --- values_list / values tuple path ---
+        if self._fields is not None and self._iterable_class in (
+            ValuesListIterable,
+            FlatValuesListIterable,
+        ):
+            select_columns = self._resolve_select_columns(self._fields)
+            if not select_columns:
+                return _FAST_PATH_MISS
+            return self._execute_simple_eq_get(
+                select_columns, lookup_field, value, as_model=False
+            )
+
+        # --- model instance path ---
+        if self._fields is None and issubclass(self._iterable_class, ModelIterable):
+            opts = self.model._meta
+            select_columns = [f.column for f in opts.concrete_fields if f.column]
+            field_names = [f.attname for f in opts.concrete_fields if f.column]
+            if not select_columns:
+                return _FAST_PATH_MISS
+            return self._execute_simple_eq_get(
+                select_columns,
+                lookup_field,
+                value,
+                as_model=True,
+                model_field_names=field_names,
+            )
+        return _FAST_PATH_MISS
+
+    def _execute_simple_eq_get(
+        self, select_columns, lookup_field, value, *, as_model, model_field_names=None
+    ):
         db = self.db
         connection = connections[db]
         qn = connection.ops.quote_name
-        table = opts.db_table
+        table = self.model._meta.db_table
+        where_column = lookup_field.column
         limit = MAX_GET_RESULTS
         cache_key = (
+            "eq",
             connection.vendor,
             table,
             tuple(select_columns),
             where_column,
             limit,
         )
-        sql = _SIMPLE_VALUES_GET_SQL_CACHE.get(cache_key)
-        if sql is None:
+
+        def build():
             from django import native as _native
 
-            quoted_table = qn(table)
-            quoted_cols = [qn(c) for c in select_columns]
-            quoted_where = qn(where_column)
+            qt, qc, qw = qn(table), [qn(c) for c in select_columns], qn(where_column)
             if _native.AVAILABLE:
-                sql = _native.simple_select_eq_limit_sql(
-                    quoted_table, quoted_cols, quoted_where, limit
-                )
-            else:
-                sql = "SELECT %s FROM %s WHERE %s = %%s LIMIT %d" % (
-                    ", ".join(quoted_cols),
-                    quoted_table,
-                    quoted_where,
-                    limit,
-                )
-            _SIMPLE_VALUES_GET_SQL_CACHE[cache_key] = sql
+                return _native.simple_select_eq_limit_sql(qt, qc, qw, limit)
+            return "SELECT %s FROM %s WHERE %s = %%s LIMIT %d" % (
+                ", ".join(qc),
+                qt,
+                qw,
+                limit,
+            )
 
+        sql = self._cached_simple_sql(cache_key, build)
         try:
             param = lookup_field.get_db_prep_value(value, connection, prepared=False)
         except Exception:
@@ -864,6 +899,8 @@ class QuerySet(AltersData):
         n = len(rows)
         if n == 1:
             row = rows[0]
+            if as_model:
+                return self.model.from_db(db, model_field_names, row)
             if self._iterable_class is FlatValuesListIterable:
                 return row[0]
             return row
@@ -878,6 +915,131 @@ class QuerySet(AltersData):
                 n if n < limit else "more than %s" % (limit - 1),
             )
         )
+
+    def _fast_path_simple_values_fetch(self):
+        """
+        Fast path for::
+
+            list(Model.objects.values('id', 'message'))
+            list(Model.objects.values_list('id', 'message'))
+
+        unfiltered single-table scans (fortune-shaped).
+        """
+        if not self._simple_base_eligible():
+            return _FAST_PATH_MISS
+        if self._fields is None:
+            return _FAST_PATH_MISS
+        if self._iterable_class not in (
+            ValuesIterable,
+            ValuesListIterable,
+            FlatValuesListIterable,
+        ):
+            return _FAST_PATH_MISS
+        select_columns = self._resolve_select_columns(self._fields)
+        if not select_columns:
+            return _FAST_PATH_MISS
+
+        db = self.db
+        connection = connections[db]
+        qn = connection.ops.quote_name
+        table = self.model._meta.db_table
+        cache_key = ("all", connection.vendor, table, tuple(select_columns))
+
+        def build():
+            from django import native as _native
+
+            qt, qc = qn(table), [qn(c) for c in select_columns]
+            if _native.AVAILABLE:
+                return _native.simple_select_all_sql(qt, qc, 0)
+            return "SELECT %s FROM %s" % (", ".join(qc), qt)
+
+        sql = self._cached_simple_sql(cache_key, build)
+        with connection.cursor() as cursor:
+            cursor.execute(sql)
+            rows = cursor.fetchall()
+
+        names = list(self._fields)
+        if self._iterable_class is ValuesIterable:
+            return [dict(zip(names, row)) for row in rows]
+        if self._iterable_class is FlatValuesListIterable:
+            return [row[0] for row in rows]
+        return list(rows)
+
+    def _fast_path_simple_in_values(self, field_name, id_list):
+        """
+        SELECT cols FROM t WHERE field IN (...) for values_list/values querysets.
+        Returns list of rows (tuples) or _FAST_PATH_MISS.
+        """
+        if not self._simple_base_eligible():
+            return _FAST_PATH_MISS
+        if self._fields is None:
+            return _FAST_PATH_MISS
+        if self._iterable_class not in (
+            ValuesListIterable,
+            FlatValuesListIterable,
+            ValuesIterable,
+        ):
+            return _FAST_PATH_MISS
+        select_columns = self._resolve_select_columns(self._fields)
+        if not select_columns:
+            return _FAST_PATH_MISS
+        lookup_field = self._resolve_lookup_field(field_name)
+        if not self._concrete_field_ok(lookup_field):
+            return _FAST_PATH_MISS
+        id_list = tuple(id_list)
+        if not id_list:
+            return []
+
+        db = self.db
+        connection = connections[db]
+        qn = connection.ops.quote_name
+        table = self.model._meta.db_table
+        where_column = lookup_field.column
+        n = len(id_list)
+        cache_key = (
+            "in",
+            connection.vendor,
+            table,
+            tuple(select_columns),
+            where_column,
+            n,
+        )
+
+        def build():
+            from django import native as _native
+
+            qt = qn(table)
+            qc = [qn(c) for c in select_columns]
+            qw = qn(where_column)
+            if _native.AVAILABLE:
+                return _native.simple_select_in_sql(qt, qc, qw, n)
+            ph = ", ".join(["%s"] * n)
+            return "SELECT %s FROM %s WHERE %s IN (%s)" % (
+                ", ".join(qc),
+                qt,
+                qw,
+                ph,
+            )
+
+        sql = self._cached_simple_sql(cache_key, build)
+        try:
+            params = [
+                lookup_field.get_db_prep_value(v, connection, prepared=False)
+                for v in id_list
+            ]
+        except Exception:
+            return _FAST_PATH_MISS
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            rows = cursor.fetchall()
+
+        if self._iterable_class is ValuesIterable:
+            names = list(self._fields)
+            return [dict(zip(names, row)) for row in rows]
+        if self._iterable_class is FlatValuesListIterable:
+            return [row[0] for row in rows]
+        return list(rows)
 
     async def aget(self, *args, **kwargs):
         return await sync_to_async(self.get)(*args, **kwargs)
@@ -1546,8 +1708,6 @@ class QuerySet(AltersData):
         Return a dictionary mapping each of the given IDs to the object with
         that ID. If `id_list` isn't provided, evaluate the entire QuerySet.
         """
-        from django import native as _native
-
         if self.query.is_sliced:
             raise TypeError("Cannot use 'limit' or 'offset' with in_bulk().")
         if not issubclass(self._iterable_class, ModelIterable):
@@ -1571,29 +1731,82 @@ class QuerySet(AltersData):
         if id_list is not None:
             # Materialize first: id_list may be a one-shot iterator.
             id_list = tuple(id_list)
-            if _native.AVAILABLE:
-                if _native.in_bulk_empty(False, len(id_list)):
-                    return {}
-                filter_key = _native.in_bulk_filter_key(field_name)
-            else:
-                if not id_list:
-                    return {}
-                filter_key = "{}__in".format(field_name)
+            if not id_list:
+                return {}
+            filter_key = "{}__in".format(field_name)
+            # Fast path: unfiltered single-table IN query → model instances.
+            if self._simple_base_eligible():
+                lookup_field = self._resolve_lookup_field(field_name)
+                if self._concrete_field_ok(lookup_field):
+                    select_columns = [
+                        f.column for f in opts.concrete_fields if f.column
+                    ]
+                    field_names = [f.attname for f in opts.concrete_fields if f.column]
+                    if select_columns:
+                        db = self.db
+                        connection = connections[db]
+                        qn = connection.ops.quote_name
+                        table = opts.db_table
+                        n = len(id_list)
+                        batch_size = connection.ops.bulk_batch_size([opts.pk], id_list)
+                        result = {}
+
+                        def fetch_batch(batch):
+                            bn = len(batch)
+                            cache_key = (
+                                "in_model",
+                                connection.vendor,
+                                table,
+                                tuple(select_columns),
+                                lookup_field.column,
+                                bn,
+                            )
+
+                            def build():
+                                from django import native as _native
+
+                                qt = qn(table)
+                                qc = [qn(c) for c in select_columns]
+                                qw = qn(lookup_field.column)
+                                if _native.AVAILABLE:
+                                    return _native.simple_select_in_sql(
+                                        qt, qc, qw, bn
+                                    )
+                                ph = ", ".join(["%s"] * bn)
+                                return "SELECT %s FROM %s WHERE %s IN (%s)" % (
+                                    ", ".join(qc),
+                                    qt,
+                                    qw,
+                                    ph,
+                                )
+
+                            sql = self._cached_simple_sql(cache_key, build)
+                            params = [
+                                lookup_field.get_db_prep_value(
+                                    v, connection, prepared=False
+                                )
+                                for v in batch
+                            ]
+                            with connection.cursor() as cursor:
+                                cursor.execute(sql, params)
+                                for row in cursor.fetchall():
+                                    obj = self.model.from_db(db, field_names, row)
+                                    result[getattr(obj, field_name if field_name != "pk" else "pk")] = obj
+
+                        if batch_size and batch_size < n:
+                            for offset in range(0, n, batch_size):
+                                fetch_batch(id_list[offset : offset + batch_size])
+                        else:
+                            fetch_batch(id_list)
+                        return result
             batch_size = connections[self.db].ops.bulk_batch_size([opts.pk], id_list)
             # If the database has a limit on the number of query parameters
             # (e.g. SQLite), retrieve objects in batches if necessary.
             if batch_size and batch_size < len(id_list):
                 qs = ()
-                if _native.AVAILABLE:
-                    for offset, end in _native.in_bulk_batch_ranges(
-                        len(id_list), batch_size
-                    ):
-                        batch = id_list[offset:end]
-                        qs += tuple(self.filter(**{filter_key: batch}))
-                else:
-                    for offset in range(0, len(id_list), batch_size):
-                        batch = id_list[offset : offset + batch_size]
-                        qs += tuple(self.filter(**{filter_key: batch}))
+                for offset in range(0, len(id_list), batch_size):
+                    batch = id_list[offset : offset + batch_size]
+                    qs += tuple(self.filter(**{filter_key: batch}))
             else:
                 qs = self.filter(**{filter_key: id_list})
         else:
@@ -1890,25 +2103,14 @@ class QuerySet(AltersData):
         return clone
 
     def values_list(self, *fields, flat=False, named=False):
-        from django import native as _native
-
-        if _native.AVAILABLE:
-            flags = _native.values_list_flags(flat, named, len(fields))
-            if flags == 1:
-                raise TypeError("'flat' and 'named' can't be used together.")
-            if flags == 2:
-                raise TypeError(
-                    "'flat' is not valid when values_list is called with more than one "
-                    "field."
-                )
-        else:
-            if flat and named:
-                raise TypeError("'flat' and 'named' can't be used together.")
-            if flat and len(fields) > 1:
-                raise TypeError(
-                    "'flat' is not valid when values_list is called with more than one "
-                    "field."
-                )
+        # Keep validation in pure Python (native hop was net-negative on hot paths).
+        if flat and named:
+            raise TypeError("'flat' and 'named' can't be used together.")
+        if flat and len(fields) > 1:
+            raise TypeError(
+                "'flat' is not valid when values_list is called with more than one "
+                "field."
+            )
         if flat and not fields:
             fields = [self.model._meta.concrete_fields[0].attname]
 
@@ -2700,20 +2902,16 @@ class QuerySet(AltersData):
         return c
 
     def _fetch_all(self):
-        from django import native as _native
-
-        if _native.AVAILABLE:
-            if not _native.result_cache_populated(self._result_cache is None):
+        # Pure Python control flow (native bool hops were net-negative on TE).
+        # Fortune-shaped values()/values_list() use the simple SELECT fast path.
+        if self._result_cache is None:
+            fast = self._fast_path_simple_values_fetch()
+            if fast is not _FAST_PATH_MISS:
+                self._result_cache = fast
+            else:
                 self._result_cache = list(self._iterable_class(self))
-            if _native.prefetch_still_needed(
-                bool(self._prefetch_related_lookups), self._prefetch_done
-            ):
-                self._prefetch_related_objects()
-        else:
-            if self._result_cache is None:
-                self._result_cache = list(self._iterable_class(self))
-            if self._prefetch_related_lookups and not self._prefetch_done:
-                self._prefetch_related_objects()
+        if self._prefetch_related_lookups and not self._prefetch_done:
+            self._prefetch_related_objects()
 
     def _next_is_sticky(self):
         """

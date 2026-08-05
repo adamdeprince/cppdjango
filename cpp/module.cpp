@@ -4093,6 +4093,24 @@ NB_MODULE(_native, m) {
       },
       nb::arg("quoted_table"), nb::arg("quoted_cols"),
       nb::arg("quoted_where_col"), nb::arg("limit"));
+  m.def(
+      "simple_select_all_sql",
+      [](const std::string& quoted_table,
+         const std::vector<std::string>& quoted_cols, int limit) {
+        return django::native::simple_select_all_sql(quoted_table, quoted_cols,
+                                                     limit);
+      },
+      nb::arg("quoted_table"), nb::arg("quoted_cols"), nb::arg("limit") = 0);
+  m.def(
+      "simple_select_in_sql",
+      [](const std::string& quoted_table,
+         const std::vector<std::string>& quoted_cols,
+         const std::string& quoted_where_col, int n_placeholders) {
+        return django::native::simple_select_in_sql(
+            quoted_table, quoted_cols, quoted_where_col, n_placeholders);
+      },
+      nb::arg("quoted_table"), nb::arg("quoted_cols"),
+      nb::arg("quoted_where_col"), nb::arg("n_placeholders"));
 
   m.attr("AVAILABLE") = true;
 }

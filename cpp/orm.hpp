@@ -1281,4 +1281,14 @@ struct TokenSplit {
     std::string_view quoted_table, const std::vector<std::string>& quoted_cols,
     std::string_view quoted_where_col, int limit);
 
+// SELECT c1, c2 FROM t  (no WHERE; optional LIMIT if limit>0)
+[[nodiscard]] std::string simple_select_all_sql(
+    std::string_view quoted_table, const std::vector<std::string>& quoted_cols,
+    int limit = 0);
+
+// SELECT c1, c2 FROM t WHERE w IN (%s,%s,...)  (n placeholders)
+[[nodiscard]] std::string simple_select_in_sql(
+    std::string_view quoted_table, const std::vector<std::string>& quoted_cols,
+    std::string_view quoted_where_col, int n_placeholders);
+
 }  // namespace django::native

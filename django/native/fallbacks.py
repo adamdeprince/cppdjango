@@ -3458,3 +3458,24 @@ def simple_select_eq_limit_sql(
         f"SELECT {cols} FROM {quoted_table} "
         f"WHERE {quoted_where_col} = %s LIMIT {int(limit)}"
     )
+
+
+def simple_select_all_sql(quoted_table: str, quoted_cols, limit: int = 0) -> str:
+    cols = ", ".join(quoted_cols)
+    sql = f"SELECT {cols} FROM {quoted_table}"
+    if limit and limit > 0:
+        sql += f" LIMIT {int(limit)}"
+    return sql
+
+
+def simple_select_in_sql(
+    quoted_table: str, quoted_cols, quoted_where_col: str, n_placeholders: int
+) -> str:
+    if n_placeholders < 1:
+        n_placeholders = 1
+    cols = ", ".join(quoted_cols)
+    ph = sql_in_placeholders(n_placeholders)
+    return (
+        f"SELECT {cols} FROM {quoted_table} "
+        f"WHERE {quoted_where_col} IN ({ph})"
+    )

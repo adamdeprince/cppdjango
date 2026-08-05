@@ -3608,3 +3608,25 @@ def simple_select_eq_limit_sql(
     return fallbacks.simple_select_eq_limit_sql(
         quoted_table, cols, quoted_where_col, limit
     )
+
+
+def simple_select_all_sql(quoted_table: str, quoted_cols, limit: int = 0) -> str:
+    impl = _impl()
+    cols = [str(c) for c in quoted_cols]
+    if impl is not None:
+        return impl.simple_select_all_sql(str(quoted_table), cols, int(limit or 0))
+    return fallbacks.simple_select_all_sql(quoted_table, cols, limit)
+
+
+def simple_select_in_sql(
+    quoted_table: str, quoted_cols, quoted_where_col: str, n_placeholders: int
+) -> str:
+    impl = _impl()
+    cols = [str(c) for c in quoted_cols]
+    if impl is not None:
+        return impl.simple_select_in_sql(
+            str(quoted_table), cols, str(quoted_where_col), int(n_placeholders)
+        )
+    return fallbacks.simple_select_in_sql(
+        quoted_table, cols, quoted_where_col, n_placeholders
+    )
