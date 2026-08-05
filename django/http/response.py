@@ -63,12 +63,8 @@ class ResponseHeaders(CaseInsensitiveMapping):
                 value = str(value)
                 # Ensure string is valid in given charset.
                 value.encode(charset)
-            if _native.AVAILABLE:
-                if not _native.header_value_no_newlines(value):
-                    raise BadHeaderError(
-                        f"Header values can't contain newlines (got {value!r})"
-                    )
-            elif "\n" in value or "\r" in value:
+            # Pure Python: nanobind hop is net-negative for short header values.
+            if "\n" in value or "\r" in value:
                 raise BadHeaderError(
                     f"Header values can't contain newlines (got {value!r})"
                 )
@@ -146,12 +142,8 @@ class HttpResponseBase:
             except (ValueError, TypeError):
                 raise TypeError("HTTP status code must be an integer.")
 
-            if _native.AVAILABLE:
-                if not _native.http_status_code_valid(self.status_code):
-                    raise ValueError(
-                        "HTTP status code must be an integer from 100 to 599."
-                    )
-            elif not 100 <= self.status_code <= 599:
+            # Pure Python range check (native hop was net-negative on TE json/plaintext).
+            if not 100 <= self.status_code <= 599:
                 raise ValueError("HTTP status code must be an integer from 100 to 599.")
         self._reason_phrase = reason
 

@@ -3479,3 +3479,48 @@ def simple_select_in_sql(
         f"SELECT {cols} FROM {quoted_table} "
         f"WHERE {quoted_where_col} IN ({ph})"
     )
+
+
+def simple_update_eq_sql(quoted_table: str, quoted_set_cols, quoted_where_col: str) -> str:
+    sets = ", ".join(f"{c} = %s" for c in quoted_set_cols)
+    return f"UPDATE {quoted_table} SET {sets} WHERE {quoted_where_col} = %s"
+
+
+def render_fortune_page(rows) -> str:
+    """rows: iterable of (id, message) already sorted by message."""
+    parts = [
+        "<!DOCTYPE html>\n",
+        "<html>\n",
+        "<head>\n",
+        "<title>Fortunes</title>\n",
+        "</head>\n",
+        "<body>\n",
+        "  \n",
+        "<table>\n",
+        "<tr>\n",
+        "<th>id</th>\n",
+        "<th>message</th>\n",
+        "</tr>\n",
+    ]
+    # Local escape matching html.escape(quote=True)
+    _esc = (
+        ("&", "&amp;"),
+        ("<", "&lt;"),
+        (">", "&gt;"),
+        ('"', "&quot;"),
+        ("'", "&#x27;"),
+    )
+
+    def esc(s: str) -> str:
+        for a, b in _esc:
+            s = s.replace(a, b)
+        return s
+
+    for row_id, message in rows:
+        parts.append("<tr>\n<td>")
+        parts.append(str(int(row_id)))
+        parts.append("</td>\n<td>")
+        parts.append(esc(str(message)))
+        parts.append("</td>\n</tr>\n")
+    parts.append("</table>\n\n</body>\n</html>")
+    return "".join(parts)

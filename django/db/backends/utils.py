@@ -13,6 +13,10 @@ from django.utils.dateparse import parse_time
 
 logger = logging.getLogger("django.db.backends")
 
+# After apps are ready, skip the init-time warning branch on every execute.
+# (apps.ready is still checked until set; then this is a single LOAD_GLOBAL.)
+_APPS_INIT_CHECKED = False
+
 
 class CursorWrapper:
     def __init__(self, cursor, db):
@@ -92,10 +96,13 @@ class CursorWrapper:
         return executor(sql, params, many, context)
 
     def _execute(self, sql, params, *ignored_wrapper_args):
-        # Raise a warning during app initialization (stored_app_configs is only
-        # ever set during testing).
-        if not apps.ready and not apps.stored_app_configs:
-            warnings.warn(self.APPS_NOT_READY_WARNING_MSG, category=RuntimeWarning)
+        global _APPS_INIT_CHECKED
+        # Hot path: after first ready check, skip apps.ready work each execute.
+        if not _APPS_INIT_CHECKED:
+            if not apps.ready and not apps.stored_app_configs:
+                warnings.warn(self.APPS_NOT_READY_WARNING_MSG, category=RuntimeWarning)
+            elif apps.ready:
+                _APPS_INIT_CHECKED = True
         self.db.validate_no_broken_transaction()
         with self.db.wrap_database_errors:
             if params is None:
@@ -105,10 +112,12 @@ class CursorWrapper:
                 return self.cursor.execute(sql, params)
 
     def _executemany(self, sql, param_list, *ignored_wrapper_args):
-        # Raise a warning during app initialization (stored_app_configs is only
-        # ever set during testing).
-        if not apps.ready and not apps.stored_app_configs:
-            warnings.warn(self.APPS_NOT_READY_WARNING_MSG, category=RuntimeWarning)
+        global _APPS_INIT_CHECKED
+        if not _APPS_INIT_CHECKED:
+            if not apps.ready and not apps.stored_app_configs:
+                warnings.warn(self.APPS_NOT_READY_WARNING_MSG, category=RuntimeWarning)
+            elif apps.ready:
+                _APPS_INIT_CHECKED = True
         self.db.validate_no_broken_transaction()
         with self.db.wrap_database_errors:
             return self.cursor.executemany(sql, param_list)

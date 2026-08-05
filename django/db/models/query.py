@@ -4,6 +4,7 @@ The main QuerySet implementation. This provides the public API for the ORM.
 
 import copy
 import operator
+import sys
 import warnings
 from contextlib import nullcontext
 from functools import reduce
@@ -46,8 +47,9 @@ REPR_OUTPUT_SIZE = 20
 
 PROHIBITED_FILTER_KWARGS = frozenset(["_connector", "_negated"])
 
-# Tier 1+: process-local SQL templates for simple SELECT fast paths.
-# Keys vary by shape (eq/all/in); values are SQL strings with %s placeholders.
+# Tier 1+: process-local SQL templates for simple SELECT/UPDATE fast paths.
+# Keys vary by shape (eq/all/in/upd); values are interned SQL strings.
+# Write-once per key after first use (reduces post-fork COW churn).
 _SIMPLE_SQL_CACHE = {}
 _FAST_PATH_MISS = object()
 
@@ -804,10 +806,15 @@ class QuerySet(AltersData):
 
     def _cached_simple_sql(self, cache_key, builder):
         sql = _SIMPLE_SQL_CACHE.get(cache_key)
-        if sql is None:
-            sql = builder()
-            _SIMPLE_SQL_CACHE[cache_key] = sql
-        return sql
+        if sql is not None:
+            return sql
+        sql = builder()
+        try:
+            sql = sys.intern(sql)
+        except TypeError:
+            pass
+        # setdefault: first writer wins; avoids duplicate dict entries under race.
+        return _SIMPLE_SQL_CACHE.setdefault(cache_key, sql)
 
     def _fast_path_simple_get(self, kwargs):
         """
@@ -892,29 +899,25 @@ class QuerySet(AltersData):
         except Exception:
             return _FAST_PATH_MISS
 
+        # fetchone×2 instead of fetchall: less allocation; still detects multi-row.
         with connection.cursor() as cursor:
-            cursor.execute(sql, [param])
-            rows = cursor.fetchall()
+            cursor.execute(sql, (param,))
+            row = cursor.fetchone()
+            if row is None:
+                raise self.model.DoesNotExist(
+                    "%s matching query does not exist." % self.model._meta.object_name
+                )
+            if cursor.fetchone() is not None:
+                raise self.model.MultipleObjectsReturned(
+                    "get() returned more than one %s -- it returned more than 1!"
+                    % self.model._meta.object_name
+                )
 
-        n = len(rows)
-        if n == 1:
-            row = rows[0]
-            if as_model:
-                return self.model.from_db(db, model_field_names, row)
-            if self._iterable_class is FlatValuesListIterable:
-                return row[0]
-            return row
-        if n == 0:
-            raise self.model.DoesNotExist(
-                "%s matching query does not exist." % self.model._meta.object_name
-            )
-        raise self.model.MultipleObjectsReturned(
-            "get() returned more than one %s -- it returned %s!"
-            % (
-                self.model._meta.object_name,
-                n if n < limit else "more than %s" % (limit - 1),
-            )
-        )
+        if as_model:
+            return self.model.from_db(db, model_field_names, row)
+        if self._iterable_class is FlatValuesListIterable:
+            return row[0]
+        return row
 
     def _fast_path_simple_values_fetch(self):
         """
@@ -964,6 +967,102 @@ class QuerySet(AltersData):
         if self._iterable_class is FlatValuesListIterable:
             return [row[0] for row in rows]
         return list(rows)
+
+    def _fast_path_simple_filter_update(self, kwargs):
+        """
+        Fast path for::
+
+            Model.objects.filter(pk=pk).update(field=value, ...)
+
+        when the queryset already has exactly one exact equality in WHERE and
+        kwargs are concrete scalar fields (no F()/expressions).
+        """
+        if not kwargs:
+            return _FAST_PATH_MISS
+        query = self.query
+        if not self._simple_base_eligible(require_empty_where=False):
+            return _FAST_PATH_MISS
+        # Exactly one exact lookup child: col = value
+        children = query.where.children
+        if len(children) != 1:
+            return _FAST_PATH_MISS
+        child = children[0]
+        # django.db.models.lookups.Exact / BuiltinLookup
+        lhs = getattr(child, "lhs", None)
+        rhs = getattr(child, "rhs", None)
+        lookup_name = getattr(child, "lookup_name", None)
+        if lookup_name != "exact" or lhs is None:
+            return _FAST_PATH_MISS
+        if hasattr(rhs, "resolve_expression"):
+            return _FAST_PATH_MISS
+        target = getattr(lhs, "target", None) or getattr(lhs, "field", None)
+        if not self._concrete_field_ok(target):
+            return _FAST_PATH_MISS
+        where_field = target
+
+        set_fields = []
+        set_values = []
+        opts = self.model._meta
+        for name, value in kwargs.items():
+            if not isinstance(name, str) or LOOKUP_SEP in name:
+                return _FAST_PATH_MISS
+            if hasattr(value, "resolve_expression"):
+                return _FAST_PATH_MISS
+            try:
+                field = opts.get_field(name)
+            except exceptions.FieldDoesNotExist:
+                return _FAST_PATH_MISS
+            if (
+                not self._concrete_field_ok(field)
+                or field.primary_key
+                or field.generated
+            ):
+                return _FAST_PATH_MISS
+            set_fields.append(field)
+            set_values.append(value)
+
+        db = self.db
+        connection = connections[db]
+        qn = connection.ops.quote_name
+        table = self.model._meta.db_table
+        quoted_set = [qn(f.column) for f in set_fields]
+        quoted_where = qn(where_field.column)
+        cache_key = (
+            "upd",
+            connection.vendor,
+            table,
+            tuple(quoted_set),
+            quoted_where,
+        )
+
+        def build():
+            from django import native as _native
+
+            qt = qn(table)
+            if _native.AVAILABLE:
+                return _native.simple_update_eq_sql(qt, quoted_set, quoted_where)
+            sets = ", ".join("%s = %%s" % c for c in quoted_set)
+            return "UPDATE %s SET %s WHERE %s = %%s" % (qt, sets, quoted_where)
+
+        sql = self._cached_simple_sql(cache_key, build)
+        try:
+            params = [
+                f.get_db_prep_save(v, connection)
+                for f, v in zip(set_fields, set_values)
+            ]
+            params.append(
+                where_field.get_db_prep_value(rhs, connection, prepared=False)
+            )
+        except Exception:
+            return _FAST_PATH_MISS
+
+        with transaction.mark_for_rollback_on_error(using=db):
+            with connection.cursor() as cursor:
+                cursor.execute(sql, params)
+                rowcount = cursor.rowcount
+        if rowcount is None or rowcount < 0:
+            return _FAST_PATH_MISS
+        return rowcount
 
     def _fast_path_simple_in_values(self, field_name, id_list):
         """
@@ -1923,6 +2022,11 @@ class QuerySet(AltersData):
             if self.query.is_sliced:
                 raise TypeError("Cannot update a query once a slice has been taken.")
         self._for_write = True
+        # Single-row exact-lookup UPDATE without SQLCompiler when eligible.
+        fast = self._fast_path_simple_filter_update(kwargs)
+        if fast is not _FAST_PATH_MISS:
+            self._result_cache = None
+            return fast
         query = self.query.chain(sql.UpdateQuery)
         query.add_update_values(kwargs)
 

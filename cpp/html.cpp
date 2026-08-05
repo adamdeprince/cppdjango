@@ -1317,4 +1317,68 @@ std::optional<std::string> clean_ipv6_address(std::string_view ip, bool unpack_i
   return compress_ipv6(hextets);
 }
 
+std::string render_fortune_page(
+    const std::vector<std::pair<std::int64_t, std::string>>& rows) {
+  // Match TechEmpower Django fortunes.html + base.html structure closely.
+  static constexpr std::string_view kPrefix =
+      "<!DOCTYPE html>\n"
+      "<html>\n"
+      "<head>\n"
+      "<title>Fortunes</title>\n"
+      "</head>\n"
+      "<body>\n"
+      "  \n"
+      "<table>\n"
+      "<tr>\n"
+      "<th>id</th>\n"
+      "<th>message</th>\n"
+      "</tr>\n";
+  static constexpr std::string_view kSuffix =
+      "</table>\n"
+      "\n"
+      "</body>\n"
+      "</html>";
+
+  std::size_t reserve = kPrefix.size() + kSuffix.size();
+  for (const auto& [id, msg] : rows) {
+    // <tr>\n<td>…</td>\n<td>…</td>\n</tr>\n + worst-case escape overhead
+    reserve += 32 + 20 + msg.size() * 2;
+    (void)id;
+  }
+  std::string out;
+  out.reserve(reserve);
+  out.append(kPrefix);
+  for (const auto& [id, msg] : rows) {
+    out.append("<tr>\n<td>");
+    out.append(std::to_string(id));
+    out.append("</td>\n<td>");
+    // Inline escape into out for fewer allocations.
+    for (char c : msg) {
+      switch (c) {
+        case '&':
+          out += "&amp;";
+          break;
+        case '<':
+          out += "&lt;";
+          break;
+        case '>':
+          out += "&gt;";
+          break;
+        case '"':
+          out += "&quot;";
+          break;
+        case '\'':
+          out += "&#x27;";
+          break;
+        default:
+          out += c;
+          break;
+      }
+    }
+    out.append("</td>\n</tr>\n");
+  }
+  out.append(kSuffix);
+  return out;
+}
+
 }  // namespace django::native

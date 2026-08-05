@@ -1266,7 +1266,100 @@ class Model(AltersData, metaclass=ModelBase):
             if results := filtered._update(values, returning_fields):
                 return results
             return [()] if filtered.exists() else []
+        # Single-table PK UPDATE without SQLCompiler (save / update_fields).
+        if not returning_fields:
+            fast = self._fast_path_simple_pk_update(using, pk_val, values)
+            if fast is not None:
+                return fast
         return filtered._update(values, returning_fields)
+
+    def _fast_path_simple_pk_update(self, using, pk_val, values):
+        """
+        UPDATE t SET c1=%s, ... WHERE pk=%s for concrete scalar fields.
+
+        Returns [()] if a row was updated, [] if not, or None to miss.
+        """
+        meta = self._meta
+        if meta.parents or meta.proxy:
+            return None
+        set_fields = []
+        raw_params = []
+        for field, _model, value in values:
+            if (
+                field is None
+                or not getattr(field, "concrete", False)
+                or not field.column
+                or field.primary_key
+                or field.generated
+                or field.many_to_many
+            ):
+                return None
+            if hasattr(value, "resolve_expression"):
+                return None
+            set_fields.append(field)
+            raw_params.append(value)
+
+        if not set_fields:
+            return None
+
+        connection = connections[using]
+        qn = connection.ops.quote_name
+        table = meta.db_table
+        pk_field = meta.pk
+        if not pk_field or not pk_field.column:
+            return None
+
+        quoted_set = [qn(f.column) for f in set_fields]
+        quoted_where = qn(pk_field.column)
+        cache_key = (
+            "upd",
+            connection.vendor,
+            table,
+            tuple(quoted_set),
+            quoted_where,
+        )
+
+        from django.db.models import query as query_module
+
+        def build():
+            from django import native as _native
+
+            qt = qn(table)
+            if _native.AVAILABLE:
+                return _native.simple_update_eq_sql(qt, quoted_set, quoted_where)
+            sets = ", ".join("%s = %%s" % c for c in quoted_set)
+            return "UPDATE %s SET %s WHERE %s = %%s" % (qt, sets, quoted_where)
+
+        sql = query_module._SIMPLE_SQL_CACHE.get(cache_key)
+        if sql is None:
+            sql = build()
+            try:
+                import sys
+
+                sql = sys.intern(sql)
+            except TypeError:
+                pass
+            sql = query_module._SIMPLE_SQL_CACHE.setdefault(cache_key, sql)
+
+        try:
+            params = [
+                f.get_db_prep_save(v, connection) for f, v in zip(set_fields, raw_params)
+            ]
+            params.append(
+                pk_field.get_db_prep_value(pk_val, connection, prepared=False)
+            )
+        except Exception:
+            return None
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, params)
+            # rowcount can be -1 on some backends; treat as success when unknown
+            # only if we cannot distinguish — prefer strict for correctness.
+            rowcount = cursor.rowcount
+        if rowcount is None or rowcount < 0:
+            # Unknown rowcount: fall back to compiler path for correctness.
+            return None
+        return [()] if rowcount else []
 
     def _do_insert(self, manager, using, fields, returning_fields, raw):
         """

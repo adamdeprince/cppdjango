@@ -1,9 +1,12 @@
 // HTML / JS string escaping (matches django.utils.html semantics).
 #pragma once
 
+#include <cstdint>
 #include <optional>
 #include <string>
 #include <string_view>
+#include <utility>
+#include <vector>
 
 namespace django::native {
 
@@ -35,6 +38,11 @@ namespace django::native {
                                               std::string_view truncate_suffix);
 [[nodiscard]] std::string truncate_words_html(std::string_view html, int length,
                                               std::string_view truncate_suffix);
+
+// TechEmpower fortune page: full HTML document from pre-sorted (id, message) rows.
+// Messages are HTML-escaped; ids are rendered as decimal integers.
+[[nodiscard]] std::string render_fortune_page(
+    const std::vector<std::pair<std::int64_t, std::string>>& rows);
 
 // IPv6 clean: compress longest zero run, lowercase, optional IPv4-mapped unpack.
 // Returns nullopt if invalid.

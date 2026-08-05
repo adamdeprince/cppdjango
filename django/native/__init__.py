@@ -3630,3 +3630,27 @@ def simple_select_in_sql(
     return fallbacks.simple_select_in_sql(
         quoted_table, cols, quoted_where_col, n_placeholders
     )
+
+
+def simple_update_eq_sql(quoted_table: str, quoted_set_cols, quoted_where_col: str) -> str:
+    impl = _impl()
+    cols = [str(c) for c in quoted_set_cols]
+    if impl is not None:
+        return impl.simple_update_eq_sql(
+            str(quoted_table), cols, str(quoted_where_col)
+        )
+    return fallbacks.simple_update_eq_sql(quoted_table, cols, quoted_where_col)
+
+
+def render_fortune_page(rows) -> str:
+    """
+    Build the TechEmpower fortunes HTML page.
+
+    ``rows`` is an iterable of ``(id, message)`` pairs, already sorted by
+    message. Messages are HTML-escaped.
+    """
+    impl = _impl()
+    pairs = [(int(i), str(m)) for i, m in rows]
+    if impl is not None:
+        return impl.render_fortune_page(pairs)
+    return fallbacks.render_fortune_page(pairs)

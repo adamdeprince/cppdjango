@@ -3393,4 +3393,24 @@ std::string simple_select_in_sql(std::string_view quoted_table,
   return out;
 }
 
+std::string simple_update_eq_sql(std::string_view quoted_table,
+                                 const std::vector<std::string>& quoted_set_cols,
+                                 std::string_view quoted_where_col) {
+  // UPDATE t SET c1 = %s, c2 = %s WHERE w = %s
+  std::string out = "UPDATE ";
+  out.append(quoted_table);
+  out.append(" SET ");
+  for (std::size_t i = 0; i < quoted_set_cols.size(); ++i) {
+    if (i) {
+      out.append(", ");
+    }
+    out.append(quoted_set_cols[i]);
+    out.append(" = %s");
+  }
+  out.append(" WHERE ");
+  out.append(quoted_where_col);
+  out.append(" = %s");
+  return out;
+}
+
 }  // namespace django::native

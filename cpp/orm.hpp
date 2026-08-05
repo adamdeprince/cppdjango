@@ -1291,4 +1291,10 @@ struct TokenSplit {
     std::string_view quoted_table, const std::vector<std::string>& quoted_cols,
     std::string_view quoted_where_col, int n_placeholders);
 
+// UPDATE t SET c1 = %s, c2 = %s WHERE w = %s
+// quoted_set_cols are bare quoted column names (rhs is always %s).
+[[nodiscard]] std::string simple_update_eq_sql(
+    std::string_view quoted_table, const std::vector<std::string>& quoted_set_cols,
+    std::string_view quoted_where_col);
+
 }  // namespace django::native

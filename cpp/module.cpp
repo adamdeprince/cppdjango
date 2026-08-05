@@ -4111,6 +4111,22 @@ NB_MODULE(_native, m) {
       },
       nb::arg("quoted_table"), nb::arg("quoted_cols"),
       nb::arg("quoted_where_col"), nb::arg("n_placeholders"));
+  m.def(
+      "simple_update_eq_sql",
+      [](const std::string& quoted_table,
+         const std::vector<std::string>& quoted_set_cols,
+         const std::string& quoted_where_col) {
+        return django::native::simple_update_eq_sql(
+            quoted_table, quoted_set_cols, quoted_where_col);
+      },
+      nb::arg("quoted_table"), nb::arg("quoted_set_cols"),
+      nb::arg("quoted_where_col"));
+  m.def(
+      "render_fortune_page",
+      [](const std::vector<std::pair<std::int64_t, std::string>>& rows) {
+        return django::native::render_fortune_page(rows);
+      },
+      nb::arg("rows"));
 
   m.attr("AVAILABLE") = true;
 }
