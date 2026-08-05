@@ -4083,6 +4083,16 @@ NB_MODULE(_native, m) {
           return django::native::mysql_isolation_level_valid(level);
         },
         nb::arg("level"));
+  m.def(
+      "simple_select_eq_limit_sql",
+      [](const std::string& quoted_table,
+         const std::vector<std::string>& quoted_cols,
+         const std::string& quoted_where_col, int limit) {
+        return django::native::simple_select_eq_limit_sql(
+            quoted_table, quoted_cols, quoted_where_col, limit);
+      },
+      nb::arg("quoted_table"), nb::arg("quoted_cols"),
+      nb::arg("quoted_where_col"), nb::arg("limit"));
 
   m.attr("AVAILABLE") = true;
 }

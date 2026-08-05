@@ -3594,3 +3594,17 @@ def mysql_isolation_level_valid(level: str) -> bool:
     if impl is not None:
         return impl.mysql_isolation_level_valid(level)
     return fallbacks.mysql_isolation_level_valid(level)
+
+
+def simple_select_eq_limit_sql(
+    quoted_table: str, quoted_cols, quoted_where_col: str, limit: int
+) -> str:
+    impl = _impl()
+    cols = [str(c) for c in quoted_cols]
+    if impl is not None:
+        return impl.simple_select_eq_limit_sql(
+            str(quoted_table), cols, str(quoted_where_col), int(limit)
+        )
+    return fallbacks.simple_select_eq_limit_sql(
+        quoted_table, cols, quoted_where_col, limit
+    )

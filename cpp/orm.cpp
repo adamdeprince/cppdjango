@@ -3331,4 +3331,28 @@ bool mysql_isolation_level_valid(std::string_view level) noexcept {
          level == "repeatable read" || level == "serializable";
 }
 
+std::string simple_select_eq_limit_sql(std::string_view quoted_table,
+                                       const std::vector<std::string>& quoted_cols,
+                                       std::string_view quoted_where_col,
+                                       int limit) {
+  // SELECT c1, c2 FROM t WHERE w = %s LIMIT n
+  if (limit < 1) {
+    limit = 1;
+  }
+  std::string out = "SELECT ";
+  for (std::size_t i = 0; i < quoted_cols.size(); ++i) {
+    if (i) {
+      out.append(", ");
+    }
+    out.append(quoted_cols[i]);
+  }
+  out.append(" FROM ");
+  out.append(quoted_table);
+  out.append(" WHERE ");
+  out.append(quoted_where_col);
+  out.append(" = %s LIMIT ");
+  out.append(std::to_string(limit));
+  return out;
+}
+
 }  // namespace django::native

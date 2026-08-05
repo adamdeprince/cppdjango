@@ -46,6 +46,11 @@ REPR_OUTPUT_SIZE = 20
 
 PROHIBITED_FILTER_KWARGS = frozenset(["_connector", "_negated"])
 
+# Tier 1: process-local SQL templates for simple values_list().get(...) fast path.
+# Key: (vendor, db_table, select_columns, where_column, limit) -> SQL with %s placeholder.
+_SIMPLE_VALUES_GET_SQL_CACHE = {}
+_FAST_PATH_MISS = object()
+
 
 class BaseIterable:
     def __init__(
@@ -714,6 +719,12 @@ class QuerySet(AltersData):
                 "Calling QuerySet.get(...) with filters after %s() is not "
                 "supported." % self.query.combinator
             )
+        # Tier 1 fast path: values_list('a','b').get(exact_field=value) without
+        # building a full SQLCompiler / QuerySet clone when the query is empty.
+        if not args and kwargs:
+            fast = self._fast_path_simple_values_get(kwargs)
+            if fast is not _FAST_PATH_MISS:
+                return fast
         clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
         if self.query.can_filter() and not self.query.distinct_fields:
             clone = clone.order_by()
@@ -725,23 +736,7 @@ class QuerySet(AltersData):
             limit = MAX_GET_RESULTS
             clone.query.set_limits(high=limit)
         num = len(clone)
-        from django import native as _native
-
-        if _native.AVAILABLE:
-            kind = _native.get_result_kind(num, limit or 0)
-            if kind == 0:
-                return clone._result_cache[0]
-            if kind == 1:
-                raise self.model.DoesNotExist(
-                    "%s matching query does not exist." % self.model._meta.object_name
-                )
-            raise self.model.MultipleObjectsReturned(
-                "get() returned more than one %s -- it returned %s!"
-                % (
-                    self.model._meta.object_name,
-                    num if not limit or num < limit else "more than %s" % (limit - 1),
-                )
-            )
+        # Avoid dual-path hop for a trivial branch (net-negative on TE /db).
         if num == 1:
             return clone._result_cache[0]
         if not num:
@@ -753,6 +748,134 @@ class QuerySet(AltersData):
             % (
                 self.model._meta.object_name,
                 num if not limit or num < limit else "more than %s" % (limit - 1),
+            )
+        )
+
+    def _fast_path_simple_values_get(self, kwargs):
+        """
+        Optimized path for::
+
+            Model.objects.values_list('col1', 'col2').get(pk_or_col=value)
+
+        when the queryset has no prior filters/joins/annotations. Returns
+        ``_FAST_PATH_MISS`` when the pattern does not apply.
+        """
+        query = self.query
+        if (
+            self._fields is None
+            or self._iterable_class
+            not in (ValuesListIterable, FlatValuesListIterable)
+            or len(kwargs) != 1
+            or query.combinator
+            or query.is_sliced
+            or query.distinct
+            or query.distinct_fields
+            or query.select_for_update
+            or query.group_by
+            or query.annotations
+            or query.extra
+            or query.where.children
+            or len(query.alias_map) > 1
+        ):
+            return _FAST_PATH_MISS
+
+        field_names = self._fields
+        if not field_names:
+            return _FAST_PATH_MISS
+        for name in field_names:
+            if not isinstance(name, str) or LOOKUP_SEP in name:
+                return _FAST_PATH_MISS
+
+        lookup_name, value = next(iter(kwargs.items()))
+        if not isinstance(lookup_name, str) or LOOKUP_SEP in lookup_name:
+            return _FAST_PATH_MISS
+
+        opts = self.model._meta
+        try:
+            if lookup_name == "pk":
+                lookup_field = opts.pk
+            else:
+                lookup_field = opts.get_field(lookup_name)
+        except exceptions.FieldDoesNotExist:
+            return _FAST_PATH_MISS
+        # Concrete columns only (incl. FK forward columns); skip M2M/reverse.
+        if not getattr(lookup_field, "concrete", False) or lookup_field.many_to_many:
+            return _FAST_PATH_MISS
+        if lookup_field.is_relation and not (
+            lookup_field.many_to_one or lookup_field.one_to_one
+        ):
+            return _FAST_PATH_MISS
+
+        select_columns = []
+        for name in field_names:
+            try:
+                f = opts.get_field(name)
+            except exceptions.FieldDoesNotExist:
+                return _FAST_PATH_MISS
+            if not getattr(f, "concrete", False) or not f.column:
+                return _FAST_PATH_MISS
+            select_columns.append(f.column)
+
+        where_column = lookup_field.column
+        if not where_column:
+            return _FAST_PATH_MISS
+
+        db = self.db
+        connection = connections[db]
+        qn = connection.ops.quote_name
+        table = opts.db_table
+        limit = MAX_GET_RESULTS
+        cache_key = (
+            connection.vendor,
+            table,
+            tuple(select_columns),
+            where_column,
+            limit,
+        )
+        sql = _SIMPLE_VALUES_GET_SQL_CACHE.get(cache_key)
+        if sql is None:
+            from django import native as _native
+
+            quoted_table = qn(table)
+            quoted_cols = [qn(c) for c in select_columns]
+            quoted_where = qn(where_column)
+            if _native.AVAILABLE:
+                sql = _native.simple_select_eq_limit_sql(
+                    quoted_table, quoted_cols, quoted_where, limit
+                )
+            else:
+                sql = "SELECT %s FROM %s WHERE %s = %%s LIMIT %d" % (
+                    ", ".join(quoted_cols),
+                    quoted_table,
+                    quoted_where,
+                    limit,
+                )
+            _SIMPLE_VALUES_GET_SQL_CACHE[cache_key] = sql
+
+        try:
+            param = lookup_field.get_db_prep_value(value, connection, prepared=False)
+        except Exception:
+            return _FAST_PATH_MISS
+
+        with connection.cursor() as cursor:
+            cursor.execute(sql, [param])
+            rows = cursor.fetchall()
+
+        n = len(rows)
+        if n == 1:
+            row = rows[0]
+            if self._iterable_class is FlatValuesListIterable:
+                return row[0]
+            return row
+        if n == 0:
+            raise self.model.DoesNotExist(
+                "%s matching query does not exist." % self.model._meta.object_name
+            )
+        raise self.model.MultipleObjectsReturned(
+            "get() returned more than one %s -- it returned %s!"
+            % (
+                self.model._meta.object_name,
+                n if n < limit else "more than %s" % (limit - 1),
             )
         )
 

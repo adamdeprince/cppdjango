@@ -3446,3 +3446,15 @@ def mysql_isolation_level_valid(level: str) -> bool:
         "repeatable read",
         "serializable",
     )
+
+
+def simple_select_eq_limit_sql(
+    quoted_table: str, quoted_cols, quoted_where_col: str, limit: int
+) -> str:
+    if limit < 1:
+        limit = 1
+    cols = ", ".join(quoted_cols)
+    return (
+        f"SELECT {cols} FROM {quoted_table} "
+        f"WHERE {quoted_where_col} = %s LIMIT {int(limit)}"
+    )

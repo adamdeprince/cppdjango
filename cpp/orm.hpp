@@ -1275,4 +1275,10 @@ struct TokenSplit {
 
 // ContentType natural key path already model_meta_label
 
+// Tier 1 ORM: simple SELECT col1, col2 FROM table WHERE col = %s LIMIT n
+// table/cols/where_col must already be quoted by the backend.
+[[nodiscard]] std::string simple_select_eq_limit_sql(
+    std::string_view quoted_table, const std::vector<std::string>& quoted_cols,
+    std::string_view quoted_where_col, int limit);
+
 }  // namespace django::native
