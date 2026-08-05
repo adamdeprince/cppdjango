@@ -8,7 +8,6 @@ filter().update, and fortune HTML rendering.
 import os
 from unittest import mock
 
-from django.db.models.query import _SIMPLE_SQL_CACHE
 from django.test import SimpleTestCase, TestCase, modify_settings
 from django.test.utils import isolate_apps
 
@@ -113,16 +112,13 @@ class OrmFastPathDBTests(TestCase):
         obj.save(update_fields=["randomnumber"])
         self.assertEqual(FastWorld.objects.get(pk=6).randomnumber, 606)
 
-    def test_sql_cache_populated(self):
-        _SIMPLE_SQL_CACHE.clear()
-        FastWorld.objects.values_list("id", "randomnumber").get(id=1)
-        # values_list get may use the C++ ORM data plane (no Python SQL cache).
-        # Model update still uses the Python-side simple UPDATE cache.
-        FastWorld.objects.filter(pk=1).update(randomnumber=11)
-        self.assertTrue(
-            any(k[0] == "upd" for k in _SIMPLE_SQL_CACHE)
-            or any(k[0] == "eq" for k in _SIMPLE_SQL_CACHE)
-        )
+    def test_dataplane_get_and_update(self):
+        # Both go through the C++ ORM data plane (no Python SQL string cache).
+        row = FastWorld.objects.values_list("id", "randomnumber").get(id=1)
+        self.assertEqual(row[0], 1)
+        n = FastWorld.objects.filter(pk=1).update(randomnumber=11)
+        self.assertEqual(n, 1)
+        self.assertEqual(FastWorld.objects.get(pk=1).randomnumber, 11)
 
     def test_annotated_misses_fast_path(self):
         from django.db.models import Value

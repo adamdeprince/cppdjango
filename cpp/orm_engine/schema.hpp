@@ -29,26 +29,31 @@ enum class FieldType : std::uint8_t {
   Time,
   UUID,
   Binary,
+  ForeignKey,
   Other,
 };
 
 struct FieldSchema {
   FieldId id = 0;
-  std::string name;      // Python field name / attname for lookups
-  std::string attname;   // instance attribute
-  std::string column;    // DB column
+  std::string name;
+  std::string attname;
+  std::string column;
   FieldType type = FieldType::Other;
   bool primary_key = false;
   bool nullable = false;
+  // FK: remote table/pk for simple joins (denormalized).
+  bool is_relation = false;
+  std::string remote_table;
+  std::string remote_pk_column;
+  std::string remote_model_label;
 };
 
 struct ModelSchema {
   ModelId id = 0;
-  std::string label;  // app_label.ModelName
+  std::string label;
   std::string db_table;
   std::vector<FieldSchema> fields;
   FieldId pk_field = 0;
-  // name / attname / "pk" → field id
   std::unordered_map<std::string, FieldId> field_by_name;
 };
 
@@ -56,14 +61,13 @@ class SchemaRegistry {
  public:
   static SchemaRegistry& instance();
 
-  // Register or replace by label. Returns model id.
   ModelId register_model(ModelSchema schema);
 
   [[nodiscard]] const ModelSchema* get(ModelId id) const;
   [[nodiscard]] const ModelSchema* get_by_label(std::string_view label) const;
   [[nodiscard]] std::optional<ModelId> find_id(std::string_view label) const;
 
-  void clear();  // tests
+  void clear();
 
  private:
   SchemaRegistry() = default;
@@ -71,7 +75,6 @@ class SchemaRegistry {
   std::unordered_map<std::string, ModelId> by_label_;
 };
 
-// Map Django field class name → FieldType (best-effort).
 [[nodiscard]] FieldType field_type_from_class_name(std::string_view class_name);
 
 }  // namespace django::orm

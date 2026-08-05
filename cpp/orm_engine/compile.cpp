@@ -16,41 +16,43 @@ const FieldSchema* field_of(const ModelSchema& m, FieldId id) {
   return &m.fields[id];
 }
 
-std::string table_alias(const ModelSchema& m, const ColumnRef& c) {
+std::string resolve_alias(const Query& q, const ModelSchema& m,
+                          const ColumnRef& c) {
   if (!c.table_alias.empty()) {
     return c.table_alias;
+  }
+  if (!q.base_alias.empty()) {
+    return q.base_alias;
   }
   return m.db_table;
 }
 
-void emit_column(std::string& out, DialectId d, const ModelSchema& m,
-                 const ColumnRef& c) {
+void emit_column(std::string& out, DialectId d, const Query& q,
+                 const ModelSchema& m, const ColumnRef& c) {
+  append_quoted(out, d, resolve_alias(q, m, c));
+  out += '.';
+  if (!c.column_override.empty()) {
+    append_quoted(out, d, c.column_override);
+    return;
+  }
   auto* f = field_of(m, c.field);
   if (!f) {
     throw std::runtime_error("orm compile: bad field id");
   }
-  append_quoted(out, d, table_alias(m, c));
-  out += '.';
   append_quoted(out, d, f->column);
 }
 
 void emit_pred(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
-               const ModelSchema& m, const Pred& p) {
-  emit_column(out, d, m, p.lhs);
+               const Query& q, const ModelSchema& m, const Pred& p) {
+  emit_column(out, d, q, m, p.lhs);
   switch (p.op) {
     case CmpOp::Eq:
       out += " = %s";
-      if (p.param_idxs.size() != 1) {
-        throw std::runtime_error("orm compile: Eq needs 1 param");
-      }
-      order.push_back(p.param_idxs[0]);
+      order.push_back(p.param_idxs.at(0));
       break;
     case CmpOp::Ne:
       out += " <> %s";
-      if (p.param_idxs.size() != 1) {
-        throw std::runtime_error("orm compile: Ne needs 1 param");
-      }
-      order.push_back(p.param_idxs[0]);
+      order.push_back(p.param_idxs.at(0));
       break;
     case CmpOp::Lt:
       out += " < %s";
@@ -90,17 +92,17 @@ void emit_pred(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
 }
 
 void emit_bool(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
-               const ModelSchema& m, const BoolExpr& e) {
+               const Query& q, const ModelSchema& m, const BoolExpr& e) {
   switch (e.kind) {
     case BoolExpr::Kind::Atom:
-      emit_pred(out, order, d, m, e.atom);
+      emit_pred(out, order, d, q, m, e.atom);
       break;
     case BoolExpr::Kind::Not:
       out += "NOT (";
       if (e.children.size() != 1) {
         throw std::runtime_error("orm compile: Not arity");
       }
-      emit_bool(out, order, d, m, e.children[0]);
+      emit_bool(out, order, d, q, m, e.children[0]);
       out += ')';
       break;
     case BoolExpr::Kind::And:
@@ -117,7 +119,7 @@ void emit_bool(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
         if (i) {
           out += sep;
         }
-        emit_bool(out, order, d, m, e.children[i]);
+        emit_bool(out, order, d, q, m, e.children[i]);
       }
       if (e.children.size() > 1) {
         out += ')';
@@ -125,6 +127,140 @@ void emit_bool(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
       break;
     }
   }
+}
+
+CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
+  CompiledSql result;
+  const DialectId d = q.dialect;
+  std::string& sql = result.sql;
+  auto& order = result.param_order;
+
+  sql = "SELECT ";
+  if (q.distinct) {
+    sql += "DISTINCT ";
+  }
+
+  std::vector<SelectItem> items = q.select;
+  if (items.empty()) {
+    for (const auto& f : m.fields) {
+      if (f.is_relation && f.column.empty()) {
+        continue;
+      }
+      SelectItem it;
+      it.col.field = f.id;
+      items.push_back(std::move(it));
+    }
+  }
+  for (std::size_t i = 0; i < items.size(); ++i) {
+    if (i) {
+      sql += ", ";
+    }
+    emit_column(sql, d, q, m, items[i].col);
+    if (!items[i].out_alias.empty()) {
+      sql += " AS ";
+      append_quoted(sql, d, items[i].out_alias);
+    }
+  }
+
+  sql += " FROM ";
+  append_quoted(sql, d, m.db_table);
+  if (!q.base_alias.empty() && q.base_alias != m.db_table) {
+    sql += ' ';
+    append_quoted(sql, d, q.base_alias);
+  }
+
+  for (const auto& j : q.joins) {
+    sql += j.type == JoinType::LeftOuter ? " LEFT OUTER JOIN " : " INNER JOIN ";
+    append_quoted(sql, d, j.table);
+    sql += ' ';
+    append_quoted(sql, d, j.alias);
+    sql += " ON ";
+    append_quoted(sql, d, j.local_alias);
+    sql += '.';
+    append_quoted(sql, d, j.local_column);
+    sql += " = ";
+    append_quoted(sql, d, j.alias);
+    sql += '.';
+    append_quoted(sql, d, j.remote_column);
+  }
+
+  if (q.has_where) {
+    sql += " WHERE ";
+    emit_bool(sql, order, d, q, m, q.where);
+  }
+
+  if (!q.order_by.empty()) {
+    sql += " ORDER BY ";
+    for (std::size_t i = 0; i < q.order_by.size(); ++i) {
+      if (i) {
+        sql += ", ";
+      }
+      emit_column(sql, d, q, m, q.order_by[i].col);
+      if (q.order_by[i].desc) {
+        sql += " DESC";
+      }
+    }
+  }
+
+  if (q.limit.has_value()) {
+    sql += " LIMIT ";
+    sql += std::to_string(*q.limit);
+  }
+  if (q.offset > 0) {
+    sql += " OFFSET ";
+    sql += std::to_string(q.offset);
+  }
+  return result;
+}
+
+CompiledSql compile_update_inner(const Query& q, const ModelSchema& m) {
+  CompiledSql result;
+  if (q.assignments.empty()) {
+    return result;
+  }
+  const DialectId d = q.dialect;
+  std::string& sql = result.sql;
+  auto& order = result.param_order;
+
+  sql = "UPDATE ";
+  append_quoted(sql, d, m.db_table);
+  sql += " SET ";
+  for (std::size_t i = 0; i < q.assignments.size(); ++i) {
+    if (i) {
+      sql += ", ";
+    }
+    auto* f = field_of(m, q.assignments[i].field);
+    if (!f) {
+      throw std::runtime_error("orm compile: bad update field");
+    }
+    append_quoted(sql, d, f->column);
+    if (q.assignments[i].set_null) {
+      sql += " = NULL";
+    } else {
+      sql += " = %s";
+      order.push_back(q.assignments[i].param_idx);
+    }
+  }
+  if (q.has_where) {
+    sql += " WHERE ";
+    emit_bool(sql, order, d, q, m, q.where);
+  }
+  return result;
+}
+
+CompiledSql compile_delete_inner(const Query& q, const ModelSchema& m) {
+  CompiledSql result;
+  const DialectId d = q.dialect;
+  std::string& sql = result.sql;
+  auto& order = result.param_order;
+
+  sql = "DELETE FROM ";
+  append_quoted(sql, d, m.db_table);
+  if (q.has_where) {
+    sql += " WHERE ";
+    emit_bool(sql, order, d, q, m, q.where);
+  }
+  return result;
 }
 
 }  // namespace
@@ -156,75 +292,24 @@ DialectId dialect_from_vendor(std::string_view vendor) {
   return DialectId::SQLite;
 }
 
-CompiledSql compile_select(const Query& q, const SchemaRegistry& reg) {
-  CompiledSql result;
+CompiledSql compile_query(const Query& q, const SchemaRegistry& reg) {
   const ModelSchema* model = reg.get(q.model);
   if (!model) {
-    return result;
+    return {};
   }
-  const DialectId d = q.dialect;
-  std::string& sql = result.sql;
-  auto& order = result.param_order;
-
-  sql = "SELECT ";
-  if (q.distinct) {
-    sql += "DISTINCT ";
-  }
-
-  std::vector<SelectItem> items = q.select;
-  if (items.empty()) {
-    for (const auto& f : model->fields) {
-      SelectItem it;
-      it.col.field = f.id;
-      items.push_back(std::move(it));
+  try {
+    switch (q.kind) {
+      case StmtKind::Select:
+        return compile_select_inner(q, *model);
+      case StmtKind::Update:
+        return compile_update_inner(q, *model);
+      case StmtKind::Delete:
+        return compile_delete_inner(q, *model);
     }
+  } catch (...) {
+    return {};
   }
-  for (std::size_t i = 0; i < items.size(); ++i) {
-    if (i) {
-      sql += ", ";
-    }
-    emit_column(sql, d, *model, items[i].col);
-    if (!items[i].out_alias.empty()) {
-      sql += " AS ";
-      append_quoted(sql, d, items[i].out_alias);
-    }
-  }
-
-  sql += " FROM ";
-  append_quoted(sql, d, model->db_table);
-
-  if (q.has_where) {
-    sql += " WHERE ";
-    emit_bool(sql, order, d, *model, q.where);
-  }
-
-  if (!q.order_by.empty()) {
-    sql += " ORDER BY ";
-    for (std::size_t i = 0; i < q.order_by.size(); ++i) {
-      if (i) {
-        sql += ", ";
-      }
-      emit_column(sql, d, *model, q.order_by[i].col);
-      if (q.order_by[i].desc) {
-        sql += " DESC";
-      }
-    }
-  }
-
-  if (q.limit.has_value()) {
-    sql += " LIMIT ";
-    sql += std::to_string(*q.limit);
-  }
-  if (q.offset > 0) {
-    // SQLite/Postgres/MySQL
-    if (!q.limit.has_value() && d == DialectId::MySQL) {
-      // MySQL offset-only needs huge limit — use dialect convention later.
-    }
-    sql += " OFFSET ";
-    sql += std::to_string(q.offset);
-  }
-
-  return result;
+  return {};
 }
 
 }  // namespace django::orm

@@ -10,13 +10,17 @@ namespace django::orm {
 
 struct CompiledSql {
   std::string sql;
-  // Indices into Query::params in left-to-right placeholder order.
   std::vector<std::uint32_t> param_order;
 };
 
-// Returns empty sql on failure (unknown model, etc.).
-[[nodiscard]] CompiledSql compile_select(const Query& q,
-                                         const SchemaRegistry& reg);
+[[nodiscard]] CompiledSql compile_query(const Query& q,
+                                        const SchemaRegistry& reg);
+
+// Back-compat alias
+[[nodiscard]] inline CompiledSql compile_select(const Query& q,
+                                                const SchemaRegistry& reg) {
+  return compile_query(q, reg);
+}
 
 [[nodiscard]] std::string quote_ident(DialectId d, std::string_view name);
 [[nodiscard]] DialectId dialect_from_vendor(std::string_view vendor);

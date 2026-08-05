@@ -873,75 +873,63 @@ class QuerySet(AltersData):
         except Exception:
             return _FAST_PATH_MISS
 
+        lookup_key = (
+            "pk"
+            if getattr(lookup_field, "primary_key", False)
+            else lookup_field.attname
+        )
+        field_names = (
+            list(self._fields)
+            if self._fields is not None
+            else list(model_field_names or [])
+        )
+
         sql = None
         params = (param,)
+        try:
+            from django.native import orm as native_orm
 
-        # Prefer C++ ORM data plane (QuerySet graph + compiler) when available.
-        # One boundary: compile_sql → (sql, params). No Python where-tree.
-        if not as_model and self._fields is not None:
-            try:
-                from django.native import orm as native_orm
-
-                lookup_key = (
-                    "pk"
-                    if getattr(lookup_field, "primary_key", False)
-                    else lookup_field.attname
-                )
+            if field_names:
                 compiled = native_orm.compile_values_list_get(
                     self.model,
-                    field_names=list(self._fields),
+                    field_names=field_names,
                     lookup_field=lookup_key,
                     lookup_value=param,
                     limit=limit,
                     connection=connection,
                 )
-                if compiled is not None:
-                    sql, param_list = compiled
-                    params = tuple(param_list)
-            except Exception:
-                sql = None
+            else:
+                compiled = native_orm.compile_select(
+                    self.model,
+                    connection,
+                    kwargs={lookup_key: param},
+                    limit=limit,
+                )
+            if compiled is not None:
+                sql, param_list = compiled
+                params = tuple(param_list)
+        except Exception:
+            sql = None
 
         if sql is None:
-            qn = connection.ops.quote_name
-            table = self.model._meta.db_table
-            where_column = lookup_field.column
-            cache_key = (
-                "eq",
-                connection.vendor,
-                table,
-                tuple(select_columns),
-                where_column,
-                limit,
+            return _FAST_PATH_MISS
+
+        try:
+            from django.native import orm as native_orm
+
+            row, multi = native_orm.execute_fetchone_pair(connection, sql, params)
+        except Exception:
+            return _FAST_PATH_MISS
+
+        if row is None:
+            raise self.model.DoesNotExist(
+                "%s matching query does not exist." % self.model._meta.object_name
             )
-
-            def build():
-                from django import native as _native
-
-                qt, qc, qw = qn(table), [qn(c) for c in select_columns], qn(where_column)
-                if _native.AVAILABLE:
-                    return _native.simple_select_eq_limit_sql(qt, qc, qw, limit)
-                return "SELECT %s FROM %s WHERE %s = %%s LIMIT %d" % (
-                    ", ".join(qc),
-                    qt,
-                    qw,
-                    limit,
-                )
-
-            sql = self._cached_simple_sql(cache_key, build)
-
-        # fetchone×2 instead of fetchall: less allocation; still detects multi-row.
-        with connection.cursor() as cursor:
-            cursor.execute(sql, params)
-            row = cursor.fetchone()
-            if row is None:
-                raise self.model.DoesNotExist(
-                    "%s matching query does not exist." % self.model._meta.object_name
-                )
-            if cursor.fetchone() is not None:
-                raise self.model.MultipleObjectsReturned(
-                    "get() returned more than one %s -- it returned more than 1!"
-                    % self.model._meta.object_name
-                )
+        if multi:
+            raise self.model.MultipleObjectsReturned(
+                "get() returned more than one %s -- it returned more than 1!"
+                % self.model._meta.object_name
+            )
 
         if as_model:
             return self.model.from_db(db, model_field_names, row)
@@ -956,7 +944,7 @@ class QuerySet(AltersData):
             list(Model.objects.values('id', 'message'))
             list(Model.objects.values_list('id', 'message'))
 
-        unfiltered single-table scans (fortune-shaped).
+        unfiltered single-table scans (fortune-shaped) via C++ data plane.
         """
         if not self._simple_base_eligible():
             return _FAST_PATH_MISS
@@ -968,28 +956,26 @@ class QuerySet(AltersData):
             FlatValuesListIterable,
         ):
             return _FAST_PATH_MISS
-        select_columns = self._resolve_select_columns(self._fields)
-        if not select_columns:
+        if not self._resolve_select_columns(self._fields):
             return _FAST_PATH_MISS
 
         db = self.db
         connection = connections[db]
-        qn = connection.ops.quote_name
-        table = self.model._meta.db_table
-        cache_key = ("all", connection.vendor, table, tuple(select_columns))
+        try:
+            from django.native import orm as native_orm
 
-        def build():
-            from django import native as _native
-
-            qt, qc = qn(table), [qn(c) for c in select_columns]
-            if _native.AVAILABLE:
-                return _native.simple_select_all_sql(qt, qc, 0)
-            return "SELECT %s FROM %s" % (", ".join(qc), qt)
-
-        sql = self._cached_simple_sql(cache_key, build)
-        with connection.cursor() as cursor:
-            cursor.execute(sql)
-            rows = cursor.fetchall()
+            compiled = native_orm.compile_select(
+                self.model,
+                connection,
+                field_names=list(self._fields),
+                kwargs=None,
+            )
+            if compiled is None:
+                return _FAST_PATH_MISS
+            sql, params = compiled
+            rows = native_orm.execute_fetchall(connection, sql, params)
+        except Exception:
+            return _FAST_PATH_MISS
 
         names = list(self._fields)
         if self._iterable_class is ValuesIterable:
@@ -1004,20 +990,17 @@ class QuerySet(AltersData):
 
             Model.objects.filter(pk=pk).update(field=value, ...)
 
-        when the queryset already has exactly one exact equality in WHERE and
-        kwargs are concrete scalar fields (no F()/expressions).
+        via C++ UPDATE compile when WHERE is a single exact lookup.
         """
         if not kwargs:
             return _FAST_PATH_MISS
         query = self.query
         if not self._simple_base_eligible(require_empty_where=False):
             return _FAST_PATH_MISS
-        # Exactly one exact lookup child: col = value
         children = query.where.children
         if len(children) != 1:
             return _FAST_PATH_MISS
         child = children[0]
-        # django.db.models.lookups.Exact / BuiltinLookup
         lhs = getattr(child, "lhs", None)
         rhs = getattr(child, "rhs", None)
         lookup_name = getattr(child, "lookup_name", None)
@@ -1028,11 +1011,9 @@ class QuerySet(AltersData):
         target = getattr(lhs, "target", None) or getattr(lhs, "field", None)
         if not self._concrete_field_ok(target):
             return _FAST_PATH_MISS
-        where_field = target
 
-        set_fields = []
-        set_values = []
         opts = self.model._meta
+        update_kwargs = {}
         for name, value in kwargs.items():
             if not isinstance(name, str) or LOOKUP_SEP in name:
                 return _FAST_PATH_MISS
@@ -1048,41 +1029,28 @@ class QuerySet(AltersData):
                 or field.generated
             ):
                 return _FAST_PATH_MISS
-            set_fields.append(field)
-            set_values.append(value)
+            update_kwargs[name] = value
 
         db = self.db
         connection = connections[db]
-        qn = connection.ops.quote_name
-        table = self.model._meta.db_table
-        quoted_set = [qn(f.column) for f in set_fields]
-        quoted_where = qn(where_field.column)
-        cache_key = (
-            "upd",
-            connection.vendor,
-            table,
-            tuple(quoted_set),
-            quoted_where,
-        )
-
-        def build():
-            from django import native as _native
-
-            qt = qn(table)
-            if _native.AVAILABLE:
-                return _native.simple_update_eq_sql(qt, quoted_set, quoted_where)
-            sets = ", ".join("%s = %%s" % c for c in quoted_set)
-            return "UPDATE %s SET %s WHERE %s = %%s" % (qt, sets, quoted_where)
-
-        sql = self._cached_simple_sql(cache_key, build)
         try:
-            params = [
-                f.get_db_prep_save(v, connection)
-                for f, v in zip(set_fields, set_values)
-            ]
-            params.append(
-                where_field.get_db_prep_value(rhs, connection, prepared=False)
+            where_key = "pk" if target.primary_key else target.attname
+            where_val = target.get_db_prep_value(rhs, connection, prepared=False)
+            prep_updates = {}
+            for name, value in update_kwargs.items():
+                field = opts.get_field(name)
+                prep_updates[name] = field.get_db_prep_save(value, connection)
+            from django.native import orm as native_orm
+
+            compiled = native_orm.compile_update(
+                self.model,
+                connection,
+                filter_kwargs={where_key: where_val},
+                update_kwargs=prep_updates,
             )
+            if compiled is None:
+                return _FAST_PATH_MISS
+            sql, params = compiled
         except Exception:
             return _FAST_PATH_MISS
 
@@ -1097,7 +1065,7 @@ class QuerySet(AltersData):
     def _fast_path_simple_in_values(self, field_name, id_list):
         """
         SELECT cols FROM t WHERE field IN (...) for values_list/values querysets.
-        Returns list of rows (tuples) or _FAST_PATH_MISS.
+        Via C++ data plane (filter_kwargs + compile + fetchall).
         """
         if not self._simple_base_eligible():
             return _FAST_PATH_MISS
@@ -1109,8 +1077,7 @@ class QuerySet(AltersData):
             ValuesIterable,
         ):
             return _FAST_PATH_MISS
-        select_columns = self._resolve_select_columns(self._fields)
-        if not select_columns:
+        if not self._resolve_select_columns(self._fields):
             return _FAST_PATH_MISS
         lookup_field = self._resolve_lookup_field(field_name)
         if not self._concrete_field_ok(lookup_field):
@@ -1121,47 +1088,30 @@ class QuerySet(AltersData):
 
         db = self.db
         connection = connections[db]
-        qn = connection.ops.quote_name
-        table = self.model._meta.db_table
-        where_column = lookup_field.column
-        n = len(id_list)
-        cache_key = (
-            "in",
-            connection.vendor,
-            table,
-            tuple(select_columns),
-            where_column,
-            n,
-        )
-
-        def build():
-            from django import native as _native
-
-            qt = qn(table)
-            qc = [qn(c) for c in select_columns]
-            qw = qn(where_column)
-            if _native.AVAILABLE:
-                return _native.simple_select_in_sql(qt, qc, qw, n)
-            ph = ", ".join(["%s"] * n)
-            return "SELECT %s FROM %s WHERE %s IN (%s)" % (
-                ", ".join(qc),
-                qt,
-                qw,
-                ph,
-            )
-
-        sql = self._cached_simple_sql(cache_key, build)
         try:
             params = [
                 lookup_field.get_db_prep_value(v, connection, prepared=False)
                 for v in id_list
             ]
+            key = (
+                "pk"
+                if lookup_field.primary_key
+                else lookup_field.attname
+            ) + "__in"
+            from django.native import orm as native_orm
+
+            compiled = native_orm.compile_select(
+                self.model,
+                connection,
+                field_names=list(self._fields),
+                kwargs={key: params},
+            )
+            if compiled is None:
+                return _FAST_PATH_MISS
+            sql, sql_params = compiled
+            rows = native_orm.execute_fetchall(connection, sql, sql_params)
         except Exception:
             return _FAST_PATH_MISS
-
-        with connection.cursor() as cursor:
-            cursor.execute(sql, params)
-            rows = cursor.fetchall()
 
         if self._iterable_class is ValuesIterable:
             names = list(self._fields)
@@ -1874,60 +1824,61 @@ class QuerySet(AltersData):
                     if select_columns:
                         db = self.db
                         connection = connections[db]
-                        qn = connection.ops.quote_name
-                        table = opts.db_table
                         n = len(id_list)
                         batch_size = connection.ops.bulk_batch_size([opts.pk], id_list)
                         result = {}
+                        try:
+                            from django.native import orm as native_orm
+                        except Exception:
+                            native_orm = None
 
                         def fetch_batch(batch):
-                            bn = len(batch)
-                            cache_key = (
-                                "in_model",
-                                connection.vendor,
-                                table,
-                                tuple(select_columns),
-                                lookup_field.column,
-                                bn,
-                            )
-
-                            def build():
-                                from django import native as _native
-
-                                qt = qn(table)
-                                qc = [qn(c) for c in select_columns]
-                                qw = qn(lookup_field.column)
-                                if _native.AVAILABLE:
-                                    return _native.simple_select_in_sql(
-                                        qt, qc, qw, bn
-                                    )
-                                ph = ", ".join(["%s"] * bn)
-                                return "SELECT %s FROM %s WHERE %s IN (%s)" % (
-                                    ", ".join(qc),
-                                    qt,
-                                    qw,
-                                    ph,
-                                )
-
-                            sql = self._cached_simple_sql(cache_key, build)
                             params = [
                                 lookup_field.get_db_prep_value(
                                     v, connection, prepared=False
                                 )
                                 for v in batch
                             ]
-                            with connection.cursor() as cursor:
-                                cursor.execute(sql, params)
-                                for row in cursor.fetchall():
-                                    obj = self.model.from_db(db, field_names, row)
-                                    result[getattr(obj, field_name if field_name != "pk" else "pk")] = obj
+                            key = (
+                                "pk"
+                                if field_name == "pk" or lookup_field.primary_key
+                                else lookup_field.attname
+                            ) + "__in"
+                            if native_orm is None:
+                                return False
+                            compiled = native_orm.compile_select(
+                                self.model,
+                                connection,
+                                field_names=field_names,
+                                kwargs={key: params},
+                            )
+                            if compiled is None:
+                                return False
+                            sql, sql_params = compiled
+                            for row in native_orm.execute_fetchall(
+                                connection, sql, sql_params
+                            ):
+                                obj = self.model.from_db(db, field_names, row)
+                                result[
+                                    getattr(
+                                        obj,
+                                        field_name if field_name != "pk" else "pk",
+                                    )
+                                ] = obj
+                            return True
 
+                        ok = True
                         if batch_size and batch_size < n:
                             for offset in range(0, n, batch_size):
-                                fetch_batch(id_list[offset : offset + batch_size])
+                                if not fetch_batch(
+                                    id_list[offset : offset + batch_size]
+                                ):
+                                    ok = False
+                                    break
                         else:
-                            fetch_batch(id_list)
-                        return result
+                            ok = fetch_batch(id_list)
+                        if ok:
+                            return result
             batch_size = connections[self.db].ops.bulk_batch_size([opts.pk], id_list)
             # If the database has a limit on the number of query parameters
             # (e.g. SQLite), retrieve objects in batches if necessary.

@@ -3,12 +3,6 @@
 #include <utility>
 
 namespace django::orm {
-
-SchemaRegistry& SchemaRegistry::instance() {
-  static SchemaRegistry reg;
-  return reg;
-}
-
 namespace {
 
 void index_fields(ModelSchema& schema) {
@@ -29,6 +23,11 @@ void index_fields(ModelSchema& schema) {
 }
 
 }  // namespace
+
+SchemaRegistry& SchemaRegistry::instance() {
+  static SchemaRegistry reg;
+  return reg;
+}
 
 ModelId SchemaRegistry::register_model(ModelSchema schema) {
   index_fields(schema);
@@ -120,6 +119,9 @@ FieldType field_type_from_class_name(std::string_view class_name) {
   }
   if (class_name == "BinaryField") {
     return FieldType::Binary;
+  }
+  if (class_name == "ForeignKey" || class_name == "OneToOneField") {
+    return FieldType::ForeignKey;
   }
   return FieldType::Other;
 }

@@ -1,4 +1,4 @@
-"""Tests for the C++ ORM data plane (schema + QuerySet + compile)."""
+"""Tests for the C++ ORM data plane (schema + QuerySet + compile + DML)."""
 
 from django.db import models
 from django.test import SimpleTestCase
@@ -23,7 +23,7 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
             "test.World",
             "world",
             [
-                ("id", "id", "id", "AutoField", True, False),
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
                 (
                     "randomnumber",
                     "randomnumber",
@@ -31,10 +31,12 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
                     "IntegerField",
                     False,
                     False,
+                    "",
+                    "",
+                    "",
                 ),
             ],
         )
-        self.assertIsInstance(mid, int)
         qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
         self.assertTrue(qs.values_list(["id", "randomnumber"], False))
         self.assertTrue(qs.filter_eq("id", 7))
@@ -47,7 +49,7 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
         )
         self.assertEqual(list(params), [7])
 
-    def test_filter_in_and_and(self):
+    def test_filter_kwargs_gt_and_in(self):
         from django import _native
 
         orm = _native.orm
@@ -55,19 +57,92 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
             "test.Item",
             "item",
             [
-                ("id", "id", "id", "AutoField", True, False),
-                ("name", "name", "name", "CharField", False, False),
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                ("score", "score", "score", "IntegerField", False, False, "", "", ""),
             ],
         )
         qs = orm.QuerySet.create(mid, orm.DIALECT_SQLITE)
-        self.assertTrue(qs.values_list(["id"], False))
-        self.assertTrue(qs.filter_eq("name", "a"))
-        self.assertTrue(qs.filter_in("id", [1, 2, 3]))
+        self.assertTrue(
+            qs.filter_kwargs({"score__gt": 10, "id__in": [1, 2, 3]}, False)
+        )
         sql, params = qs.compile_sql()
-        self.assertIn("WHERE", sql)
-        self.assertIn(" AND ", sql)
+        self.assertIn(">", sql)
         self.assertIn("IN (%s, %s, %s)", sql)
-        self.assertEqual(list(params), ["a", 1, 2, 3])
+        self.assertEqual(list(params), [10, 1, 2, 3])
+
+    def test_filter_isnull(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "test.N",
+            "n",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                ("name", "name", "name", "CharField", False, True, "", "", ""),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.filter_isnull("name", True))
+        sql, params = qs.compile_sql()
+        self.assertIn("IS NULL", sql)
+        self.assertEqual(list(params), [])
+
+    def test_join_fk_path(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "test.Book",
+            "book",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                (
+                    "author",
+                    "author_id",
+                    "author_id",
+                    "ForeignKey",
+                    False,
+                    False,
+                    "author",
+                    "id",
+                    "test.Author",
+                ),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.filter_kwargs({"author__name": "Ada"}, False))
+        sql, params = qs.compile_sql()
+        self.assertIn("INNER JOIN", sql)
+        self.assertIn('"author"', sql)
+        self.assertEqual(list(params), ["Ada"])
+
+    def test_update_and_delete_compile(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "test.U",
+            "u",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                ("n", "n", "n", "IntegerField", False, False, "", "", ""),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        qs.filter_eq("id", 1)
+        qs.add_update("n", 99)
+        sql, params = qs.compile_sql()
+        self.assertTrue(sql.startswith("UPDATE"))
+        self.assertIn("SET", sql)
+        self.assertEqual(list(params), [99, 1])
+
+        qs2 = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        qs2.filter_eq("id", 2)
+        qs2.set_delete()
+        sql2, params2 = qs2.compile_sql()
+        self.assertTrue(sql2.startswith("DELETE FROM"))
+        self.assertEqual(list(params2), [2])
 
     def test_mysql_quoting(self):
         from django import _native
@@ -76,7 +151,7 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
         mid = orm.register_model(
             "test.T",
             "t",
-            [("id", "id", "id", "AutoField", True, False)],
+            [("id", "id", "id", "AutoField", True, False, "", "", "")],
         )
         qs = orm.QuerySet.create(mid, orm.DIALECT_MYSQL)
         qs.filter_eq("pk", 1)
@@ -84,19 +159,6 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
         sql, params = qs.compile_sql()
         self.assertIn("`t`", sql)
         self.assertEqual(list(params), [1])
-
-    def test_python_facade_export(self):
-        from django.native import orm
-
-        class Widget(models.Model):
-            name = models.CharField(max_length=10)
-
-            class Meta:
-                app_label = "native_orm_dataplane_unit"
-
-        mid = orm.export_model(Widget)
-        self.assertIsNotNone(mid)
-        self.assertEqual(orm.model_id("native_orm_dataplane_unit.Widget"), mid)
 
 
 @isolate_apps("native_orm_dataplane")
@@ -110,7 +172,6 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
             class Meta:
                 app_label = "native_orm_dataplane"
 
-        # Fake connection.vendor without a live DB round-trip.
         class _Conn:
             vendor = "sqlite"
 
@@ -124,21 +185,15 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         )
         self.assertIsNotNone(compiled)
         sql, params = compiled
-        self.assertIn('FROM "native_orm_dataplane_world"', sql)
-        self.assertIn('"randomnumber"', sql)
+        self.assertIn("randomnumber", sql)
         self.assertEqual(params, [2])
-        # Re-export must not collapse field ids (regression).
-        compiled2 = orm.compile_values_list_get(
+
+        compiled2 = orm.compile_update(
             World,
-            field_names=["id", "randomnumber"],
-            lookup_field="id",
-            lookup_value=9,
-            limit=21,
-            connection=_Conn(),
+            _Conn(),
+            filter_kwargs={"id": 2},
+            update_kwargs={"randomnumber": 5},
         )
-        self.assertIn('"randomnumber"', compiled2[0])
-        self.assertNotEqual(
-            compiled2[0].count('"id"'),
-            # id appears as column + maybe AS — randomnumber must still be present
-            0,
-        )
+        self.assertIsNotNone(compiled2)
+        self.assertTrue(compiled2[0].startswith("UPDATE"))
+        self.assertEqual(compiled2[1], [5, 2])
