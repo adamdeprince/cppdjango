@@ -77,6 +77,7 @@ class BaseHandler:
             self._middleware_hooks_empty = True
             # Still build exact routes for lean C++ get_response when applicable.
             self._exact_routes = self._build_exact_route_table()
+            self._pin_lean_urlconf()
             return
 
         for middleware_path in reversed(settings.MIDDLEWARE):
@@ -157,6 +158,18 @@ class BaseHandler:
         # Exact static routes for lean C++ resolve (TE floor / empty middleware).
         if self._middleware_hooks_empty and not is_async:
             self._exact_routes = self._build_exact_route_table()
+            self._pin_lean_urlconf()
+
+    def _pin_lean_urlconf(self):
+        """
+        Pin ROOT_URLCONF once at load so lean C++ get_response can skip
+        per-request _ensure_root_urlconf (sync gunicorn workers are 1 thread).
+        """
+        try:
+            set_urlconf(settings.ROOT_URLCONF)
+            self._lean_urlconf_pinned = True
+        except Exception:
+            self._lean_urlconf_pinned = False
 
     def _build_exact_route_table(self):
         """

@@ -91,8 +91,21 @@ Exceptions → `response_for_exception` (same as `convert_exception_to_response`
 - Full C++ `WSGIRequest` for POST/multipart
 - Middleware stack in this loop (hybrid stacks use Python walk)
 
+## Floor hot-path optimizations
+
+1. **Process-lifetime `LeanCache`**: interned attr names, held callables
+   (`set_script_prefix`, `BytesIO`, …), empty tuple/dict — avoid re-import and
+   re-intern per request.
+2. **Exact-route hit skips `ResolverMatch`**: leave `request.resolver_match`
+   as `None` (floor views do not use it).
+3. **`request_started`**: read `Signal.receivers` length; skip `send` when 0.
+4. **Urlconf pin at load**: `_lean_urlconf_pinned` so lean get_response skips
+   `_ensure_root_urlconf` per request.
+5. **CallOneArg-style view call** for empty args/kwargs; hardcoded `"200 OK"`;
+   skip cookie/header work when empty; skip `check_response` when response is
+   non-None.
+
 ## Future
 
 - Exact routes for one level of static `include()` prefixes
-- Fewer crossings on header pack / status line
 - North-star: ORM/templates/forms/auth data planes in C++
