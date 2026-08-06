@@ -854,9 +854,46 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
   }
   nb::object request = nb::steal<nb::object>(request_o);
 
+  // lean_view_only (empty MIDDLEWARE): C++ exact-route + view.
+  // Otherwise (pure stock chain or hybrid): Python get_response so the
+  // middleware onion / native_stock_chain_call still runs.
   nb::object response;
+  bool lean_view = false;
+  {
+    PyObject* flag =
+        PyObject_GetAttrString(handler.ptr(), "_lean_view_only");
+    if (flag) {
+      lean_view = truthy(flag);
+      Py_DECREF(flag);
+    } else {
+      PyErr_Clear();
+      // Back-compat: empty hooks + no stock chain flag
+      PyObject* empty =
+          PyObject_GetAttr(handler.ptr(), g_lean.name__middleware_hooks_empty);
+      if (empty) {
+        lean_view = truthy(empty);
+        Py_DECREF(empty);
+      } else {
+        PyErr_Clear();
+      }
+    }
+  }
   try {
-    response = wsgi_lean_get_response(handler, request);
+    if (lean_view) {
+      response = wsgi_lean_get_response(handler, request);
+    } else {
+      PyObject* gr =
+          PyObject_GetAttrString(handler.ptr(), "get_response");
+      if (!gr) {
+        throw nb::python_error();
+      }
+      PyObject* resp = call_one(gr, request.ptr());
+      Py_DECREF(gr);
+      if (!resp) {
+        throw nb::python_error();
+      }
+      response = nb::steal<nb::object>(resp);
+    }
   } catch (nb::python_error& e) {
     try {
       response = response_for_python_error(request, e);

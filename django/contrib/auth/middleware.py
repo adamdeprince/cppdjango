@@ -59,6 +59,12 @@ class LoginRequiredMiddleware(MiddlewareMixin):
     redirect_field_name = REDIRECT_FIELD_NAME
     native_capable = True
 
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        from django import native as _native
+
+        self._use_native = _native.AVAILABLE
+
     def process_view(self, request, view_func, view_args, view_kwargs):
         from django import native as _native
 
@@ -67,7 +73,7 @@ class LoginRequiredMiddleware(MiddlewareMixin):
         # / user DB load (see test_public_view_logged_in_performance).
         if not login_required:
             return None
-        if _native.AVAILABLE:
+        if getattr(self, "_use_native", _native.AVAILABLE):
             gate = _native.auth_login_required_gate(
                 True,
                 bool(request.user.is_authenticated),

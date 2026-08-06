@@ -29,9 +29,11 @@ class SecurityMiddleware(MiddlewareMixin):
         self._redirect_exempt_patterns = list(settings.SECURE_REDIRECT_EXEMPT)
         self.referrer_policy = settings.SECURE_REFERRER_POLICY
         self.cross_origin_opener_policy = settings.SECURE_CROSS_ORIGIN_OPENER_POLICY
+        # Freeze dual-path choice at load (not per request).
+        self._use_native = _native.AVAILABLE
 
     def process_request(self, request):
-        if _native.AVAILABLE:
+        if self._use_native:
             url = _native.security_process_request(
                 self.redirect,
                 request.is_secure(),
@@ -56,7 +58,7 @@ class SecurityMiddleware(MiddlewareMixin):
             return HttpResponsePermanentRedirect(url)
 
     def process_response(self, request, response):
-        if _native.AVAILABLE:
+        if self._use_native:
             actions = _native.security_process_response(
                 request.is_secure(),
                 "Strict-Transport-Security" in response,

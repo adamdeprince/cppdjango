@@ -22,10 +22,11 @@ class SessionMiddleware(MiddlewareMixin):
         super().__init__(get_response)
         engine = import_module(settings.SESSION_ENGINE)
         self.SessionStore = engine.SessionStore
+        self._use_native = _native.AVAILABLE
 
     def process_request(self, request):
         session_key = request.COOKIES.get(settings.SESSION_COOKIE_NAME)
-        if _native.AVAILABLE and session_key is not None:
+        if self._use_native and session_key is not None:
             session_key = _native.session_load_key(session_key)
         request.session = self.SessionStore(session_key)
 
@@ -43,7 +44,7 @@ class SessionMiddleware(MiddlewareMixin):
             return response
 
         cookie_name = settings.SESSION_COOKIE_NAME
-        if _native.AVAILABLE:
+        if self._use_native:
             # Avoid get_expiry_* until we know we may save — those touch the
             # session dict and would load from the DB on every response.
             may_save = (modified or settings.SESSION_SAVE_EVERY_REQUEST) and not empty

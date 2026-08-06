@@ -20,6 +20,10 @@ class XFrameOptionsMiddleware(MiddlewareMixin):
 
     native_capable = True
 
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        self._use_native = _native.AVAILABLE
+
     def process_response(self, request, response):
         # Don't set it if it's already in the response
         if response.get("X-Frame-Options") is not None:
@@ -44,6 +48,6 @@ class XFrameOptionsMiddleware(MiddlewareMixin):
         the request or response.
         """
         raw = getattr(settings, "X_FRAME_OPTIONS", "DENY")
-        if _native.AVAILABLE:
+        if getattr(self, "_use_native", _native.AVAILABLE):
             return _native.xframe_options_value(raw or "")
         return (raw or "DENY").upper()

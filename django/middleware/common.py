@@ -35,6 +35,10 @@ class CommonMiddleware(MiddlewareMixin):
     native_capable = True
     response_redirect_class = HttpResponsePermanentRedirect
 
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        self._use_native = _native.AVAILABLE
+
     def process_request(self, request):
         """
         Check for denied User-Agents and rewrite the URL based on
@@ -59,7 +63,7 @@ class CommonMiddleware(MiddlewareMixin):
                 path = self.get_full_path_with_slash(request)
             else:
                 path = request.get_full_path()
-            if _native.AVAILABLE:
+            if self._use_native:
                 url = _native.common_www_redirect_url(
                     True, host, request.scheme, path
                 )
@@ -77,7 +81,7 @@ class CommonMiddleware(MiddlewareMixin):
         """
         ends_slash = (
             _native.path_ends_with_slash(request.path_info)
-            if _native.AVAILABLE
+            if getattr(self, "_use_native", _native.AVAILABLE)
             else request.path_info.endswith("/")
         )
         if settings.APPEND_SLASH and not ends_slash:
@@ -127,7 +131,7 @@ class CommonMiddleware(MiddlewareMixin):
 
         # Add the Content-Length header to non-streaming responses if not
         # already set (body decision in C++ when native is available).
-        if _native.AVAILABLE:
+        if getattr(self, "_use_native", _native.AVAILABLE):
             cl = _native.common_content_length_header(
                 response.streaming,
                 response.has_header("Content-Length"),

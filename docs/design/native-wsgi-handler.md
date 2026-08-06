@@ -28,8 +28,16 @@ gunicorn / uWSGI
 | Condition | Path |
 |-----------|------|
 | `DJANGO_NATIVE=0` or extension missing | Pure Python `_python_call` |
-| Middleware hooks non-empty or `ATOMIC_REQUESTS` | Pure Python `_python_call` |
-| Empty middleware, no atomic, native available | `django.native.wsgi_handler_call` (C++) |
+| Custom (non-stock) middleware present | Pure Python `_python_call` |
+| Empty `MIDDLEWARE`, no atomic | C++ outer + **lean_view_only** get_response |
+| Pure stock chain (Security/XFrame/Common) | C++ outer + Python `get_response` → `native_stock_chain_call` |
+| All-native **hybrid** (Session/CSRF/Auth/…) | C++ outer + Python middleware onion (`get_response`) |
+
+Flags set at `load_middleware` (not per request):
+
+- `_use_native_wsgi_outer` — enter C++ `wsgi_handler_call`
+- `_lean_view_only` — skip middleware chain inside C++ (empty stack only)
+- `_exact_routes` — static path_info → view (used by lean C++ and Python `resolve_request`)
 
 ## Load-time vs request-time
 

@@ -31,8 +31,13 @@ class BaseHandler:
     # Per-path native classification frozen at load_middleware (debug/metrics).
     _middleware_native_at_load = None
     # path_info → (callback, args, kwargs, url_name, route) for lean C++ resolve.
-    # Built once in load_middleware when middleware hooks are empty.
+    # Built once in load_middleware (empty / pure-stock / all-native hybrid).
     _exact_routes = None
+    # True only when MIDDLEWARE is empty: C++ may skip the middleware chain.
+    _lean_view_only = False
+    # C++ owns WSGI outer loop (script prefix, request, start_response pack).
+    # True for empty stack, pure stock chain, or all-native hybrid.
+    _use_native_wsgi_outer = False
 
     # Middleware paths whose full request/response bodies can run in the pure
     # C++ stock chain (no Python process_request side effects required).
@@ -60,6 +65,8 @@ class BaseHandler:
         self._native_stock_specs = None
         self._middleware_native_at_load = None
         self._exact_routes = None
+        self._lean_view_only = False
+        self._use_native_wsgi_outer = False
 
         get_response = self._get_response_async if is_async else self._get_response
         handler = convert_exception_to_response(get_response)
@@ -75,7 +82,10 @@ class BaseHandler:
         if stock_handler is not None:
             self._middleware_chain = stock_handler
             self._middleware_hooks_empty = True
-            # Still build exact routes for lean C++ get_response when applicable.
+            # Pure stock chain still needs get_response (not lean_view_only) so
+            # security/xframe process_* run via native_stock_chain_call.
+            self._lean_view_only = False
+            self._use_native_wsgi_outer = bool(_native.AVAILABLE) and not is_async
             self._exact_routes = self._build_exact_route_table()
             self._pin_lean_urlconf()
             return
@@ -155,8 +165,29 @@ class BaseHandler:
             or self._template_response_middleware
             or self._exception_middleware
         )
-        # Exact static routes for lean C++ resolve (TE floor / empty middleware).
-        if self._middleware_hooks_empty and not is_async:
+
+        paths = list(settings.MIDDLEWARE or ())
+        truly_empty = not paths
+        # All entries dual-path native (from classification built during install
+        # attempt, or re-classify here for hybrid).
+        if self._middleware_native_at_load is None:
+            self._middleware_native_at_load = self._classify_middleware_at_load(
+                paths, _native
+            )
+        all_native = bool(paths) and all(
+            c.get("native") for c in self._middleware_native_at_load
+        )
+
+        # Empty stack: C++ may run view-only lean get_response.
+        self._lean_view_only = truly_empty and not is_async
+        # C++ WSGI outer loop for empty, pure-stock (handled above), or hybrid
+        # where every middleware is stock dual-path native.
+        self._use_native_wsgi_outer = bool(_native.AVAILABLE) and not is_async and (
+            truly_empty or all_native or self._middleware_hooks_empty
+        )
+
+        # Exact routes + urlconf pin for empty, hooks-empty, and all-native hybrid.
+        if self._use_native_wsgi_outer:
             self._exact_routes = self._build_exact_route_table()
             self._pin_lean_urlconf()
 
@@ -418,7 +449,8 @@ class BaseHandler:
 
     def get_response(self, request):
         """Return an HttpResponse object for the given HttpRequest."""
-        self._ensure_root_urlconf()
+        if not getattr(self, "_lean_urlconf_pinned", False):
+            self._ensure_root_urlconf()
         response = self._middleware_chain(request)
         response._resource_closers.append(request.close)
         if response.status_code >= 400:
@@ -603,6 +635,21 @@ class BaseHandler:
         Retrieve/set the urlconf for the request. Return the view resolved,
         with its args and kwargs.
         """
+        # Load-time exact-route table (empty / hybrid all-native / pure stock).
+        # Skip full URLResolver for converter-free static paths.
+        table = getattr(self, "_exact_routes", None)
+        if table and not hasattr(request, "urlconf"):
+            entry = table.get(request.path_info)
+            if entry is not None:
+                from django.urls.resolvers import ResolverMatch
+
+                callback, args, kwargs, name, route = entry
+                resolver_match = ResolverMatch(
+                    callback, args, kwargs, name, route=route
+                )
+                request.resolver_match = resolver_match
+                return resolver_match
+
         # Work out the resolver.
         if hasattr(request, "urlconf"):
             urlconf = request.urlconf

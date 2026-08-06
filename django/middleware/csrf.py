@@ -195,6 +195,12 @@ class CsrfViewMiddleware(MiddlewareMixin):
 
     native_capable = True
 
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        from django import native as _n
+
+        self._use_native = _n.AVAILABLE
+
     @cached_property
     def csrf_trusted_origins_hosts(self):
         return [
@@ -307,7 +313,7 @@ class CsrfViewMiddleware(MiddlewareMixin):
                 good_host,
             )
 
-        if _native.AVAILABLE:
+        if getattr(self, "_use_native", _native.AVAILABLE):
             subdomains = []
             for scheme, hosts in self.allowed_origin_subdomains.items():
                 for host in hosts:
@@ -341,7 +347,7 @@ class CsrfViewMiddleware(MiddlewareMixin):
         if referer is None:
             raise RejectRequest(REASON_NO_REFERER)
 
-        if _native.AVAILABLE:
+        if getattr(self, "_use_native", _native.AVAILABLE):
             good_referer = (
                 settings.SESSION_COOKIE_DOMAIN
                 if settings.CSRF_USE_SESSIONS
@@ -470,7 +476,7 @@ class CsrfViewMiddleware(MiddlewareMixin):
 
         from django import native as _native
 
-        if _native.AVAILABLE:
+        if getattr(self, "_use_native", _native.AVAILABLE):
             match = _native.csrf_secrets_match(
                 str(request_csrf_token),
                 str(csrf_secret),
@@ -500,7 +506,7 @@ class CsrfViewMiddleware(MiddlewareMixin):
         from django import native as _native
 
         # Fat native gate: done / exempt / accept (safe methods) / check.
-        if _native.AVAILABLE:
+        if getattr(self, "_use_native", _native.AVAILABLE):
             gate = _native.csrf_process_view_gate(
                 bool(getattr(request, "csrf_processing_done", False)),
                 bool(getattr(callback, "csrf_exempt", False)),
