@@ -1,5 +1,6 @@
 #include "middleware.hpp"
 
+#include "cookie.hpp"
 #include "orm.hpp"  // hsts, csrf_unmask, session helpers, etc.
 #include "request_utils.hpp"  // is_same_domain
 
@@ -754,6 +755,124 @@ nb::object hybrid_process_response(nb::dict cfg, nb::handle request,
 bool session_response_needs_work(bool accessed, bool modified,
                                  bool save_every_request) noexcept {
   return accessed || modified || save_every_request;
+}
+
+nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
+                             nb::handle get_response) {
+  // --- Security / Common process_request ---------------------------------
+  {
+    nb::object early = hybrid_process_request(cfg, request);
+    if (!early.is_none()) {
+      return early;
+    }
+  }
+
+  nb::object meta = request.attr("META");
+  std::string http_cookie;
+  try {
+    if (nb::hasattr(meta, "get")) {
+      nb::object raw = meta.attr("get")("HTTP_COOKIE", "");
+      if (!raw.is_none()) {
+        http_cookie = nb::cast<std::string>(nb::str(raw));
+      }
+    }
+  } catch (...) {
+    http_cookie.clear();
+  }
+
+  // --- Session attach (no COOKIES parse when header empty) -----------------
+  if (!bits["session_store"].is_none()) {
+    nb::object store_cls = bits["session_store"];
+    std::string sess_name =
+        nb::cast<std::string>(nb::str(bits["session_cookie_name"]));
+    nb::object session_key = nb::none();
+    if (!http_cookie.empty()) {
+      auto key = cookie_header_get(http_cookie, sess_name);
+      if (key) {
+        auto valid = session_load_key(*key, 8);
+        if (valid) {
+          session_key = nb::str(valid->c_str(), valid->size());
+        }
+      }
+    }
+    request.attr("session") = store_cls(session_key);
+  }
+
+  // --- CSRF process_request (cookie header only; no full COOKIES) ----------
+  bool has_csrf = nb::cast<bool>(bits["has_csrf"]);
+  if (has_csrf) {
+    std::string csrf_name =
+        nb::cast<std::string>(nb::str(bits["csrf_cookie_name"]));
+    if (!http_cookie.empty()) {
+      auto secret = cookie_header_get(http_cookie, csrf_name);
+      if (secret && !secret->empty()) {
+        // length_ok returns 0 if valid length, non-zero if bad.
+        const int secret_len = 32;
+        const int token_len = 64;
+        const int n = static_cast<int>(secret->size());
+        const bool len_ok = csrf_token_length_ok(n, secret_len, token_len) == 0;
+        if (len_ok && csrf_token_chars_valid(*secret)) {
+          std::string unmasked = *secret;
+          if (n == token_len) {
+            unmasked = csrf_unmask_token(*secret, secret_len);
+          }
+          if (!unmasked.empty()) {
+            meta.attr("__setitem__")(
+                "CSRF_COOKIE", nb::str(unmasked.c_str(), unmasked.size()));
+          }
+        } else if (bits.contains("csrf_invalid_cookie") &&
+                   !bits["csrf_invalid_cookie"].is_none()) {
+          bits["csrf_invalid_cookie"](request);
+        }
+      }
+    }
+  }
+
+  // --- Auth attach (SimpleLazyObject via partial) --------------------------
+  if (nb::cast<bool>(bits["has_auth"])) {
+    nb::object SLO =
+        nb::module_::import_("django.utils.functional").attr("SimpleLazyObject");
+    nb::object partial = nb::module_::import_("functools").attr("partial");
+    nb::object get_user = bits["get_user"];
+    nb::object auser = bits["auser"];
+    request.attr("user") = SLO(partial(get_user, request));
+    request.attr("auser") = partial(auser, request);
+  }
+
+  // --- Safe-method CSRF accept: skip view middleware -----------------------
+  std::string method = nb::cast<std::string>(nb::str(request.attr("method")));
+  bool dont_enforce = false;
+  if (nb::hasattr(request, "_dont_enforce_csrf_checks")) {
+    dont_enforce = nb::cast<bool>(request.attr("_dont_enforce_csrf_checks"));
+  }
+  if (has_csrf &&
+      (csrf_is_safe_method(method) || dont_enforce)) {
+    request.attr("csrf_processing_done") = true;
+    request.attr("_skip_view_middleware") = true;
+  }
+
+  // --- View layer ----------------------------------------------------------
+  nb::object response = get_response(request);
+
+  // --- CSRF process_response only when cookie must be written --------------
+  if (has_csrf && bits.contains("csrf_process_response") &&
+      !bits["csrf_process_response"].is_none()) {
+    nb::dict m = nb::cast<nb::dict>(request.attr("META"));
+    if (m.contains("CSRF_COOKIE_NEEDS_UPDATE") &&
+        nb::cast<bool>(m["CSRF_COOKIE_NEEDS_UPDATE"])) {
+      response = bits["csrf_process_response"](request, response);
+    }
+  }
+
+  // --- Session process_response (Python method with no-op fast path) -------
+  if (!bits["session_store"].is_none() &&
+      bits.contains("session_process_response") &&
+      !bits["session_process_response"].is_none()) {
+    response = bits["session_process_response"](request, response);
+  }
+
+  // --- Header middleware batch ---------------------------------------------
+  return hybrid_process_response(cfg, request, response);
 }
 
 }  // namespace django::native

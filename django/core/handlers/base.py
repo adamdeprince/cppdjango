@@ -546,31 +546,45 @@ class BaseHandler:
         if self._HYBRID_XFRAME not in path_set:
             del cfg["xframe"]
 
+        from django.contrib.auth.middleware import auser, get_user
+        from django.middleware.csrf import _add_new_csrf_cookie
+
+        bits = {
+            "session_store": (
+                session_mw.SessionStore if session_mw is not None else None
+            ),
+            "session_cookie_name": settings.SESSION_COOKIE_NAME,
+            "csrf_cookie_name": settings.CSRF_COOKIE_NAME,
+            "has_csrf": csrf_mw is not None,
+            "has_auth": auth_mw is not None,
+            "get_user": get_user,
+            "auser": auser,
+            "csrf_process_response": (
+                csrf_mw.process_response if csrf_mw is not None else None
+            ),
+            "session_process_response": (
+                session_mw.process_response if session_mw is not None else None
+            ),
+            "csrf_invalid_cookie": (
+                (lambda req: _add_new_csrf_cookie(req))
+                if csrf_mw is not None
+                else None
+            ),
+            "save_every_request": bool(settings.SESSION_SAVE_EVERY_REQUEST),
+        }
+
         def hybrid_chain(
             request,
             *,
             _cfg=cfg,
-            _session=session_mw,
-            _csrf=csrf_mw,
-            _auth=auth_mw,
+            _bits=bits,
             _get_response=get_response,
             _n=_native,
         ):
-            early = _n.hybrid_process_request(_cfg, request)
-            if early is not None:
-                return early
-            if _session is not None:
-                _session.process_request(request)
-            if _csrf is not None:
-                _csrf.process_request(request)
-            if _auth is not None:
-                _auth.process_request(request)
-            response = _get_response(request)
-            if _csrf is not None:
-                response = _csrf.process_response(request, response)
-            if _session is not None:
-                response = _session.process_response(request, response)
-            return _n.hybrid_process_response(_cfg, request, response)
+            # One C++ crossing: security/common, session/csrf/auth attach,
+            # safe-method CSRF accept + skip view mw, view, csrf/session
+            # response, header batch.
+            return _n.hybrid_chain_call(_cfg, _bits, request, _get_response)
 
         self._hybrid_flattened = True
         return convert_exception_to_response(hybrid_chain)
@@ -672,8 +686,13 @@ class BaseHandler:
         template_response middleware. This method is everything that happens
         inside the request/response middleware.
         """
-        # Fast path: empty middleware hooks (TE-style MIDDLEWARE=()).
-        if self._middleware_hooks_empty and not self._any_atomic_requests():
+        # Fast path: empty hooks, or hybrid safe-method skip of view middleware
+        # (CSRF already accepted in hybrid_chain_call).
+        skip_view_mw = getattr(request, "_skip_view_middleware", False)
+        if (
+            (self._middleware_hooks_empty or skip_view_mw)
+            and not self._any_atomic_requests()
+        ):
             callback, callback_args, callback_kwargs = self.resolve_request(request)
             if iscoroutinefunction(callback):
                 callback = async_to_sync(callback)
@@ -690,12 +709,13 @@ class BaseHandler:
         callback, callback_args, callback_kwargs = self.resolve_request(request)
 
         # Apply view middleware
-        for middleware_method in self._view_middleware:
-            response = middleware_method(
-                request, callback, callback_args, callback_kwargs
-            )
-            if response:
-                break
+        if not skip_view_mw:
+            for middleware_method in self._view_middleware:
+                response = middleware_method(
+                    request, callback, callback_args, callback_kwargs
+                )
+                if response:
+                    break
 
         if response is None:
             if self._any_atomic_requests():

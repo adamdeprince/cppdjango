@@ -88,4 +88,19 @@ std::vector<std::pair<std::string, std::string>> parse_cookie(std::string_view c
   return items;
 }
 
+std::optional<std::string> cookie_header_get(std::string_view cookie_header,
+                                             std::string_view name) {
+  if (cookie_header.empty() || name.empty()) {
+    return std::nullopt;
+  }
+  std::optional<std::string> found;
+  // Last-wins: scan all pairs.
+  for (const auto& [k, v] : parse_cookie(cookie_header)) {
+    if (k == name) {
+      found = v;
+    }
+  }
+  return found;
+}
+
 }  // namespace django::native

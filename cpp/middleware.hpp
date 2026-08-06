@@ -171,4 +171,24 @@ namespace django::native {
 [[nodiscard]] bool session_response_needs_work(bool accessed, bool modified,
                                                bool save_every_request) noexcept;
 
+// Full hybrid request orchestration (one crossing from Python).
+//
+// cfg: same as hybrid_process_request/response (+ cookie names).
+// bits: Python helpers {
+//   session_store: SessionStore class or None,
+//   session_cookie_name: str,
+//   csrf_cookie_name: str,
+//   has_csrf: bool,
+//   has_auth: bool,
+//   get_user: callable,
+//   auser: callable,
+//   csrf_process_response: callable(request, response)->response or None,
+//   session_process_response: callable(request, response)->response or None,
+//   save_every_request: bool,
+// }
+// get_response: view layer (may honor request._skip_view_middleware).
+[[nodiscard]] nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits,
+                                           nb::handle request,
+                                           nb::handle get_response);
+
 }  // namespace django::native

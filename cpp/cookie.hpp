@@ -1,6 +1,7 @@
 // Cookie header parsing (django.http.cookie.parse_cookie).
 #pragma once
 
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
@@ -15,5 +16,10 @@ namespace django::native {
 
 // http.cookies._unquote
 [[nodiscard]] std::string cookie_unquote(std::string_view value);
+
+// Last-wins lookup of a single cookie name from a Cookie header (no dict).
+// Returns nullopt if missing.
+[[nodiscard]] std::optional<std::string> cookie_header_get(
+    std::string_view cookie_header, std::string_view name);
 
 }  // namespace django::native

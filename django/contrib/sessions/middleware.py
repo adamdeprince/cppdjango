@@ -25,9 +25,12 @@ class SessionMiddleware(MiddlewareMixin):
         self._use_native = _native.AVAILABLE
 
     def process_request(self, request):
+        # Avoid full COOKIES parse when the header is absent (hybrid TE path).
+        if not request.META.get("HTTP_COOKIE"):
+            request.session = self.SessionStore(None)
+            return
         session_key = request.COOKIES.get(settings.SESSION_COOKIE_NAME)
         if session_key is None:
-            # No cookie: empty SessionStore (no key validation hop).
             request.session = self.SessionStore(None)
             return
         if self._use_native:

@@ -85,16 +85,24 @@ includes Session, CSRF, or Auth (cannot be pure C++ stock chain),
 `MiddlewareMixin` onion:
 
 ```text
-hybrid_process_request(cfg)     # C++: Security SSL + Common PREPEND_WWW
-→ Session / CSRF / Auth process_request   # Python (session has no-op fast path)
-→ get_response                  # view middleware (CSRF process_view) + view
-→ CSRF / Session process_response         # Python (session skips if untouched)
-→ hybrid_process_response(cfg)  # C++: XFrame + Content-Length + Security headers
+hybrid_chain_call (one C++ crossing)
+  hybrid_process_request          # Security SSL + Common PREPEND_WWW
+  session attach                  # Cookie header scan only (no COOKIES parse)
+  CSRF cookie → META              # Cookie header scan; invalid → Python new cookie
+  Auth SimpleLazyObject(user)     # still Python objects; constructed from C++
+  safe method → csrf_processing_done + _skip_view_middleware
+  get_response                    # resolve + view (skips process_view list)
+  CSRF process_response           # only if CSRF_COOKIE_NEEDS_UPDATE
+  Session process_response        # no-op if never accessed
+  hybrid_process_response         # XFrame + Content-Length + Security headers
 ```
 
 Session fast no-op: if `not accessed and not modified and not
 SESSION_SAVE_EVERY_REQUEST`, `process_response` returns immediately
 (`session_response_needs_work`).
+
+Unsafe methods (POST/…) still run full CSRF `process_view` via the view
+middleware list (origin/referer/token).
 
 GZip / ConditionalGet / custom middleware still use the Python onion.
 

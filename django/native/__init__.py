@@ -2916,6 +2916,21 @@ def session_response_needs_work(accessed, modified, save_every_request) -> bool:
         )
     return bool(accessed or modified or save_every_request)
 
+
+def hybrid_chain_call(cfg, bits, request, get_response):
+    """C++-orchestrated hybrid middleware chain (one crossing)."""
+    impl = _impl()
+    if impl is not None:
+        return impl.hybrid_chain_call(cfg, bits, request, get_response)
+    raise RuntimeError("native hybrid_chain_call unavailable")
+
+
+def cookie_header_get(cookie_header, name):
+    """Extract one cookie value from a Cookie header (last-wins)."""
+    impl = _impl()
+    if impl is not None:
+        return impl.cookie_header_get(str(cookie_header or ""), str(name or ""))
+    return None
 def message_tags_join(extra_tags: str, level_tag: str) -> str:
     impl = _impl()
     if impl is not None:

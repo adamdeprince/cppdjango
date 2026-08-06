@@ -3603,7 +3603,26 @@ NB_MODULE(_native, m) {
       },
       nb::arg("accessed"), nb::arg("modified"),
       nb::arg("save_every_request"));
-  m.def("message_tags_join",
+  m.def(
+      "hybrid_chain_call",
+      [](nb::dict cfg, nb::dict bits, nb::handle request,
+         nb::handle get_response) {
+        return django::native::hybrid_chain_call(cfg, bits, request,
+                                                 get_response);
+      },
+      nb::arg("cfg"), nb::arg("bits"), nb::arg("request"),
+      nb::arg("get_response"));
+  m.def(
+      "cookie_header_get",
+      [](const std::string& header, const std::string& name)
+          -> nb::object {
+        auto v = django::native::cookie_header_get(header, name);
+        if (!v) {
+          return nb::none();
+        }
+        return nb::str(v->c_str(), v->size());
+      },
+      nb::arg("cookie_header"), nb::arg("name"));  m.def("message_tags_join",
         [](const std::string& extra_tags, const std::string& level_tag) {
           return django::native::message_tags_join(extra_tags, level_tag);
         },
