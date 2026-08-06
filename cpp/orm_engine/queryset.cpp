@@ -689,10 +689,379 @@ bool QuerySet::add_select_related(std::string_view path) {
   return true;
 }
 
-void QuerySet::add_prefetch(std::string_view lookup) {
+bool QuerySet::add_select_related_all(int max_depth) {
+  if (max_depth < 1) {
+    return false;
+  }
+  if (query_.select.empty()) {
+    if (!select_model_columns()) {
+      return false;
+    }
+  }
+  const SchemaRegistry& reg = SchemaRegistry::instance();
+  const ModelSchema* base = reg.get(query_.model);
+  if (!base) {
+    return false;
+  }
+  // BFS: (path, model, depth)
+  struct Node {
+    std::string path;
+    ModelId model;
+    int depth;
+  };
+  std::vector<Node> queue;
+  queue.push_back({"", query_.model, 0});
+  std::vector<std::string> paths;
+  std::size_t qi = 0;
+  while (qi < queue.size()) {
+    Node cur = queue[qi++];
+    if (cur.depth >= max_depth) {
+      continue;
+    }
+    const ModelSchema* m = reg.get(cur.model);
+    if (!m) {
+      continue;
+    }
+    for (const auto& f : m->fields) {
+      if (f.rel != RelKind::ForwardFK) {
+        continue;  // O2O stored as FK; skip reverse/m2m for select_related
+      }
+      if (f.remote_model_label.empty()) {
+        continue;
+      }
+      auto rid = reg.find_id(f.remote_model_label);
+      if (!rid) {
+        continue;
+      }
+      std::string path =
+          cur.path.empty() ? f.name : (cur.path + "__" + f.name);
+      paths.push_back(path);
+      queue.push_back({path, *rid, cur.depth + 1});
+    }
+  }
+  for (const auto& p : paths) {
+    if (!add_select_related(p)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool QuerySet::add_prefetch(std::string_view lookup) {
+  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  if (!m) {
+    return false;
+  }
+  // Single-hop prefetch for now (lookup may be "books" or "tags").
+  auto parts = split_lookup_sep(lookup);
+  if (parts.empty()) {
+    return false;
+  }
+  // Use first hop field for relation metadata.
+  auto fit = m->field_by_name.find(parts[0]);
+  if (fit == m->field_by_name.end()) {
+    return false;
+  }
+  const FieldSchema& f = m->fields[fit->second];
+  if (!f.is_relation()) {
+    return false;
+  }
   PrefetchSpec p;
   p.lookup = std::string(lookup);
+  p.rel = f.rel;
+  p.remote_table = f.remote_table;
+  p.remote_model_label = f.remote_model_label;
+  p.remote_pk_column = f.remote_pk_column;
+  p.remote_fk_column = f.remote_fk_column;
+  p.m2m_table = f.m2m_table;
+  p.m2m_column = f.m2m_column;
+  p.m2m_reverse_column = f.m2m_reverse_column;
+  p.cache_name = parts[0];
+  if (m->pk_field < m->fields.size()) {
+    p.parent_pk_column = m->fields[m->pk_field].column;
+  }
+  if (p.parent_pk_column.empty()) {
+    p.parent_pk_column = "id";
+  }
   query_.prefetches.push_back(std::move(p));
+  return true;
+}
+
+bool QuerySet::filter_subquery_qs(std::string_view field_name, CmpOp op,
+                                  const QuerySet& sub) {
+  auto compiled = sub.compile();
+  if (compiled.sql.empty()) {
+    return false;
+  }
+  std::vector<ParamValue> flat;
+  const auto& sp = sub.query().params;
+  for (auto idx : compiled.param_order) {
+    if (idx >= sp.size()) {
+      return false;
+    }
+    flat.push_back(sp[idx]);
+  }
+  return filter_subquery(field_name, op, compiled.sql, std::move(flat));
+}
+
+bool QuerySet::annotate_subquery_qs(std::string alias, const QuerySet& sub) {
+  auto compiled = sub.compile();
+  if (compiled.sql.empty()) {
+    return false;
+  }
+  std::vector<ParamValue> flat;
+  const auto& sp = sub.query().params;
+  for (auto idx : compiled.param_order) {
+    if (idx >= sp.size()) {
+      return false;
+    }
+    flat.push_back(sp[idx]);
+  }
+  return annotate_sql(std::move(alias), compiled.sql, std::move(flat));
+}
+
+bool QuerySet::annotate_case(
+    std::string alias, const std::vector<std::pair<QNode, ParamValue>>& cases,
+    bool has_else, ParamValue else_value) {
+  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  if (!m || cases.empty()) {
+    return false;
+  }
+  std::string frag = "CASE";
+  std::vector<std::uint32_t> order;
+  for (const auto& [when_node, then_val] : cases) {
+    auto when_expr = lower_q_node(when_node);
+    if (!when_expr) {
+      return false;
+    }
+    frag += " WHEN ";
+    append_bool_sql(frag, order, query_, *m, *when_expr);
+    frag += " THEN %s";
+    order.push_back(query_.add_param(then_val));
+  }
+  if (has_else) {
+    frag += " ELSE %s";
+    order.push_back(query_.add_param(std::move(else_value)));
+  }
+  frag += " END";
+  // Convert order (param indices) into fragment_param_idxs — already absolute
+  // indices into query_.params.
+  SelectItem it;
+  it.kind = SelectKind::SqlFragment;
+  it.out_alias = std::move(alias);
+  it.sql_fragment = std::move(frag);
+  it.fragment_param_idxs = std::move(order);
+  query_.select.push_back(std::move(it));
+  return true;
+}
+
+bool QuerySet::annotate_binop(std::string alias, std::string lhs_field,
+                              std::string op, ParamValue rhs) {
+  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  if (!m) {
+    return false;
+  }
+  ColumnRef col;
+  CmpOp cop = CmpOp::Eq;
+  bool isnull = false;
+  if (!resolve_lookup_key(lhs_field, col, cop, isnull)) {
+    auto fid = resolve_field(lhs_field);
+    if (!fid) {
+      return false;
+    }
+    col.field = *fid;
+  }
+  std::string frag;
+  append_column_sql(frag, query_.dialect, query_, *m, col);
+  frag += ' ';
+  frag += op;
+  frag += " %s";
+  SelectItem it;
+  it.kind = SelectKind::SqlFragment;
+  it.out_alias = std::move(alias);
+  it.sql_fragment = std::move(frag);
+  it.fragment_param_idxs.push_back(query_.add_param(std::move(rhs)));
+  query_.select.push_back(std::move(it));
+  return true;
+}
+
+bool QuerySet::annotate_binop_fields(std::string alias, std::string lhs_field,
+                                     std::string op, std::string rhs_field) {
+  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  if (!m) {
+    return false;
+  }
+  ColumnRef lcol, rcol;
+  CmpOp cop = CmpOp::Eq;
+  bool isnull = false;
+  if (!resolve_lookup_key(lhs_field, lcol, cop, isnull)) {
+    auto fid = resolve_field(lhs_field);
+    if (!fid) {
+      return false;
+    }
+    lcol.field = *fid;
+  }
+  if (!resolve_lookup_key(rhs_field, rcol, cop, isnull)) {
+    auto fid = resolve_field(rhs_field);
+    if (!fid) {
+      return false;
+    }
+    rcol.field = *fid;
+  }
+  std::string frag;
+  append_column_sql(frag, query_.dialect, query_, *m, lcol);
+  frag += ' ';
+  frag += op;
+  frag += ' ';
+  append_column_sql(frag, query_.dialect, query_, *m, rcol);
+  SelectItem it;
+  it.kind = SelectKind::SqlFragment;
+  it.out_alias = std::move(alias);
+  it.sql_fragment = std::move(frag);
+  query_.select.push_back(std::move(it));
+  return true;
+}
+
+bool QuerySet::annotate_value(std::string alias, ParamValue value) {
+  SelectItem it;
+  it.kind = SelectKind::SqlFragment;
+  it.out_alias = std::move(alias);
+  it.sql_fragment = "%s";
+  it.fragment_param_idxs.push_back(query_.add_param(std::move(value)));
+  query_.select.push_back(std::move(it));
+  return true;
+}
+
+bool QuerySet::annotate_f(std::string alias, std::string field_name) {
+  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  if (!m) {
+    return false;
+  }
+  ColumnRef col;
+  CmpOp cop = CmpOp::Eq;
+  bool isnull = false;
+  if (!resolve_lookup_key(field_name, col, cop, isnull)) {
+    auto fid = resolve_field(field_name);
+    if (!fid) {
+      return false;
+    }
+    col.field = *fid;
+  }
+  std::string frag;
+  append_column_sql(frag, query_.dialect, query_, *m, col);
+  SelectItem it;
+  it.kind = SelectKind::SqlFragment;
+  it.out_alias = std::move(alias);
+  it.sql_fragment = std::move(frag);
+  query_.select.push_back(std::move(it));
+  return true;
+}
+
+QuerySet::PrefetchSql QuerySet::compile_prefetch_secondary(
+    const PrefetchSpec& spec,
+    const std::vector<ParamValue>& parent_pks) const {
+  PrefetchSql out;
+  if (parent_pks.empty() || spec.remote_model_label.empty()) {
+    return out;
+  }
+  const SchemaRegistry& reg = SchemaRegistry::instance();
+  auto rid = reg.find_id(spec.remote_model_label);
+  if (!rid) {
+    return out;
+  }
+  QuerySet sub(*rid, query_.dialect);
+  if (!sub.select_model_columns()) {
+    return out;
+  }
+  // Filter related rows by parent link.
+  if (spec.rel == RelKind::ReverseFK) {
+    // remote.fk IN parent_pks
+    const std::string& fkcol = spec.remote_fk_column.empty()
+                                   ? std::string("id")
+                                   : spec.remote_fk_column;
+    Pred p;
+    p.op = CmpOp::In;
+    p.lhs.field = 0;
+    p.lhs.table_alias = sub.query().base_alias;
+    p.lhs.column_override = fkcol;
+    for (const auto& v : parent_pks) {
+      p.param_idxs.push_back(sub.query_mut().add_param(v));
+    }
+    sub.query_mut().where = bool_atom(std::move(p));
+    sub.query_mut().has_where = true;
+  } else if (spec.rel == RelKind::ForwardM2M || spec.rel == RelKind::ReverseM2M) {
+    // JOIN through WHERE through.parent_col IN pks
+    if (spec.m2m_table.empty()) {
+      return out;
+    }
+    JoinEdge through;
+    through.type = JoinType::Inner;
+    through.alias = "PF";
+    through.table = spec.m2m_table;
+    through.local_alias = sub.query().base_alias;
+    // remote side of through links to remote pk
+    through.local_column =
+        reg.get(*rid) && reg.get(*rid)->pk_field < reg.get(*rid)->fields.size()
+            ? reg.get(*rid)->fields[reg.get(*rid)->pk_field].column
+            : "id";
+    through.remote_column = spec.m2m_reverse_column.empty()
+                                ? std::string("to_id")
+                                : spec.m2m_reverse_column;
+    // Actually ON remote.pk = through.m2m_reverse AND through.m2m_column IN (...)
+    // Rewrite: JOIN through ON through.m2m_reverse = remote.pk
+    through.local_column =
+        reg.get(*rid)->fields[reg.get(*rid)->pk_field].column.empty()
+            ? "id"
+            : reg.get(*rid)->fields[reg.get(*rid)->pk_field].column;
+    // emit: local_alias.local_column = alias.remote_column
+    // so remote.pk = through.m2m_reverse
+    // local_alias = remote table alias, local_column = pk
+    // alias = through, remote_column = m2m_reverse
+    JoinEdge j;
+    j.type = JoinType::Inner;
+    j.alias = "PF";
+    j.table = spec.m2m_table;
+    j.local_alias = sub.query().base_alias;
+    j.local_column = through.local_column;
+    j.remote_column = spec.m2m_reverse_column.empty() ? "to_id"
+                                                     : spec.m2m_reverse_column;
+    sub.query_mut().joins.push_back(j);
+    Pred p;
+    p.op = CmpOp::In;
+    p.lhs.field = 0;
+    p.lhs.table_alias = "PF";
+    p.lhs.column_override =
+        spec.m2m_column.empty() ? std::string("from_id") : spec.m2m_column;
+    for (const auto& v : parent_pks) {
+      p.param_idxs.push_back(sub.query_mut().add_param(v));
+    }
+    sub.query_mut().where = bool_atom(std::move(p));
+    sub.query_mut().has_where = true;
+  } else if (spec.rel == RelKind::ForwardFK) {
+    // parent_pks are FK values; match remote PK IN (...)
+    Pred p;
+    p.op = CmpOp::In;
+    p.lhs.field = 0;
+    p.lhs.table_alias = sub.query().base_alias;
+    p.lhs.column_override =
+        spec.remote_pk_column.empty() ? std::string("id") : spec.remote_pk_column;
+    for (const auto& v : parent_pks) {
+      p.param_idxs.push_back(sub.query_mut().add_param(v));
+    }
+    sub.query_mut().where = bool_atom(std::move(p));
+    sub.query_mut().has_where = true;
+  } else {
+    return out;
+  }
+  auto compiled = sub.compile();
+  out.sql = std::move(compiled.sql);
+  const auto& sp = sub.query().params;
+  for (auto idx : compiled.param_order) {
+    if (idx < sp.size()) {
+      out.params.push_back(sp[idx]);
+    }
+  }
+  return out;
 }
 
 bool QuerySet::add_update(std::string_view field_name, ParamValue value) {

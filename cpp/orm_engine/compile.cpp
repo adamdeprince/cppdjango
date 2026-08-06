@@ -42,6 +42,10 @@ void emit_column(std::string& out, DialectId d, const Query& q,
   append_quoted(out, d, f->column);
 }
 
+// Forward declare for mutual recursion with emit_bool used externally.
+void emit_bool(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
+               const Query& q, const ModelSchema& m, const BoolExpr& e);
+
 void emit_rhs_sql(std::string& out, std::vector<std::uint32_t>& order,
                   const Pred& p) {
   out += p.rhs_sql;
@@ -459,6 +463,16 @@ CompiledSql compile_query(const Query& q, const SchemaRegistry& reg) {
     return {};
   }
   return {};
+}
+
+void append_bool_sql(std::string& out, std::vector<std::uint32_t>& order,
+                     const Query& q, const ModelSchema& m, const BoolExpr& e) {
+  emit_bool(out, order, q.dialect, q, m, e);
+}
+
+void append_column_sql(std::string& out, DialectId d, const Query& q,
+                       const ModelSchema& m, const ColumnRef& c) {
+  emit_column(out, d, q, m, c);
 }
 
 }  // namespace django::orm

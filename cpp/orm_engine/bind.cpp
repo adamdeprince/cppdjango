@@ -352,11 +352,140 @@ void register_orm_engine(nb::module_& parent) {
           },
           nb::arg("path"))
       .def(
+          "add_select_related_all",
+          [](django::orm::QuerySet& self, int max_depth) {
+            return self.add_select_related_all(max_depth);
+          },
+          nb::arg("max_depth") = 5)
+      .def(
           "add_prefetch",
           [](django::orm::QuerySet& self, const std::string& lookup) {
-            self.add_prefetch(lookup);
+            return self.add_prefetch(lookup);
           },
           nb::arg("lookup"))
+      .def(
+          "filter_subquery_qs",
+          [](django::orm::QuerySet& self, const std::string& field, int op,
+             const django::orm::QuerySet& sub) {
+            return self.filter_subquery_qs(
+                field, static_cast<django::orm::CmpOp>(op), sub);
+          },
+          nb::arg("field"), nb::arg("op"), nb::arg("sub"))
+      .def(
+          "annotate_subquery_qs",
+          [](django::orm::QuerySet& self, const std::string& alias,
+             const django::orm::QuerySet& sub) {
+            return self.annotate_subquery_qs(alias, sub);
+          },
+          nb::arg("alias"), nb::arg("sub"))
+      .def(
+          "annotate_case",
+          [](django::orm::QuerySet& self, const std::string& alias,
+             nb::list cases, nb::object else_val) {
+            // cases: list of (when_dict, then_value)
+            std::vector<std::pair<django::orm::QNode, django::orm::ParamValue>>
+                parsed;
+            for (nb::handle item : cases) {
+              nb::tuple t = nb::cast<nb::tuple>(item);
+              django::orm::QNode when = q_node_from_python(t[0]);
+              parsed.emplace_back(std::move(when), param_from_python(t[1]));
+            }
+            bool has_else = !else_val.is_none();
+            django::orm::ParamValue ev =
+                has_else ? param_from_python(else_val)
+                         : django::orm::ParamValue::null();
+            return self.annotate_case(alias, parsed, has_else, std::move(ev));
+          },
+          nb::arg("alias"), nb::arg("cases"), nb::arg("else_val") = nb::none())
+      .def(
+          "annotate_binop",
+          [](django::orm::QuerySet& self, const std::string& alias,
+             const std::string& lhs, const std::string& op, nb::handle rhs) {
+            return self.annotate_binop(alias, lhs, op, param_from_python(rhs));
+          },
+          nb::arg("alias"), nb::arg("lhs"), nb::arg("op"), nb::arg("rhs"))
+      .def(
+          "annotate_binop_fields",
+          [](django::orm::QuerySet& self, const std::string& alias,
+             const std::string& lhs, const std::string& op,
+             const std::string& rhs) {
+            return self.annotate_binop_fields(alias, lhs, op, rhs);
+          },
+          nb::arg("alias"), nb::arg("lhs"), nb::arg("op"), nb::arg("rhs"))
+      .def(
+          "annotate_value",
+          [](django::orm::QuerySet& self, const std::string& alias,
+             nb::handle value) {
+            return self.annotate_value(alias, param_from_python(value));
+          },
+          nb::arg("alias"), nb::arg("value"))
+      .def(
+          "annotate_f",
+          [](django::orm::QuerySet& self, const std::string& alias,
+             const std::string& field) {
+            return self.annotate_f(alias, field);
+          },
+          nb::arg("alias"), nb::arg("field"))
+      .def(
+          "compile_prefetch_secondary",
+          [](const django::orm::QuerySet& self, nb::dict spec,
+             nb::sequence parent_pks) {
+            django::orm::PrefetchSpec p;
+            p.lookup = nb::cast<std::string>(spec["lookup"]);
+            p.rel = django::orm::rel_kind_from_string(
+                nb::cast<std::string>(spec["rel"]));
+            p.remote_table = nb::cast<std::string>(spec["remote_table"]);
+            p.remote_model_label =
+                nb::cast<std::string>(spec["remote_model_label"]);
+            p.remote_pk_column =
+                nb::cast<std::string>(spec["remote_pk_column"]);
+            p.remote_fk_column =
+                nb::cast<std::string>(spec["remote_fk_column"]);
+            p.m2m_table = nb::cast<std::string>(spec["m2m_table"]);
+            p.m2m_column = nb::cast<std::string>(spec["m2m_column"]);
+            p.m2m_reverse_column =
+                nb::cast<std::string>(spec["m2m_reverse_column"]);
+            p.parent_pk_column =
+                nb::cast<std::string>(spec["parent_pk_column"]);
+            p.cache_name = nb::cast<std::string>(spec["cache_name"]);
+            std::vector<django::orm::ParamValue> pks;
+            for (nb::handle v : parent_pks) {
+              pks.push_back(param_from_python(v));
+            }
+            auto compiled = self.compile_prefetch_secondary(p, pks);
+            nb::list params;
+            for (const auto& pv : compiled.params) {
+              params.append(param_to_python(pv));
+            }
+            return nb::make_tuple(
+                nb::str(compiled.sql.c_str(), compiled.sql.size()), params);
+          },
+          nb::arg("spec"), nb::arg("parent_pks"))
+      .def(
+          "prefetch_specs",
+          [](const django::orm::QuerySet& self) {
+            nb::list out;
+            for (const auto& p : self.prefetches()) {
+              nb::dict d;
+              d["lookup"] = p.lookup;
+              d["rel"] = std::to_string(static_cast<int>(p.rel));
+              // string form for rel_kind_from_string
+              const char* rels[] = {"", "fk", "rev_fk", "m2m", "rev_m2m"};
+              int ri = static_cast<int>(p.rel);
+              d["rel"] = (ri >= 0 && ri <= 4) ? rels[ri] : "";
+              d["remote_table"] = p.remote_table;
+              d["remote_model_label"] = p.remote_model_label;
+              d["remote_pk_column"] = p.remote_pk_column;
+              d["remote_fk_column"] = p.remote_fk_column;
+              d["m2m_table"] = p.m2m_table;
+              d["m2m_column"] = p.m2m_column;
+              d["m2m_reverse_column"] = p.m2m_reverse_column;
+              d["parent_pk_column"] = p.parent_pk_column;
+              d["cache_name"] = p.cache_name;
+              out.append(d);
+            }
+            return out;
+          })
       .def(
           "add_update",
           [](django::orm::QuerySet& self, const std::string& field,

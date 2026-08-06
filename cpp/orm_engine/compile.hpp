@@ -22,6 +22,15 @@ struct CompiledSql {
   return compile_query(q, reg);
 }
 
+// Emit a boolean expression SQL fragment (for CASE WHEN, etc.).
+// Appends placeholder order indices into `order` (indexes into q.params).
+void append_bool_sql(std::string& out, std::vector<std::uint32_t>& order,
+                     const Query& q, const ModelSchema& m, const BoolExpr& e);
+
+// Emit a column reference.
+void append_column_sql(std::string& out, DialectId d, const Query& q,
+                       const ModelSchema& m, const ColumnRef& c);
+
 [[nodiscard]] std::string quote_ident(DialectId d, std::string_view name);
 [[nodiscard]] DialectId dialect_from_vendor(std::string_view vendor);
 

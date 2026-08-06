@@ -146,9 +146,18 @@ enum class ResultMode : std::uint8_t {
 
 // Prefetch plan: executed after main query (ids known).
 struct PrefetchSpec {
-  std::string lookup;       // path e.g. "author" or "book_set"
-  std::string related_name; // optional
-  // Filter serialized as Q-tree JSON is applied in Python for flexibility.
+  std::string lookup;  // path e.g. "author" or "books" / "tags"
+  // Populated from schema at add_prefetch time for secondary query build.
+  RelKind rel = RelKind::None;
+  std::string remote_table;
+  std::string remote_model_label;
+  std::string remote_pk_column;
+  std::string remote_fk_column;   // reverse FK column on remote
+  std::string m2m_table;
+  std::string m2m_column;         // through → parent
+  std::string m2m_reverse_column; // through → remote
+  std::string parent_pk_column;
+  std::string cache_name;  // descriptor / related name for attach
 };
 
 // select_related column mapping for materialize

@@ -74,9 +74,45 @@ class QuerySet {
 
   // select_related: LEFT OUTER JOIN + append related concrete columns
   bool add_select_related(std::string_view path);
+  // All forward FK/O2O paths up to max_depth (unrestricted select_related()).
+  bool add_select_related_all(int max_depth = 5);
 
-  // prefetch_related: record lookup for post-fetch
-  void add_prefetch(std::string_view lookup);
+  // prefetch_related: record lookup (+ schema metadata) for secondary queries
+  bool add_prefetch(std::string_view lookup);
+
+  // Nested QuerySet as subquery (compiled entirely in C++).
+  bool filter_subquery_qs(std::string_view field_name, CmpOp op,
+                          const QuerySet& sub);
+  bool annotate_subquery_qs(std::string alias, const QuerySet& sub);
+
+  // CASE WHEN ... THEN ... ELSE ... END annotation (when = QNode trees).
+  // each case: (when_tree, then_value); else optional.
+  bool annotate_case(
+      std::string alias,
+      const std::vector<std::pair<QNode, ParamValue>>& cases,
+      bool has_else, ParamValue else_value);
+
+  // CombinedExpression-style: field op value  or field op field
+  bool annotate_binop(std::string alias, std::string lhs_field,
+                      std::string op, ParamValue rhs);
+  bool annotate_binop_fields(std::string alias, std::string lhs_field,
+                             std::string op, std::string rhs_field);
+
+  // Value() constant annotation
+  bool annotate_value(std::string alias, ParamValue value);
+
+  // F('field') annotation (column alias)
+  bool annotate_f(std::string alias, std::string field_name);
+
+  // Build secondary SELECT for prefetch given parent PK values.
+  // Returns empty sql on failure; params are fully flattened for execute.
+  struct PrefetchSql {
+    std::string sql;
+    std::vector<ParamValue> params;
+  };
+  [[nodiscard]] PrefetchSql compile_prefetch_secondary(
+      const PrefetchSpec& spec,
+      const std::vector<ParamValue>& parent_pks) const;
 
   bool add_update(std::string_view field_name, ParamValue value);
   bool add_update_null(std::string_view field_name);

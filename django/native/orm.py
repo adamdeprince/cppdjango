@@ -431,9 +431,8 @@ def materialize_models(model, connection, handle, *, limit=None):
     Compile+fetch model rows from a native handle.
     Returns (list[model], prefetch_lookups) or None on failure.
     Applies select_related caches when related_selects_info is present.
+    Runs native secondary queries for prefetch_specs when possible.
     """
-    from django.db import router
-
     try:
         qs = handle.clone()
         if not qs.base_attnames():
@@ -448,23 +447,23 @@ def materialize_models(model, connection, handle, *, limit=None):
         attnames = list(qs.base_attnames())
         related = list(qs.related_selects_info())
         prefetches = list(qs.prefetch_lookups())
+        try:
+            prefetch_specs = list(qs.prefetch_specs())
+        except Exception:
+            prefetch_specs = []
         db = connection.alias
-        # Map model_id → model class via registry labels is hard; use path resolve.
         objs = []
         for row in rows:
             base = row[: len(attnames)]
             obj = model.from_db(db, attnames, base)
-            # select_related: fill deferred related objects from trailing cols
             for rs in related:
                 off = int(rs["offset"])
                 cnt = int(rs["count"])
                 rel_atts = list(rs["attnames"])
                 rel_vals = row[off : off + cnt]
-                # Null PK → no related object
                 if not rel_vals or rel_vals[0] is None:
                     continue
                 path = rs["path"]
-                # Resolve related model from path on root model
                 rel_model = model
                 field = None
                 for part in path.split("__"):
@@ -477,9 +476,122 @@ def materialize_models(model, connection, handle, *, limit=None):
                     elif hasattr(field, "get_cache_name"):
                         setattr(obj, field.get_cache_name(), rel_obj)
             objs.append(obj)
+        # Native prefetch secondary queries
+        if objs and prefetch_specs:
+            _run_native_prefetch(model, objs, handle, prefetch_specs, connection)
+            # Mark lookups done so Django prefetch skips them
+            prefetches = []
         return objs, prefetches
     except Exception:
         return None
+
+
+def _run_native_prefetch(model, objs, handle, specs, connection):
+    """Execute secondary SELECTs for reverse FK / M2M and attach to parents."""
+    if not objs:
+        return
+    # Parent PKs
+    pk_att = model._meta.pk.attname
+    parent_pks = [getattr(o, pk_att) for o in objs]
+    pk_to_obj = {getattr(o, pk_att): o for o in objs}
+    db = connection.alias
+
+    for spec in specs:
+        try:
+            sql, params = handle.compile_prefetch_secondary(spec, parent_pks)
+            if not sql:
+                # Fall back to Django prefetch for this lookup
+                from django.db.models.query import prefetch_related_objects
+
+                prefetch_related_objects(objs, spec["lookup"])
+                continue
+            rows = execute_fetchall(connection, sql, params)
+            # Resolve remote model
+            rel_model = None
+            label = spec.get("remote_model_label") or ""
+            if label and "." in label:
+                app, name = label.split(".", 1)
+                from django.apps import apps
+
+                rel_model = apps.get_model(app, name)
+            if rel_model is None:
+                continue
+            # Concrete attnames order from secondary select_model_columns
+            remote_atts = [
+                f.attname
+                for f in rel_model._meta.concrete_fields
+                if f.column
+            ]
+            # Group related rows by parent link
+            rel = spec.get("rel") or ""
+            cache = spec.get("cache_name") or spec.get("lookup")
+            # For reverse FK, FK col is remote_fk_column on related row
+            # For M2M, need parent id from through — secondary SQL selects only
+            # remote columns; for M2M we must include through parent col.
+            # Current compile only selects remote model columns — for reverse FK
+            # the FK value is among remote_atts (author_id).
+            buckets = {pk: [] for pk in parent_pks}
+            for row in rows:
+                rel_obj = rel_model.from_db(db, remote_atts, row[: len(remote_atts)])
+                parent_id = None
+                if rel in ("rev_fk", "reverse_fk"):
+                    fk_col = spec.get("remote_fk_column") or ""
+                    # map column → attname
+                    for f in rel_model._meta.concrete_fields:
+                        if f.column == fk_col:
+                            parent_id = getattr(rel_obj, f.attname)
+                            break
+                elif rel in ("m2m", "rev_m2m", "forward_m2m", "reverse_m2m"):
+                    # Without through parent id in SELECT, cannot bucket natively;
+                    # fall back.
+                    from django.db.models.query import prefetch_related_objects
+
+                    prefetch_related_objects(objs, spec["lookup"])
+                    buckets = None
+                    break
+                elif rel in ("fk", "forward_fk"):
+                    parent_id = rel_obj.pk  # parent stored FK pointing here
+                    # Actually for forward FK prefetch on parent, children are
+                    # where remote.pk in parent.fk_values — attach by pk match
+                    # to parents that have that fk.
+                    for po in objs:
+                        # find field
+                        try:
+                            field = model._meta.get_field(cache)
+                            if getattr(po, field.attname) == rel_obj.pk:
+                                if hasattr(field, "set_cached_value"):
+                                    field.set_cached_value(po, rel_obj)
+                        except Exception:
+                            pass
+                    continue
+                if parent_id in buckets:
+                    buckets[parent_id].append(rel_obj)
+            if buckets is None:
+                continue
+            # Attach reverse relations as lists on cache / descriptor
+            for pk, rel_list in buckets.items():
+                parent = pk_to_obj.get(pk)
+                if parent is None:
+                    continue
+                try:
+                    field = model._meta.get_field(cache)
+                except Exception:
+                    # related descriptor name
+                    setattr(parent, "_prefetched_objects_cache", getattr(parent, "_prefetched_objects_cache", {}))
+                    parent._prefetched_objects_cache[cache] = rel_list
+                    continue
+                # Reverse many: use prefetched cache
+                cache_name = cache
+                if not hasattr(parent, "_prefetched_objects_cache"):
+                    parent._prefetched_objects_cache = {}
+                parent._prefetched_objects_cache[cache_name] = rel_list
+        except Exception:
+            try:
+                from django.db.models.query import prefetch_related_objects
+
+                prefetch_related_objects(objs, spec.get("lookup", ""))
+            except Exception:
+                pass
 
 
 def materialize_aggregate(connection, handle):

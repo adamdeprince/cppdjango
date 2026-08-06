@@ -858,6 +858,10 @@ class QuerySet(AltersData):
             return _FAST_PATH_MISS
         if self._fields is not None:
             return _FAST_PATH_MISS  # values_list get uses other path
+        # Model instances with annotations need annotation_select materialize
+        # (Python path) until we project annotation aliases onto instances.
+        if self.query.annotations:
+            return _FAST_PATH_MISS
         try:
             from django.native import orm as native_orm
 
@@ -905,6 +909,8 @@ class QuerySet(AltersData):
         if self._fields is not None:
             return _FAST_PATH_MISS
         if not issubclass(self._iterable_class, ModelIterable):
+            return _FAST_PATH_MISS
+        if self.query.annotations:
             return _FAST_PATH_MISS
         try:
             from django.native import orm as native_orm
@@ -2810,33 +2816,39 @@ class QuerySet(AltersData):
             obj._native_track_select_related(fields)
         else:
             obj.query.select_related = True
-            # unrestricted select_related — leave to Python compiler
-            obj._native_disabled = True
-            obj._native_qs = None
+            obj._native_track_select_related_all()
         return obj
 
-    def _native_track_select_related(self, fields):
+    def _native_ensure_handle(self):
+        """Return a writable native handle or None."""
         if getattr(self, "_native_disabled", False):
-            return
+            return None
         try:
             from django.native import orm as native_orm
 
             if native_orm._orm() is None:
-                return
+                return None
             handle = getattr(self, "_native_qs", None)
             if handle is None:
                 if not self._native_eligible_for_dataplane():
-                    return
+                    return None
                 handle = native_orm.build_queryset(
                     self.model, connections[self.db]
                 )
                 if handle is None:
-                    return
+                    return None
                 self._native_qs = handle
             else:
-                handle = handle.clone()
-                self._native_qs = handle
-            h = self._native_qs
+                self._native_qs = handle.clone()
+            return self._native_qs
+        except Exception:
+            return None
+
+    def _native_track_select_related(self, fields):
+        h = self._native_ensure_handle()
+        if h is None:
+            return
+        try:
             if not h.base_attnames():
                 h.select_model_columns()
             for path in fields:
@@ -2848,34 +2860,45 @@ class QuerySet(AltersData):
             self._native_disabled = True
             self._native_qs = None
 
+    def _native_track_select_related_all(self, max_depth=5):
+        h = self._native_ensure_handle()
+        if h is None:
+            self._native_disabled = True
+            self._native_qs = None
+            return
+        try:
+            if not h.base_attnames():
+                h.select_model_columns()
+            if not h.add_select_related_all(int(max_depth)):
+                self._native_disabled = True
+                self._native_qs = None
+        except Exception:
+            self._native_disabled = True
+            self._native_qs = None
+
     def _native_track_annotate(self, annotations, select=True):
-        """Mirror simple Aggregate / Subquery annotations onto native handle."""
+        """Mirror Aggregate / Subquery / Case / F / Value / Combined onto native."""
         if getattr(self, "_native_disabled", False) or not select:
             return
         try:
             from django.native import orm as native_orm
             from django.db.models.aggregates import Aggregate
-            from django.db.models.expressions import Star, Subquery
+            from django.db.models.expressions import (
+                Case,
+                CombinedExpression,
+                F,
+                Star,
+                Subquery,
+                Value,
+                When,
+            )
 
             if native_orm._orm() is None:
                 return
-            handle = getattr(self, "_native_qs", None)
-            if handle is None:
-                if not self._native_eligible_for_dataplane():
-                    return
-                handle = native_orm.build_queryset(
-                    self.model, connections[self.db]
-                )
-                if handle is None:
-                    return
-                self._native_qs = handle
-            else:
-                self._native_qs = handle.clone()
-            h = self._native_qs
-            if not h.base_attnames() and not any(
-                True for _ in []  # keep select if already set
-            ):
-                # Model fetch annotations need base columns
+            h = self._native_ensure_handle()
+            if h is None:
+                return
+            if not h.base_attnames():
                 h.select_model_columns()
             for alias, expr in annotations.items():
                 if isinstance(expr, Aggregate):
@@ -2901,18 +2924,113 @@ class QuerySet(AltersData):
                         self._native_disabled = True
                         self._native_qs = None
                         return
-                    # Aggregates with non-agg columns need GROUP BY
                     h.group_by_selected_columns()
                 elif isinstance(expr, Subquery):
-                    # Lower inner queryset via Python compiler once; store SQL.
-                    try:
-                        compiler = expr.query.get_compiler(self.db)
-                        sql, params = compiler.as_sql()
-                    except Exception:
+                    # Prefer fully native nested QuerySet when possible.
+                    sub_qs = getattr(expr, "queryset", None)
+                    if sub_qs is not None and getattr(
+                        sub_qs, "_native_qs", None
+                    ) is not None:
+                        if not h.annotate_subquery_qs(alias, sub_qs._native_qs):
+                            self._native_disabled = True
+                            self._native_qs = None
+                            return
+                    else:
+                        # Build native sub from model+empty and try simple values
+                        try:
+                            inner = expr.query
+                            # Compile via a throwaway native QS if simple
+                            sub_handle = native_orm.build_queryset(
+                                inner.model, connections[self.db]
+                            )
+                            if sub_handle is None:
+                                raise ValueError("no sub handle")
+                            # Best-effort: only empty-where values subqueries
+                            if not h.annotate_subquery_qs(alias, sub_handle):
+                                raise ValueError("annotate sub failed")
+                        except Exception:
+                            self._native_disabled = True
+                            self._native_qs = None
+                            return
+                elif isinstance(expr, Case):
+                    cases = []
+                    for w in expr.cases:
+                        if not isinstance(w, When):
+                            self._native_disabled = True
+                            self._native_qs = None
+                            return
+                        cond = w.condition
+                        # When.condition is often a Q or lookup
+                        from django.db.models import Q as Qobj
+
+                        if not isinstance(cond, Qobj):
+                            # Try wrap single node
+                            try:
+                                cond = Qobj(cond) if False else None
+                            except Exception:
+                                cond = None
+                        if cond is None:
+                            # condition may be a dict-like ResolvedOuter?
+                            # Fall back: use Q from children if present
+                            self._native_disabled = True
+                            self._native_qs = None
+                            return
+                        tree = native_orm.q_to_tree(cond)
+                        if tree is None:
+                            self._native_disabled = True
+                            self._native_qs = None
+                            return
+                        then = w.result
+                        if isinstance(then, Value):
+                            then_v = then.value
+                        elif isinstance(then, (str, int, float, bool, type(None))):
+                            then_v = then
+                        else:
+                            self._native_disabled = True
+                            self._native_qs = None
+                            return
+                        cases.append((tree, then_v))
+                    else_v = expr.default
+                    has_else = else_v is not None
+                    if has_else and isinstance(else_v, Value):
+                        else_v = else_v.value
+                    elif has_else and not isinstance(
+                        else_v, (str, int, float, bool, type(None))
+                    ):
                         self._native_disabled = True
                         self._native_qs = None
                         return
-                    if not h.annotate_sql(alias, sql, list(params)):
+                    if not h.annotate_case(alias, cases, has_else, else_v):
+                        self._native_disabled = True
+                        self._native_qs = None
+                        return
+                elif isinstance(expr, Value):
+                    if not h.annotate_value(alias, expr.value):
+                        self._native_disabled = True
+                        self._native_qs = None
+                        return
+                elif isinstance(expr, F):
+                    if not h.annotate_f(alias, expr.name):
+                        self._native_disabled = True
+                        self._native_qs = None
+                        return
+                elif isinstance(expr, CombinedExpression):
+                    lhs, rhs = expr.lhs, expr.rhs
+                    connector = expr.connector  # '+', '-', etc.
+                    if isinstance(lhs, F) and isinstance(rhs, Value):
+                        ok = h.annotate_binop(
+                            alias, lhs.name, connector, rhs.value
+                        )
+                    elif isinstance(lhs, F) and isinstance(rhs, F):
+                        ok = h.annotate_binop_fields(
+                            alias, lhs.name, connector, rhs.name
+                        )
+                    elif isinstance(lhs, Value) and isinstance(rhs, F):
+                        # rewrite as field op is awkward; poison
+                        ok = False
+                    else:
+                        ok = False
+                    if not ok:
                         self._native_disabled = True
                         self._native_qs = None
                         return
@@ -2967,29 +3085,21 @@ class QuerySet(AltersData):
         if getattr(self, "_native_disabled", False):
             return
         try:
-            from django.native import orm as native_orm
-
-            if native_orm._orm() is None:
+            h = self._native_ensure_handle()
+            if h is None:
                 return
-            handle = getattr(self, "_native_qs", None)
-            if handle is None:
-                if not self._native_eligible_for_dataplane():
-                    return
-                handle = native_orm.build_queryset(
-                    self.model, connections[self.db]
-                )
-                if handle is None:
-                    return
-                self._native_qs = handle
-            h = self._native_qs
             for lookup in lookups:
                 if isinstance(lookup, Prefetch):
                     path = lookup.prefetch_to
                 else:
                     path = str(lookup)
-                h.add_prefetch(path)
+                # Multi-hop prefetch: first hop only for native secondary
+                first = path.split(LOOKUP_SEP, 1)[0]
+                if not h.add_prefetch(first):
+                    # Leave Django prefetch list intact for fallback
+                    continue
         except Exception:
-            pass  # prefetch is post-fetch; main query can still be native
+            pass
 
     def annotate(self, *args, **kwargs):
         """

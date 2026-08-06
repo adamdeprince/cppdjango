@@ -617,3 +617,108 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         self.assertEqual(len(info), 1)
         self.assertEqual(info[0]["path"], "author")
         self.assertGreater(info[0]["count"], 0)
+
+        # Unrestricted select_related (all FKs)
+        qs2 = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs2.select_model_columns())
+        self.assertTrue(qs2.add_select_related_all(2))
+        sql2, _ = qs2.compile_sql()
+        self.assertIn("LEFT OUTER JOIN", sql2)
+
+    def test_case_when_and_native_subquery(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "cx.T",
+            "t",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("n", "n", "n", "IntegerField", False, False),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        qs.select_model_columns()
+        when = {"kind": "atom", "key": "n__gt", "values": [10]}
+        self.assertTrue(
+            qs.annotate_case("bucket", [(when, "hi")], "lo")
+        )
+        sql, params = qs.compile_sql()
+        self.assertIn("CASE", sql)
+        self.assertIn("WHEN", sql)
+        self.assertIn("THEN %s", sql)
+        self.assertIn("ELSE %s", sql)
+
+        # Nested QuerySet subquery (native compile)
+        sub = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        sub.values_list(["id"], False)
+        sub.filter_eq("n", 1)
+        qs2 = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs2.filter_subquery_qs("id", orm.OP_IN, sub))
+        sql2, p2 = qs2.compile_sql()
+        self.assertIn("IN (", sql2)
+        self.assertIn("SELECT", sql2)
+
+        qs3 = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        qs3.select_model_columns()
+        self.assertTrue(qs3.annotate_subquery_qs("sid", sub))
+        sql3, _ = qs3.compile_sql()
+        self.assertIn("AS \"sid\"", sql3)
+
+    def test_prefetch_secondary_sql(self):
+        from django import _native
+
+        orm = _native.orm
+        orm.register_model(
+            "pf.Book",
+            "book",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("title", "title", "title", "CharField", False, False),
+                _row(
+                    "author",
+                    "author_id",
+                    "author_id",
+                    "ForeignKey",
+                    False,
+                    False,
+                    "author",
+                    "id",
+                    "pf.Author",
+                    "fk",
+                ),
+            ],
+        )
+        author_id = orm.register_model(
+            "pf.Author",
+            "author",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("name", "name", "name", "CharField", False, False),
+                _row(
+                    "books",
+                    "books",
+                    "",
+                    "ManyToOneRel",
+                    False,
+                    True,
+                    "book",
+                    "id",
+                    "pf.Book",
+                    "rev_fk",
+                    "",
+                    "",
+                    "",
+                    "author_id",
+                ),
+            ],
+        )
+        qs = orm.QuerySet.create(author_id, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.add_prefetch("books"))
+        specs = qs.prefetch_specs()
+        self.assertEqual(len(specs), 1)
+        sql, params = qs.compile_prefetch_secondary(specs[0], [1, 2, 3])
+        self.assertTrue(sql)
+        self.assertIn("SELECT", sql)
+        self.assertIn("IN (", sql)
+        self.assertEqual(list(params), [1, 2, 3])
