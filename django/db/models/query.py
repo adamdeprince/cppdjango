@@ -858,10 +858,6 @@ class QuerySet(AltersData):
             return _FAST_PATH_MISS
         if self._fields is not None:
             return _FAST_PATH_MISS  # values_list get uses other path
-        # Model instances with annotations need annotation_select materialize
-        # (Python path) until we project annotation aliases onto instances.
-        if self.query.annotations:
-            return _FAST_PATH_MISS
         try:
             from django.native import orm as native_orm
 
@@ -909,8 +905,6 @@ class QuerySet(AltersData):
         if self._fields is not None:
             return _FAST_PATH_MISS
         if not issubclass(self._iterable_class, ModelIterable):
-            return _FAST_PATH_MISS
-        if self.query.annotations:
             return _FAST_PATH_MISS
         try:
             from django.native import orm as native_orm
@@ -3093,9 +3087,8 @@ class QuerySet(AltersData):
                     path = lookup.prefetch_to
                 else:
                     path = str(lookup)
-                # Multi-hop prefetch: first hop only for native secondary
-                first = path.split(LOOKUP_SEP, 1)[0]
-                if not h.add_prefetch(first):
+                # Full multi-hop path: C++ emits one PrefetchSpec per hop.
+                if not h.add_prefetch(path):
                     # Leave Django prefetch list intact for fallback
                     continue
         except Exception:

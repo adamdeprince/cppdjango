@@ -145,8 +145,15 @@ enum class ResultMode : std::uint8_t {
 };
 
 // Prefetch plan: executed after main query (ids known).
+// Multi-hop lookups produce one PrefetchSpec per hop (in order).
 struct PrefetchSpec {
-  std::string lookup;  // path e.g. "author" or "books" / "tags"
+  std::string lookup;  // full original path e.g. "books__tags"
+  // Hop path relative to root of this prefetch chain segment.
+  // Empty parent_path → parents are main-query instances.
+  // Non-empty (e.g. "books") → parents are objects attached under that
+  // cumulative path on the root instances.
+  std::string parent_path;
+  std::string hop;  // this hop's field name only, e.g. "tags"
   // Populated from schema at add_prefetch time for secondary query build.
   RelKind rel = RelKind::None;
   std::string remote_table;

@@ -717,8 +717,193 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         self.assertTrue(qs.add_prefetch("books"))
         specs = qs.prefetch_specs()
         self.assertEqual(len(specs), 1)
-        sql, params = qs.compile_prefetch_secondary(specs[0], [1, 2, 3])
+        compiled = qs.compile_prefetch_secondary(specs[0], [1, 2, 3])
+        sql, params = compiled[0], compiled[1]
         self.assertTrue(sql)
         self.assertIn("SELECT", sql)
         self.assertIn("IN (", sql)
         self.assertEqual(list(params), [1, 2, 3])
+
+    def test_annotation_selects_offsets(self):
+        """Annotation aliases are exposed with SELECT-list offsets for materialize."""
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "ann.T",
+            "t",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("n", "n", "n", "IntegerField", False, False),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.select_model_columns())
+        base_n = len(qs.base_attnames())
+        self.assertTrue(qs.annotate_value("x", 42))
+        self.assertTrue(qs.annotate_binop("double_n", "n", "*", 2))
+        anns = qs.annotation_selects()
+        self.assertEqual(len(anns), 2)
+        self.assertEqual(anns[0]["alias"], "x")
+        self.assertEqual(anns[0]["offset"], base_n)
+        self.assertEqual(anns[1]["alias"], "double_n")
+        self.assertEqual(anns[1]["offset"], base_n + 1)
+        sql, params = qs.compile_sql()
+        self.assertIn('AS "x"', sql)
+        self.assertIn('AS "double_n"', sql)
+        self.assertIn(42, list(params))
+
+    def test_multi_hop_prefetch_specs(self):
+        """prefetch path a__b emits one PrefetchSpec per hop with parent_path."""
+        from django import _native
+
+        orm = _native.orm
+        orm.register_model(
+            "mh.Tag",
+            "tag",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("name", "name", "name", "CharField", False, False),
+            ],
+        )
+        orm.register_model(
+            "mh.Book",
+            "book",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("title", "title", "title", "CharField", False, False),
+                _row(
+                    "author",
+                    "author_id",
+                    "author_id",
+                    "ForeignKey",
+                    False,
+                    False,
+                    "author",
+                    "id",
+                    "mh.Author",
+                    "fk",
+                ),
+                _row(
+                    "tags",
+                    "tags",
+                    "",
+                    "ManyToManyField",
+                    False,
+                    True,
+                    "tag",
+                    "id",
+                    "mh.Tag",
+                    "m2m",
+                    "book_tags",
+                    "book_id",
+                    "tag_id",
+                    "",
+                ),
+            ],
+        )
+        author_id = orm.register_model(
+            "mh.Author",
+            "author",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("name", "name", "name", "CharField", False, False),
+                _row(
+                    "books",
+                    "books",
+                    "",
+                    "ManyToOneRel",
+                    False,
+                    True,
+                    "book",
+                    "id",
+                    "mh.Book",
+                    "rev_fk",
+                    "",
+                    "",
+                    "",
+                    "author_id",
+                ),
+            ],
+        )
+        qs = orm.QuerySet.create(author_id, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.add_prefetch("books__tags"))
+        specs = qs.prefetch_specs()
+        self.assertEqual(len(specs), 2)
+        self.assertEqual(specs[0]["hop"], "books")
+        self.assertEqual(specs[0]["parent_path"], "")
+        self.assertEqual(specs[0]["rel"], "rev_fk")
+        self.assertEqual(specs[0]["lookup"], "books__tags")
+        self.assertEqual(specs[1]["hop"], "tags")
+        self.assertEqual(specs[1]["parent_path"], "books")
+        self.assertEqual(specs[1]["rel"], "m2m")
+        lookups = list(qs.prefetch_lookups())
+        self.assertEqual(lookups, ["books__tags"])
+
+        # Hop 0 secondary (rev_fk)
+        c0 = qs.compile_prefetch_secondary(specs[0], [1, 2])
+        self.assertTrue(c0[0])
+        self.assertIn("IN (", c0[0])
+        self.assertEqual(list(c0[1]), [1, 2])
+
+        # Hop 1 secondary (m2m) includes parent link column
+        c1 = qs.compile_prefetch_secondary(specs[1], [10, 20])
+        sql1, params1, parent_off = c1[0], c1[1], c1[2]
+        self.assertTrue(sql1)
+        self.assertIn("book_tags", sql1)
+        self.assertIn("book_id", sql1)
+        self.assertEqual(list(params1), [10, 20])
+        self.assertGreaterEqual(parent_off, 0)
+        # Parent link is selected after remote concrete columns
+        self.assertIn("PF", sql1)
+
+    def test_m2m_prefetch_secondary_parent_link(self):
+        """M2M secondary SELECT projects through.parent_id for bucketing."""
+        from django import _native
+
+        orm = _native.orm
+        orm.register_model(
+            "m2mpf.Tag",
+            "tag",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("name", "name", "name", "CharField", False, False),
+            ],
+        )
+        book_id = orm.register_model(
+            "m2mpf.Book",
+            "book",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("title", "title", "title", "CharField", False, False),
+                _row(
+                    "tags",
+                    "tags",
+                    "",
+                    "ManyToManyField",
+                    False,
+                    True,
+                    "tag",
+                    "id",
+                    "m2mpf.Tag",
+                    "m2m",
+                    "book_tags",
+                    "book_id",
+                    "tag_id",
+                    "",
+                ),
+            ],
+        )
+        qs = orm.QuerySet.create(book_id, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.add_prefetch("tags"))
+        specs = qs.prefetch_specs()
+        self.assertEqual(len(specs), 1)
+        self.assertEqual(specs[0]["rel"], "m2m")
+        sql, params, parent_off = qs.compile_prefetch_secondary(specs[0], [5, 6])
+        self.assertTrue(sql)
+        self.assertIn("INNER JOIN", sql)
+        self.assertIn("book_tags", sql)
+        # Parent link column must appear in SELECT list
+        self.assertIn('"PF"."book_id"', sql)
+        self.assertGreaterEqual(parent_off, 1)
+        self.assertEqual(list(params), [5, 6])

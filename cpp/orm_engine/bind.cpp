@@ -7,6 +7,7 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <stdexcept>
 #include <string>
@@ -432,6 +433,12 @@ void register_orm_engine(nb::module_& parent) {
              nb::sequence parent_pks) {
             django::orm::PrefetchSpec p;
             p.lookup = nb::cast<std::string>(spec["lookup"]);
+            if (spec.contains("parent_path")) {
+              p.parent_path = nb::cast<std::string>(spec["parent_path"]);
+            }
+            if (spec.contains("hop")) {
+              p.hop = nb::cast<std::string>(spec["hop"]);
+            }
             p.rel = django::orm::rel_kind_from_string(
                 nb::cast<std::string>(spec["rel"]));
             p.remote_table = nb::cast<std::string>(spec["remote_table"]);
@@ -457,8 +464,10 @@ void register_orm_engine(nb::module_& parent) {
             for (const auto& pv : compiled.params) {
               params.append(param_to_python(pv));
             }
+            // (sql, params, parent_link_offset)
             return nb::make_tuple(
-                nb::str(compiled.sql.c_str(), compiled.sql.size()), params);
+                nb::str(compiled.sql.c_str(), compiled.sql.size()), params,
+                compiled.parent_link_offset);
           },
           nb::arg("spec"), nb::arg("parent_pks"))
       .def(
@@ -468,7 +477,8 @@ void register_orm_engine(nb::module_& parent) {
             for (const auto& p : self.prefetches()) {
               nb::dict d;
               d["lookup"] = p.lookup;
-              d["rel"] = std::to_string(static_cast<int>(p.rel));
+              d["parent_path"] = p.parent_path;
+              d["hop"] = p.hop;
               // string form for rel_kind_from_string
               const char* rels[] = {"", "fk", "rev_fk", "m2m", "rev_m2m"};
               int ri = static_cast<int>(p.rel);
@@ -482,6 +492,18 @@ void register_orm_engine(nb::module_& parent) {
               d["m2m_reverse_column"] = p.m2m_reverse_column;
               d["parent_pk_column"] = p.parent_pk_column;
               d["cache_name"] = p.cache_name;
+              out.append(d);
+            }
+            return out;
+          })
+      .def(
+          "annotation_selects",
+          [](const django::orm::QuerySet& self) {
+            nb::list out;
+            for (const auto& a : self.annotation_selects()) {
+              nb::dict d;
+              d["alias"] = a.alias;
+              d["offset"] = a.offset;
               out.append(d);
             }
             return out;
@@ -533,8 +555,14 @@ void register_orm_engine(nb::module_& parent) {
              return out;
            })
       .def("prefetch_lookups", [](const django::orm::QuerySet& self) {
+        // Unique full lookup paths (multi-hop expands to multiple specs).
         nb::list out;
+        std::vector<std::string> seen;
         for (const auto& p : self.prefetches()) {
+          if (std::find(seen.begin(), seen.end(), p.lookup) != seen.end()) {
+            continue;
+          }
+          seen.push_back(p.lookup);
           out.append(p.lookup);
         }
         return out;

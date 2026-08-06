@@ -748,43 +748,83 @@ bool QuerySet::add_select_related_all(int max_depth) {
 }
 
 bool QuerySet::add_prefetch(std::string_view lookup) {
-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  const SchemaRegistry& reg = SchemaRegistry::instance();
+  const ModelSchema* m = reg.get(query_.model);
   if (!m) {
     return false;
   }
-  // Single-hop prefetch for now (lookup may be "books" or "tags").
+  // Multi-hop: one PrefetchSpec per hop (Django-style sequential prefetch).
   auto parts = split_lookup_sep(lookup);
   if (parts.empty()) {
     return false;
   }
-  // Use first hop field for relation metadata.
-  auto fit = m->field_by_name.find(parts[0]);
-  if (fit == m->field_by_name.end()) {
-    return false;
+  const ModelSchema* current = m;
+  std::string parent_path;
+  std::string full(lookup);
+  bool any = false;
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    auto fit = current->field_by_name.find(parts[i]);
+    if (fit == current->field_by_name.end()) {
+      return any;  // keep earlier hops if later hop unknown
+    }
+    const FieldSchema& f = current->fields[fit->second];
+    if (!f.is_relation()) {
+      return any;
+    }
+    PrefetchSpec p;
+    p.lookup = full;
+    p.parent_path = parent_path;
+    p.hop = parts[i];
+    p.rel = f.rel;
+    p.remote_table = f.remote_table;
+    p.remote_model_label = f.remote_model_label;
+    p.remote_pk_column = f.remote_pk_column;
+    p.remote_fk_column = f.remote_fk_column;
+    p.m2m_table = f.m2m_table;
+    p.m2m_column = f.m2m_column;
+    p.m2m_reverse_column = f.m2m_reverse_column;
+    p.cache_name = parts[i];
+    if (current->pk_field < current->fields.size()) {
+      p.parent_pk_column = current->fields[current->pk_field].column;
+    }
+    if (p.parent_pk_column.empty()) {
+      p.parent_pk_column = "id";
+    }
+    query_.prefetches.push_back(std::move(p));
+    any = true;
+
+    // Advance to remote model for next hop; parent_path accumulates.
+    if (!parent_path.empty()) {
+      parent_path += "__";
+    }
+    parent_path += parts[i];
+    if (f.remote_model_label.empty()) {
+      break;
+    }
+    const ModelSchema* remote = reg.get_by_label(f.remote_model_label);
+    if (!remote) {
+      break;
+    }
+    current = remote;
   }
-  const FieldSchema& f = m->fields[fit->second];
-  if (!f.is_relation()) {
-    return false;
+  return any;
+}
+
+std::vector<QuerySet::AnnotationSelect> QuerySet::annotation_selects() const {
+  std::vector<AnnotationSelect> out;
+  for (std::size_t i = 0; i < query_.select.size(); ++i) {
+    const SelectItem& it = query_.select[i];
+    if (it.out_alias.empty()) {
+      continue;
+    }
+    if (it.kind == SelectKind::Aggregate || it.kind == SelectKind::SqlFragment) {
+      AnnotationSelect a;
+      a.alias = it.out_alias;
+      a.offset = static_cast<int>(i);
+      out.push_back(std::move(a));
+    }
   }
-  PrefetchSpec p;
-  p.lookup = std::string(lookup);
-  p.rel = f.rel;
-  p.remote_table = f.remote_table;
-  p.remote_model_label = f.remote_model_label;
-  p.remote_pk_column = f.remote_pk_column;
-  p.remote_fk_column = f.remote_fk_column;
-  p.m2m_table = f.m2m_table;
-  p.m2m_column = f.m2m_column;
-  p.m2m_reverse_column = f.m2m_reverse_column;
-  p.cache_name = parts[0];
-  if (m->pk_field < m->fields.size()) {
-    p.parent_pk_column = m->fields[m->pk_field].column;
-  }
-  if (p.parent_pk_column.empty()) {
-    p.parent_pk_column = "id";
-  }
-  query_.prefetches.push_back(std::move(p));
-  return true;
+  return out;
 }
 
 bool QuerySet::filter_subquery_qs(std::string_view field_name, CmpOp op,
@@ -990,42 +1030,36 @@ QuerySet::PrefetchSql QuerySet::compile_prefetch_secondary(
     sub.query_mut().where = bool_atom(std::move(p));
     sub.query_mut().has_where = true;
   } else if (spec.rel == RelKind::ForwardM2M || spec.rel == RelKind::ReverseM2M) {
-    // JOIN through WHERE through.parent_col IN pks
+    // JOIN through WHERE through.parent_col IN pks; also SELECT parent link
+    // so Python can bucket related rows without an extra round-trip.
     if (spec.m2m_table.empty()) {
       return out;
     }
-    JoinEdge through;
-    through.type = JoinType::Inner;
-    through.alias = "PF";
-    through.table = spec.m2m_table;
-    through.local_alias = sub.query().base_alias;
-    // remote side of through links to remote pk
-    through.local_column =
-        reg.get(*rid) && reg.get(*rid)->pk_field < reg.get(*rid)->fields.size()
-            ? reg.get(*rid)->fields[reg.get(*rid)->pk_field].column
+    const ModelSchema* remote_m = reg.get(*rid);
+    std::string remote_pk =
+        (remote_m && remote_m->pk_field < remote_m->fields.size() &&
+         !remote_m->fields[remote_m->pk_field].column.empty())
+            ? remote_m->fields[remote_m->pk_field].column
             : "id";
-    through.remote_column = spec.m2m_reverse_column.empty()
-                                ? std::string("to_id")
-                                : spec.m2m_reverse_column;
-    // Actually ON remote.pk = through.m2m_reverse AND through.m2m_column IN (...)
-    // Rewrite: JOIN through ON through.m2m_reverse = remote.pk
-    through.local_column =
-        reg.get(*rid)->fields[reg.get(*rid)->pk_field].column.empty()
-            ? "id"
-            : reg.get(*rid)->fields[reg.get(*rid)->pk_field].column;
-    // emit: local_alias.local_column = alias.remote_column
-    // so remote.pk = through.m2m_reverse
-    // local_alias = remote table alias, local_column = pk
-    // alias = through, remote_column = m2m_reverse
     JoinEdge j;
     j.type = JoinType::Inner;
     j.alias = "PF";
     j.table = spec.m2m_table;
     j.local_alias = sub.query().base_alias;
-    j.local_column = through.local_column;
+    j.local_column = remote_pk;
     j.remote_column = spec.m2m_reverse_column.empty() ? "to_id"
                                                      : spec.m2m_reverse_column;
     sub.query_mut().joins.push_back(j);
+    // Append through.parent_col so each row carries the parent PK for bucketing.
+    SelectItem parent_link;
+    parent_link.kind = SelectKind::Column;
+    parent_link.col.field = 0;
+    parent_link.col.table_alias = "PF";
+    parent_link.col.column_override =
+        spec.m2m_column.empty() ? std::string("from_id") : spec.m2m_column;
+    out.parent_link_offset =
+        static_cast<int>(sub.query().select.size());
+    sub.query_mut().select.push_back(std::move(parent_link));
     Pred p;
     p.op = CmpOp::In;
     p.lhs.field = 0;

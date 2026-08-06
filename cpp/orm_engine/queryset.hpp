@@ -106,9 +106,12 @@ class QuerySet {
 
   // Build secondary SELECT for prefetch given parent PK values.
   // Returns empty sql on failure; params are fully flattened for execute.
+  // parent_link_offset >= 0 means that column index holds the parent PK
+  // (used for M2M bucketing where the FK is on the through table).
   struct PrefetchSql {
     std::string sql;
     std::vector<ParamValue> params;
+    int parent_link_offset = -1;
   };
   [[nodiscard]] PrefetchSql compile_prefetch_secondary(
       const PrefetchSpec& spec,
@@ -139,6 +142,12 @@ class QuerySet {
   [[nodiscard]] const std::vector<PrefetchSpec>& prefetches() const {
     return query_.prefetches;
   }
+  // Annotation aliases with select-list offsets for setattr on instances.
+  struct AnnotationSelect {
+    std::string alias;
+    int offset = 0;
+  };
+  [[nodiscard]] std::vector<AnnotationSelect> annotation_selects() const;
 
   [[nodiscard]] QuerySet clone() const;
 

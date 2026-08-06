@@ -120,10 +120,11 @@ class OrmFastPathDBTests(TestCase):
         self.assertEqual(n, 1)
         self.assertEqual(FastWorld.objects.get(pk=1).randomnumber, 11)
 
-    def test_annotated_misses_fast_path(self):
+    def test_annotated_get_projects_attrs(self):
         from django.db.models import Value
 
-        # Annotations must miss the simple get fast path but still work.
+        # Annotation aliases must appear as attributes on model instances
+        # (native materialize projects SELECT annotation columns).
         qs = FastWorld.objects.annotate(x=Value(1))
         self.assertEqual(qs.get(pk=1).x, 1)
 
