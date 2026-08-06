@@ -133,11 +133,15 @@ class WSGIHandler(base.BaseHandler):
 
         response._handler_class = self.__class__
 
-        status = "%d %s" % (response.status_code, response.reason_phrase)
-        response_headers = [
-            *response.items(),
-            *(("Set-Cookie", c.OutputString()) for c in response.cookies.values()),
-        ]
+        # Cached "200 OK" when possible (see HttpResponseBase.wsgi_status_line).
+        status = response.wsgi_status_line()
+        if response.cookies:
+            response_headers = [
+                *response.items(),
+                *(("Set-Cookie", c.OutputString()) for c in response.cookies.values()),
+            ]
+        else:
+            response_headers = list(response.items())
         start_response(status, response_headers)
         if getattr(response, "file_to_stream", None) is not None and environ.get(
             "wsgi.file_wrapper"

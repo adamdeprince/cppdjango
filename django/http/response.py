@@ -34,6 +34,9 @@ _charset_from_content_type_re = _lazy_re_compile(
     r";\s*charset=(?P<charset>[^\s;]+)", re.I
 )
 
+# Cached WSGI status line for the common default (framework-floor path).
+_STATUS_LINE_200_OK = "200 OK"
+
 
 class ResponseHeaders(CaseInsensitiveMapping):
     def __init__(self, data):
@@ -338,12 +341,23 @@ class HttpResponseBase:
         # Handle string types -- we can't rely on force_bytes here because:
         # - Python attempts str conversion first
         # - when self._charset != 'utf-8' it re-encodes the content
-        if isinstance(value, (bytes, memoryview)):
-            return bytes(value)
+        if isinstance(value, bytes):
+            return value
+        if isinstance(value, memoryview):
+            return value.tobytes()
         if isinstance(value, str):
             return bytes(value.encode(self.charset))
         # Handle non-string types.
         return str(value).encode(self.charset)
+
+    def wsgi_status_line(self):
+        """Status line for start_response (e.g. ``'200 OK'``)."""
+        if (
+            self.status_code == 200
+            and self._reason_phrase is None
+        ):
+            return _STATUS_LINE_200_OK
+        return "%d %s" % (self.status_code, self.reason_phrase)
 
     # These methods partially implement the file-like object interface.
     # See https://docs.python.org/library/io.html#io.IOBase
@@ -400,8 +414,15 @@ class HttpResponse(HttpResponseBase):
 
     def __init__(self, content=b"", *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Content is a bytestring. See the `content` property methods.
-        self.content = content
+        # Fast path: body already bytes (orjson / static payloads). Skip
+        # make_bytes → charset property (Content-Type parse / DEFAULT_CHARSET).
+        if isinstance(content, bytes):
+            self._container = [content]
+        elif isinstance(content, memoryview):
+            self._container = [content.tobytes()]
+        else:
+            # Content is a bytestring. See the `content` property methods.
+            self.content = content
 
     def __repr__(self):
         return "<%(cls)s status_code=%(status_code)d%(content_type)s>" % {
@@ -423,9 +444,16 @@ class HttpResponse(HttpResponseBase):
     @content.setter
     def content(self, value):
         # Consume iterators upon assignment to allow repeated iteration.
-        if hasattr(value, "__iter__") and not isinstance(
-            value, (bytes, memoryview, str)
-        ):
+        if isinstance(value, bytes):
+            # Avoid charset lookup for already-encoded bodies.
+            self._container = [value]
+            self.__dict__.pop("text", None)
+            return
+        if isinstance(value, memoryview):
+            self._container = [value.tobytes()]
+            self.__dict__.pop("text", None)
+            return
+        if hasattr(value, "__iter__") and not isinstance(value, str):
             content = b"".join(self.make_bytes(chunk) for chunk in value)
             if hasattr(value, "close"):
                 try:

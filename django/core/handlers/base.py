@@ -22,6 +22,8 @@ class BaseHandler:
     _template_response_middleware = None
     _exception_middleware = None
     _middleware_chain = None
+    # Set in load_middleware: no view/template/exception middleware hooks.
+    _middleware_hooks_empty = False
 
     def load_middleware(self, is_async=False):
         """
@@ -109,6 +111,21 @@ class BaseHandler:
         # We only assign to this when initialization is complete as it is used
         # as a flag for initialization being complete.
         self._middleware_chain = handler
+        self._middleware_hooks_empty = not (
+            self._view_middleware
+            or self._template_response_middleware
+            or self._exception_middleware
+        )
+
+    def _any_atomic_requests(self):
+        """True if any DB alias has ATOMIC_REQUESTS (checked live; tests toggle it)."""
+        try:
+            return any(
+                settings_dict.get("ATOMIC_REQUESTS")
+                for settings_dict in connections.settings.values()
+            )
+        except Exception:
+            return True
 
     def adapt_method_mode(
         self,
@@ -142,10 +159,21 @@ class BaseHandler:
             return async_to_sync(method)
         return method
 
+    def _ensure_root_urlconf(self):
+        """
+        Pin ROOT_URLCONF on this thread if unset.
+
+        Avoids set_urlconf thrash when the previous request left ROOT pinned
+        (see reset_urlconf). reverse() and get_urlconf() still see a value.
+        """
+        from django.urls import get_urlconf
+
+        if get_urlconf() is None:
+            set_urlconf(settings.ROOT_URLCONF)
+
     def get_response(self, request):
         """Return an HttpResponse object for the given HttpRequest."""
-        # Setup default url resolver for this thread
-        set_urlconf(settings.ROOT_URLCONF)
+        self._ensure_root_urlconf()
         response = self._middleware_chain(request)
         response._resource_closers.append(request.close)
         if response.status_code >= 400:
@@ -166,8 +194,7 @@ class BaseHandler:
         get_response() is too slow. Avoid the context switch by using
         a separate async response path.
         """
-        # Setup default url resolver for this thread.
-        set_urlconf(settings.ROOT_URLCONF)
+        self._ensure_root_urlconf()
         response = await self._middleware_chain(request)
         response._resource_closers.append(request.close)
         if response.status_code >= 400:
@@ -186,6 +213,20 @@ class BaseHandler:
         template_response middleware. This method is everything that happens
         inside the request/response middleware.
         """
+        # Fast path: empty middleware hooks (TE-style MIDDLEWARE=()).
+        if self._middleware_hooks_empty and not self._any_atomic_requests():
+            callback, callback_args, callback_kwargs = self.resolve_request(request)
+            if iscoroutinefunction(callback):
+                callback = async_to_sync(callback)
+            try:
+                response = callback(request, *callback_args, **callback_kwargs)
+            except Exception:
+                raise
+            self.check_response(response, callback)
+            if hasattr(response, "render") and callable(response.render):
+                response = response.render()
+            return response
+
         response = None
         callback, callback_args, callback_kwargs = self.resolve_request(request)
 
@@ -198,7 +239,10 @@ class BaseHandler:
                 break
 
         if response is None:
-            wrapped_callback = self.make_view_atomic(callback)
+            if self._any_atomic_requests():
+                wrapped_callback = self.make_view_atomic(callback)
+            else:
+                wrapped_callback = callback
             # If it is an asynchronous view, run it in a subthread.
             if iscoroutinefunction(wrapped_callback):
                 wrapped_callback = async_to_sync(wrapped_callback)
@@ -252,7 +296,10 @@ class BaseHandler:
                 break
 
         if response is None:
-            wrapped_callback = self.make_view_atomic(callback)
+            if self._any_atomic_requests():
+                wrapped_callback = self.make_view_atomic(callback)
+            else:
+                wrapped_callback = callback
             # If it is a synchronous view, run it in a subthread
             if not iscoroutinefunction(wrapped_callback):
                 wrapped_callback = sync_to_async(
@@ -352,6 +399,8 @@ class BaseHandler:
     # Other utility methods.
 
     def make_view_atomic(self, view):
+        if not self._any_atomic_requests():
+            return view
         non_atomic_requests = getattr(view, "_non_atomic_requests", set())
         for alias, settings_dict in connections.settings.items():
             if settings_dict["ATOMIC_REQUESTS"] and alias not in non_atomic_requests:
@@ -375,8 +424,21 @@ class BaseHandler:
 
 
 def reset_urlconf(sender, **kwargs):
-    """Reset the URLconf after each request is finished."""
-    set_urlconf(None)
+    """
+    Reset the URLconf after each request is finished.
+
+    Custom per-request urlconfs (request.urlconf) are cleared so they do not
+    leak to the next request. ROOT_URLCONF left pinned on the thread is kept to
+    avoid set/clear thrash on the framework-floor path.
+    """
+    from django.urls import get_urlconf
+
+    urlconf = get_urlconf()
+    if urlconf is None:
+        return
+    if urlconf != settings.ROOT_URLCONF:
+        set_urlconf(None)
+    # else: leave ROOT_URLCONF pinned for the next request
 
 
 request_finished.connect(reset_urlconf)

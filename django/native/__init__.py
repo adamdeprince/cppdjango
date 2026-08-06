@@ -1870,7 +1870,8 @@ def key_has_lookup_sep(key: str) -> bool:
 def keys_without_lookup_sep(keys):
     impl = _impl()
     if impl is not None:
-        return list(impl.keys_without_lookup_sep(list(keys)))
+        # Native already returns a Python list (built in C++).
+        return impl.keys_without_lookup_sep(list(keys))
     return fallbacks.keys_without_lookup_sep(keys)
 
 
@@ -1919,7 +1920,8 @@ def filter_after_slice_error(has_filters: bool, is_sliced: bool) -> bool:
 def prohibited_filter_kwargs(keys):
     impl = _impl()
     if impl is not None:
-        return list(impl.prohibited_filter_kwargs(list(keys)))
+        # Native already returns a Python list (built in C++).
+        return impl.prohibited_filter_kwargs(list(keys))
     return fallbacks.prohibited_filter_kwargs(keys)
 
 

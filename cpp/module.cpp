@@ -27,6 +27,8 @@
 #include <nanobind/stl/tuple.h>
 #include <nanobind/stl/vector.h>
 
+#include "nb_util.hpp"
+
 #include <algorithm>
 #include <functional>
 #include <optional>
@@ -247,7 +249,8 @@ NB_MODULE(_native, m) {
           maxf = nb::cast<std::size_t>(max_num_fields);
         }
         try {
-          return django::native::parse_qsl_utf8(qs, maxf);
+          return django::native::list_from_string_pairs(
+              django::native::parse_qsl_utf8(qs, maxf));
         } catch (const std::invalid_argument& e) {
           throw nb::value_error(e.what());
         }
@@ -446,7 +449,9 @@ NB_MODULE(_native, m) {
   // --- template expressions (smart_split / Variable / FilterExpression) ---
   m.def(
       "smart_split",
-      [](const std::string& text) { return django::native::smart_split(text); },
+      [](const std::string& text) {
+        return django::native::list_from_strings(django::native::smart_split(text));
+      },
       nb::arg("text"),
       "Split on spaces while preserving quoted phrases.");
 
@@ -471,7 +476,7 @@ NB_MODULE(_native, m) {
         d["int_value"] = p.int_value;
         d["float_value"] = p.float_value;
         d["string_value"] = p.string_value;
-        d["lookups"] = p.lookups;
+        d["lookups"] = django::native::list_from_strings(p.lookups);
         d["error"] = p.error;
         d["error_detail"] = p.error_detail;
         return d;
@@ -868,7 +873,8 @@ NB_MODULE(_native, m) {
   m.def(
       "make_list_chars",
       [](const std::string& value) {
-        return django::native::make_list_chars(value);
+        return django::native::list_from_strings(
+            django::native::make_list_chars(value));
       },
       nb::arg("value"));
 
@@ -1418,7 +1424,8 @@ NB_MODULE(_native, m) {
   m.def(
       "urlize_word_split",
       [](const std::string& text) {
-        return django::native::urlize_word_split(text);
+        return django::native::list_from_strings(
+            django::native::urlize_word_split(text));
       },
       nb::arg("text"));
 
@@ -1737,7 +1744,8 @@ NB_MODULE(_native, m) {
   m.def(
       "parse_etags",
       [](const std::string& etag_str) {
-        return django::native::parse_etags(etag_str);
+        return django::native::list_from_strings(
+            django::native::parse_etags(etag_str));
       },
       nb::arg("etag_str"));
 
@@ -1952,14 +1960,16 @@ NB_MODULE(_native, m) {
   m.def(
       "cc_delim_split",
       [](const std::string& header) {
-        return django::native::cc_delim_split(header);
+        return django::native::list_from_strings(
+            django::native::cc_delim_split(header));
       },
       nb::arg("header"));
 
   m.def(
       "parse_cache_control",
       [](const std::string& header) {
-        return django::native::parse_cache_control(header);
+        return django::native::list_from_string_pairs(
+            django::native::parse_cache_control(header));
       },
       nb::arg("header"));
 
@@ -2043,7 +2053,7 @@ NB_MODULE(_native, m) {
       [](const std::vector<std::string>& values) -> nb::object {
         auto r = django::native::mvd_last_value(values);
         if (r.empty_list) {
-          return nb::cast(std::vector<std::string>{});  // []
+          return nb::list();  // []
         }
         return nb::cast(r.last);
       },
@@ -2248,7 +2258,8 @@ NB_MODULE(_native, m) {
           nb::tuple t = nb::cast<nb::tuple>(item);
           vec.emplace_back(nb::cast<std::string>(t[0]), nb::cast<std::string>(t[1]));
         }
-        return django::native::serialize_header_lines(vec);
+        return django::native::list_from_strings(
+            django::native::serialize_header_lines(vec));
       },
       nb::arg("headers"));
 
@@ -2345,7 +2356,8 @@ NB_MODULE(_native, m) {
   m.def(
       "signing_split",
       [](const std::string& signed_value, const std::string& sep) {
-        return django::native::signing_split(signed_value, sep);
+        return django::native::list_from_strings(
+            django::native::signing_split(signed_value, sep));
       },
       nb::arg("signed_value"), nb::arg("sep") = ":");
 
@@ -2443,7 +2455,10 @@ NB_MODULE(_native, m) {
 
   m.def(
       "split_lookup_path",
-      [](const std::string& path) { return django::native::split_lookup_path(path); },
+      [](const std::string& path) {
+        return django::native::list_from_strings(
+            django::native::split_lookup_path(path));
+      },
       nb::arg("path"));
 
   m.def(
@@ -2469,14 +2484,16 @@ NB_MODULE(_native, m) {
   m.def(
       "lookup_field_parts",
       [](const std::vector<std::string>& lookup_splitted, int n_lookup_parts) {
-        return django::native::lookup_field_parts(lookup_splitted, n_lookup_parts);
+        return django::native::list_from_strings(
+            django::native::lookup_field_parts(lookup_splitted, n_lookup_parts));
       },
       nb::arg("lookup_splitted"), nb::arg("n_lookup_parts"));
 
   m.def(
       "lookup_or_exact",
       [](const std::vector<std::string>& lookups) {
-        return django::native::lookup_or_exact(lookups);
+        return django::native::list_from_strings(
+            django::native::lookup_or_exact(lookups));
       },
       nb::arg("lookups"));
 
@@ -2485,10 +2502,11 @@ NB_MODULE(_native, m) {
       [](const std::vector<std::string>& lookup_parts,
          const std::vector<std::string>& annotation_keys) {
         auto r = django::native::refs_expression_match(lookup_parts, annotation_keys);
+        auto rem = django::native::list_from_strings(std::move(r.remaining));
         if (r.annotation.empty()) {
-          return nb::make_tuple(nb::none(), nb::cast(r.remaining));
+          return nb::make_tuple(nb::none(), rem);
         }
-        return nb::make_tuple(nb::cast(r.annotation), nb::cast(r.remaining));
+        return nb::make_tuple(nb::cast(r.annotation), rem);
       },
       nb::arg("lookup_parts"), nb::arg("annotation_keys"));
 
@@ -2518,7 +2536,8 @@ NB_MODULE(_native, m) {
           post_v.emplace_back(nb::cast<std::string>(nb::str(item.first)),
                               nb::cast<int>(item.second));
         }
-        return django::native::alias_refcount_increased(pre_v, post_v);
+        return django::native::list_from_strings(
+            django::native::alias_refcount_increased(pre_v, post_v));
       },
       nb::arg("pre"), nb::arg("post"));
 
@@ -2780,7 +2799,8 @@ NB_MODULE(_native, m) {
   m.def(
       "keys_without_lookup_sep",
       [](const std::vector<std::string>& keys) {
-        return django::native::keys_without_lookup_sep(keys);
+        return django::native::list_from_strings(
+            django::native::keys_without_lookup_sep(keys));
       },
       nb::arg("keys"));
 
@@ -2831,7 +2851,8 @@ NB_MODULE(_native, m) {
   m.def(
       "prohibited_filter_kwargs",
       [](const std::vector<std::string>& keys) {
-        return django::native::prohibited_filter_kwargs(keys);
+        return django::native::list_from_strings(
+            django::native::prohibited_filter_kwargs(keys));
       },
       nb::arg("keys"));
 

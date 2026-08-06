@@ -7,6 +7,8 @@
 #include <nanobind/stl/string.h>
 #include <nanobind/stl/vector.h>
 
+#include "nb_util.hpp"
+
 #include <algorithm>
 #include <cstdint>
 #include <stdexcept>
@@ -534,7 +536,7 @@ void register_orm_engine(nb::module_& parent) {
       .def("compile_sql", &compile_to_tuple)
       .def("base_attnames",
            [](const django::orm::QuerySet& self) {
-             return self.base_attnames();
+             return django::native::list_from_strings(self.base_attnames());
            })
       .def("related_selects_info",
            [](const django::orm::QuerySet& self) {
