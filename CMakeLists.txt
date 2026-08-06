@@ -67,6 +67,7 @@ set(DJANGO_NATIVE_SOURCES
   cpp/orm_engine/compile.cpp
   cpp/orm_engine/queryset.cpp
   cpp/orm_engine/bind.cpp
+  cpp/wsgi_handler.cpp
   cpp/module.cpp
 )
 

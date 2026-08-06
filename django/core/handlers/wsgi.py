@@ -119,6 +119,16 @@ class WSGIRequest(HttpRequest):
 
 
 class WSGIHandler(base.BaseHandler):
+    """
+    Django's WSGI application.
+
+    Dual-path: when the native extension is available and the handler is
+    lean-eligible (empty middleware hooks, no ATOMIC_REQUESTS), the request
+    loop runs in C++ (``django.native.wsgi_handler_call``). Views remain
+    Python — that is the public API contract. Non-lean configurations use
+    the pure-Python path (``_python_call``).
+    """
+
     request_class = WSGIRequest
 
     def __init__(self, *args, **kwargs):
@@ -126,6 +136,21 @@ class WSGIHandler(base.BaseHandler):
         self.load_middleware()
 
     def __call__(self, environ, start_response):
+        from django import native as _native
+
+        if _native.AVAILABLE and getattr(self, "_middleware_hooks_empty", False):
+            # Prefer C++ eligibility check (mirrors _any_atomic_requests live).
+            try:
+                if _native.wsgi_handler_lean_eligible(self):
+                    return _native.wsgi_handler_call(self, environ, start_response)
+            except Exception:
+                # Fall through to pure Python on unexpected native failure so
+                # dual-path remains safe; re-raise if that also fails.
+                pass
+        return self._python_call(environ, start_response)
+
+    def _python_call(self, environ, start_response):
+        """Stock pure-Python WSGIHandler.__call__ body (dual-path fallback)."""
         set_script_prefix(get_script_name(environ))
         signals.request_started.send(sender=self.__class__, environ=environ)
         request = self.request_class(environ)

@@ -19,6 +19,7 @@
 #include "urlize.hpp"
 #include "urls.hpp"
 #include "validators.hpp"
+#include "wsgi_handler.hpp"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -4142,6 +4143,24 @@ NB_MODULE(_native, m) {
       },
       nb::arg("quoted_table"), nb::arg("quoted_set_cols"),
       nb::arg("quoted_where_col"));
+  // --- WSGI handler (C++ owns the request loop; views stay Python) ----------
+  m.def(
+      "wsgi_handler_lean_eligible",
+      [](nb::handle handler) {
+        return django::native::wsgi_handler_lean_eligible(handler);
+      },
+      nb::arg("handler"),
+      "True when empty middleware hooks and no ATOMIC_REQUESTS.");
+  m.def(
+      "wsgi_handler_call",
+      [](nb::handle handler, nb::handle environ, nb::handle start_response) {
+        return django::native::wsgi_handler_call(handler, environ,
+                                                 start_response);
+      },
+      nb::arg("handler"), nb::arg("environ"), nb::arg("start_response"),
+      "Native WSGIHandler.__call__ body: script prefix, request, "
+      "get_response (Python views), start_response packing.");
+
   m.def(
       "render_fortune_page",
       [](const std::vector<std::pair<std::int64_t, std::string>>& rows) {

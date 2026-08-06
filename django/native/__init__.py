@@ -3058,6 +3058,27 @@ def wsgi_request_path(script_name: str, path_info: str) -> str:
     return fallbacks.wsgi_request_path(script_name, path_info)
 
 
+def wsgi_handler_lean_eligible(handler) -> bool:
+    """True when C++ WSGI loop may run (empty middleware, no ATOMIC_REQUESTS)."""
+    impl = _impl()
+    if impl is not None:
+        return bool(impl.wsgi_handler_lean_eligible(handler))
+    return False
+
+
+def wsgi_handler_call(handler, environ, start_response):
+    """
+    Native WSGIHandler request loop.
+
+    Views remain Python (``handler.get_response``). Raises if the extension
+    is unavailable — callers should dual-path to pure Python.
+    """
+    impl = _impl()
+    if impl is not None:
+        return impl.wsgi_handler_call(handler, environ, start_response)
+    raise RuntimeError("native wsgi_handler_call unavailable")
+
+
 def exception_status_code(kind: str) -> int:
     impl = _impl()
     if impl is not None:
