@@ -1,11 +1,13 @@
 #include "middleware.hpp"
 
-#include "orm.hpp"  // hsts_header_value, https_redirect_url, referrer_policy, xframe, gzip helpers
+#include "orm.hpp"  // hsts, csrf_unmask, session helpers, etc.
+#include "request_utils.hpp"  // is_same_domain
 
 #include <chrono>
 #include <ctime>
 #include <regex>
 #include <sstream>
+#include <utility>
 
 namespace django::native {
 namespace {
@@ -366,6 +368,103 @@ bool csrf_secrets_match(std::string_view request_token, std::string_view csrf_se
             static_cast<unsigned char>(csrf_secret[static_cast<std::size_t>(i)]);
   }
   return diff == 0;
+}
+
+namespace {
+
+// Minimal scheme://netloc split for Origin/Referer (no full URL parser).
+struct OriginParts {
+  std::string scheme;
+  std::string netloc;
+  bool ok = false;
+};
+
+OriginParts split_origin_like(std::string_view url) {
+  OriginParts out;
+  auto scheme_end = url.find("://");
+  if (scheme_end == std::string_view::npos || scheme_end == 0) {
+    return out;
+  }
+  out.scheme = std::string(url.substr(0, scheme_end));
+  std::string_view rest = url.substr(scheme_end + 3);
+  if (rest.empty()) {
+    return out;
+  }
+  // netloc ends at / ? # or end
+  std::size_t i = 0;
+  while (i < rest.size() && rest[i] != '/' && rest[i] != '?' && rest[i] != '#') {
+    ++i;
+  }
+  if (i == 0) {
+    return out;
+  }
+  out.netloc = std::string(rest.substr(0, i));
+  out.ok = !out.scheme.empty() && !out.netloc.empty();
+  return out;
+}
+
+}  // namespace
+
+bool csrf_origin_verified(
+    std::string_view request_origin, std::string_view good_origin,
+    const std::vector<std::string>& exact_origins,
+    const std::vector<std::pair<std::string, std::string>>& subdomain_patterns) {
+  if (request_origin.empty()) {
+    return false;
+  }
+  if (!good_origin.empty() && request_origin == good_origin) {
+    return true;
+  }
+  for (const auto& exact : exact_origins) {
+    if (request_origin == exact) {
+      return true;
+    }
+  }
+  auto parsed = split_origin_like(request_origin);
+  if (!parsed.ok) {
+    return false;
+  }
+  for (const auto& [scheme, host_pat] : subdomain_patterns) {
+    if (scheme == parsed.scheme && is_same_domain(parsed.netloc, host_pat)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::string csrf_check_referer(std::string_view referer_header,
+                               std::string_view good_referer,
+                               const std::vector<std::string>& trusted_hosts) {
+  if (referer_header.empty()) {
+    return "no_referer";
+  }
+  auto ref = split_origin_like(referer_header);
+  if (!ref.ok) {
+    // Also reject if scheme/netloc empty after partial parse
+    return "malformed";
+  }
+  // Lowercase compare for scheme
+  std::string scheme = ref.scheme;
+  for (char& c : scheme) {
+    if (c >= 'A' && c <= 'Z') {
+      c = static_cast<char>(c - 'A' + 'a');
+    }
+  }
+  if (scheme != "https") {
+    return "insecure";
+  }
+  for (const auto& host : trusted_hosts) {
+    if (is_same_domain(ref.netloc, host)) {
+      return {};
+    }
+  }
+  if (good_referer.empty()) {
+    return "bad";
+  }
+  if (!is_same_domain(ref.netloc, good_referer)) {
+    return "bad";
+  }
+  return {};
 }
 
 int auth_login_required_gate(bool login_required,

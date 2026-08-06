@@ -110,6 +110,24 @@ namespace django::native {
                                       std::string_view csrf_secret,
                                       int secret_len, int token_len);
 
+// Origin check (process_view when HTTP_ORIGIN present).
+// good_origin: "https://host" or empty if get_host failed.
+// exact_origins: CSRF_TRUSTED_ORIGINS without wildcards.
+// subdomain_patterns: pairs (scheme, host_pattern) for "*.example.com" style.
+[[nodiscard]] bool csrf_origin_verified(
+    std::string_view request_origin, std::string_view good_origin,
+    const std::vector<std::string>& exact_origins,
+    const std::vector<std::pair<std::string, std::string>>& subdomain_patterns);
+
+// Referer check under HTTPS when Origin is absent.
+// Returns empty string if ok, else a short reason code:
+//   "no_referer" | "malformed" | "insecure" | "bad"
+// good_referer: cookie domain or request host (with port when needed).
+// trusted_hosts: hosts from CSRF_TRUSTED_ORIGINS (netloc without *).
+[[nodiscard]] std::string csrf_check_referer(
+    std::string_view referer_header, std::string_view good_referer,
+    const std::vector<std::string>& trusted_hosts);
+
 // --- Auth -----------------------------------------------------------------
 
 // LoginRequiredMiddleware process_view gate.

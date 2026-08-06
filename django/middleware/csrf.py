@@ -293,7 +293,10 @@ class CsrfViewMiddleware(MiddlewareMixin):
             patch_vary_headers(response, ("Cookie",))
 
     def _origin_verified(self, request):
+        from django import native as _native
+
         request_origin = request.META["HTTP_ORIGIN"]
+        good_origin = ""
         try:
             good_host = request.get_host()
         except DisallowedHost:
@@ -303,8 +306,21 @@ class CsrfViewMiddleware(MiddlewareMixin):
                 "https" if request.is_secure() else "http",
                 good_host,
             )
-            if request_origin == good_origin:
-                return True
+
+        if _native.AVAILABLE:
+            subdomains = []
+            for scheme, hosts in self.allowed_origin_subdomains.items():
+                for host in hosts:
+                    subdomains.append((scheme, host))
+            return _native.csrf_origin_verified(
+                request_origin,
+                good_origin,
+                list(self.allowed_origins_exact),
+                subdomains,
+            )
+
+        if good_origin and request_origin == good_origin:
+            return True
         if request_origin in self.allowed_origins_exact:
             return True
         try:
@@ -319,7 +335,44 @@ class CsrfViewMiddleware(MiddlewareMixin):
         )
 
     def _check_referer(self, request):
+        from django import native as _native
+
         referer = request.META.get("HTTP_REFERER")
+        if _native.AVAILABLE:
+            good_referer = (
+                settings.SESSION_COOKIE_DOMAIN
+                if settings.CSRF_USE_SESSIONS
+                else settings.CSRF_COOKIE_DOMAIN
+            )
+            if good_referer is None:
+                try:
+                    good_referer = request.get_host()
+                except DisallowedHost:
+                    good_referer = ""
+            else:
+                server_port = request.get_port()
+                if server_port not in ("443", "80"):
+                    good_referer = "%s:%s" % (good_referer, server_port)
+            reason = _native.csrf_check_referer(
+                referer or "",
+                good_referer or "",
+                list(self.csrf_trusted_origins_hosts),
+            )
+            if not reason:
+                return
+            if reason == "no_referer":
+                raise RejectRequest(REASON_NO_REFERER)
+            if reason == "malformed":
+                raise RejectRequest(REASON_MALFORMED_REFERER)
+            if reason == "insecure":
+                raise RejectRequest(REASON_INSECURE_REFERER)
+            # bad — include referer URL when possible
+            try:
+                shown = urlsplit(referer).geturl() if referer else ""
+            except ValueError:
+                shown = referer or ""
+            raise RejectRequest(REASON_BAD_REFERER % shown)
+
         if referer is None:
             raise RejectRequest(REASON_NO_REFERER)
 
@@ -362,7 +415,6 @@ class CsrfViewMiddleware(MiddlewareMixin):
 
         if not is_same_domain(referer.netloc, good_referer):
             raise RejectRequest(REASON_BAD_REFERER % referer.geturl())
-
     def _bad_token_message(self, reason, token_source):
         if token_source != "POST":
             # Assume it is a settings.CSRF_HEADER_NAME value.

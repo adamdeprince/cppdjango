@@ -3542,6 +3542,28 @@ NB_MODULE(_native, m) {
       nb::arg("request_token"), nb::arg("csrf_secret"),
       nb::arg("secret_len") = 32, nb::arg("token_len") = 64);
   m.def(
+      "csrf_origin_verified",
+      [](const std::string& request_origin, const std::string& good_origin,
+         const std::vector<std::string>& exact_origins,
+         const std::vector<std::pair<std::string, std::string>>&
+             subdomain_patterns) {
+        return django::native::csrf_origin_verified(
+            request_origin, good_origin, exact_origins, subdomain_patterns);
+      },
+      nb::arg("request_origin"), nb::arg("good_origin") = "",
+      nb::arg("exact_origins") = std::vector<std::string>{},
+      nb::arg("subdomain_patterns") =
+          std::vector<std::pair<std::string, std::string>>{});
+  m.def(
+      "csrf_check_referer",
+      [](const std::string& referer_header, const std::string& good_referer,
+         const std::vector<std::string>& trusted_hosts) {
+        return django::native::csrf_check_referer(referer_header, good_referer,
+                                                  trusted_hosts);
+      },
+      nb::arg("referer_header") = "", nb::arg("good_referer") = "",
+      nb::arg("trusted_hosts") = std::vector<std::string>{});
+  m.def(
       "auth_login_required_gate",
       [](bool login_required, bool is_authenticated) {
         return django::native::auth_login_required_gate(login_required,

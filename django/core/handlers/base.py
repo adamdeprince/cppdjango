@@ -173,36 +173,52 @@ class BaseHandler:
 
     def _build_exact_route_table(self):
         """
-        Load-time map of path_info → view for converter-free root path() routes.
+        Load-time map of path_info → view for converter-free path() routes.
 
-        Used by the native lean get_response to skip URLResolver on static
-        endpoints (e.g. /plaintext, /json). Nested includes and dynamic
-        converters are omitted (resolved in Python as usual).
+        Includes one level of static ``include()`` prefixes (no converters on
+        the include pattern). Used by lean C++ get_response to skip URLResolver
+        on static endpoints (e.g. /plaintext, /api/health).
         """
         from django.urls import get_resolver
-        from django.urls.resolvers import RoutePattern, URLPattern
+        from django.urls.resolvers import RoutePattern, URLPattern, URLResolver
 
         table = {}
+
+        def add_pattern(prefix, pattern):
+            if not isinstance(pattern, URLPattern):
+                return
+            route_pat = pattern.pattern
+            if not isinstance(route_pat, RoutePattern):
+                return
+            if route_pat.converters:
+                return
+            route = str(route_pat)
+            full = prefix + route
+            path_info = full if full.startswith("/") else "/" + full
+            table[path_info] = (
+                pattern.callback,
+                (),
+                dict(pattern.default_args or {}),
+                pattern.name,
+                full.lstrip("/"),
+            )
+
         try:
             resolver = get_resolver()
             for pattern in resolver.url_patterns:
-                if not isinstance(pattern, URLPattern):
-                    continue
-                route_pat = pattern.pattern
-                if not isinstance(route_pat, RoutePattern):
-                    continue
-                if route_pat.converters:
-                    continue
-                route = str(route_pat)
-                # Root URLResolver strips leading '/'; path_info is '/'+route.
-                path_info = route if route.startswith("/") else "/" + route
-                table[path_info] = (
-                    pattern.callback,
-                    (),
-                    dict(pattern.default_args or {}),
-                    pattern.name,
-                    route,
-                )
+                if isinstance(pattern, URLPattern):
+                    add_pattern("", pattern)
+                elif isinstance(pattern, URLResolver):
+                    # One level of include: static RoutePattern prefix only.
+                    inc = pattern.pattern
+                    if not isinstance(inc, RoutePattern) or inc.converters:
+                        continue
+                    prefix = str(inc)
+                    try:
+                        for child in pattern.url_patterns:
+                            add_pattern(prefix, child)
+                    except Exception:
+                        continue
         except Exception:
             return {}
         return table

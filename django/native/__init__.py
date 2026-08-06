@@ -2821,6 +2821,41 @@ def csrf_secrets_match(request_token, csrf_secret, secret_len=32, token_len=64):
     raise RuntimeError("native csrf_secrets_match unavailable")
 
 
+def csrf_origin_verified(
+    request_origin, good_origin="", exact_origins=None, subdomain_patterns=None
+):
+    """True if Origin is the request host or a trusted origin/subdomain."""
+    impl = _impl()
+    if impl is not None:
+        patterns = []
+        for item in subdomain_patterns or ():
+            if isinstance(item, (list, tuple)) and len(item) >= 2:
+                patterns.append((str(item[0]), str(item[1])))
+        return bool(
+            impl.csrf_origin_verified(
+                str(request_origin or ""),
+                str(good_origin or ""),
+                [str(x) for x in (exact_origins or ())],
+                patterns,
+            )
+        )
+    raise RuntimeError("native csrf_origin_verified unavailable")
+
+
+def csrf_check_referer(referer_header="", good_referer="", trusted_hosts=None):
+    """Empty string if Referer ok, else no_referer|malformed|insecure|bad."""
+    impl = _impl()
+    if impl is not None:
+        return str(
+            impl.csrf_check_referer(
+                str(referer_header or ""),
+                str(good_referer or ""),
+                [str(x) for x in (trusted_hosts or ())],
+            )
+        )
+    raise RuntimeError("native csrf_check_referer unavailable")
+
+
 def auth_login_required_gate(login_required, is_authenticated) -> int:
     """0=skip, 1=allow, 2=need redirect."""
     impl = _impl()
