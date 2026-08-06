@@ -865,14 +865,43 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
     throw;
   }
 
-  // request
+  // request — prefer __new__ + lean init (skip Python WSGIRequest.__init__).
   PyObject* request_class =
       PyObject_GetAttr(handler.ptr(), g_lean.name_request_class);
   if (!request_class) {
     Py_DECREF(handler_type);
     throw nb::python_error();
   }
-  PyObject* request_o = call_one(request_class, env);
+  PyObject* request_o = nullptr;
+  {
+    // WSGIRequest.__new__(cls) then C++ lean populate for GET/HEAD empty body.
+    PyObject* new_m = PyObject_GetAttrString(request_class, "__new__");
+    if (new_m) {
+      PyObject* bare = PyObject_CallFunctionObjArgs(new_m, request_class, nullptr);
+      Py_DECREF(new_m);
+      if (bare) {
+        try {
+          if (wsgi_request_try_lean_init(nb::handle(bare), environ)) {
+            request_o = bare;
+          } else {
+            Py_DECREF(bare);
+          }
+        } catch (...) {
+          Py_DECREF(bare);
+          Py_DECREF(request_class);
+          Py_DECREF(handler_type);
+          throw;
+        }
+      } else {
+        PyErr_Clear();
+      }
+    } else {
+      PyErr_Clear();
+    }
+  }
+  if (!request_o) {
+    request_o = call_one(request_class, env);
+  }
   Py_DECREF(request_class);
   if (!request_o) {
     Py_DECREF(handler_type);

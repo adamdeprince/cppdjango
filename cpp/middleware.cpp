@@ -506,17 +506,246 @@ bool is_native_stock_middleware_path(std::string_view dotted_path) noexcept {
 
 namespace {
 
+// Interned ResponseHeaders._store keys (process-lifetime).
+struct HybridHeaderNames {
+  bool ready = false;
+  PyObject* name_headers = nullptr;
+  PyObject* name__store = nullptr;
+  PyObject* name_streaming = nullptr;
+  PyObject* name_content = nullptr;
+  PyObject* name__container = nullptr;
+  PyObject* name_xframe_exempt = nullptr;
+
+  PyObject* lower_xframe = nullptr;
+  PyObject* key_xframe = nullptr;
+  PyObject* lower_content_length = nullptr;
+  PyObject* key_content_length = nullptr;
+  PyObject* lower_xcto = nullptr;
+  PyObject* key_xcto = nullptr;
+  PyObject* lower_sts = nullptr;
+  PyObject* key_sts = nullptr;
+  PyObject* lower_referrer = nullptr;
+  PyObject* key_referrer = nullptr;
+  PyObject* lower_coop = nullptr;
+  PyObject* key_coop = nullptr;
+  PyObject* str_nosniff = nullptr;
+};
+HybridHeaderNames g_hh;
+
+void hybrid_header_names_init() {
+  if (g_hh.ready) {
+    return;
+  }
+  auto intern = [](const char* s) { return PyUnicode_InternFromString(s); };
+  g_hh.name_headers = intern("headers");
+  g_hh.name__store = intern("_store");
+  g_hh.name_streaming = intern("streaming");
+  g_hh.name_content = intern("content");
+  g_hh.name__container = intern("_container");
+  g_hh.name_xframe_exempt = intern("xframe_options_exempt");
+  g_hh.lower_xframe = intern("x-frame-options");
+  g_hh.key_xframe = intern("X-Frame-Options");
+  g_hh.lower_content_length = intern("content-length");
+  g_hh.key_content_length = intern("Content-Length");
+  g_hh.lower_xcto = intern("x-content-type-options");
+  g_hh.key_xcto = intern("X-Content-Type-Options");
+  g_hh.lower_sts = intern("strict-transport-security");
+  g_hh.key_sts = intern("Strict-Transport-Security");
+  g_hh.lower_referrer = intern("referrer-policy");
+  g_hh.key_referrer = intern("Referrer-Policy");
+  g_hh.lower_coop = intern("cross-origin-opener-policy");
+  g_hh.key_coop = intern("Cross-Origin-Opener-Policy");
+  g_hh.str_nosniff = intern("nosniff");
+  g_hh.ready = true;
+}
+
+// response.headers._store or nullptr (exception cleared).
+PyObject* response_header_store(PyObject* response) {
+  hybrid_header_names_init();
+  PyObject* headers = PyObject_GetAttr(response, g_hh.name_headers);
+  if (!headers) {
+    PyErr_Clear();
+    return nullptr;
+  }
+  PyObject* store = PyObject_GetAttr(headers, g_hh.name__store);
+  Py_DECREF(headers);
+  if (!store || !PyDict_Check(store)) {
+    Py_XDECREF(store);
+    PyErr_Clear();
+    return nullptr;
+  }
+  return store;  // new ref
+}
+
+bool store_has(PyObject* store, PyObject* lower_key) {
+  int r = PyDict_Contains(store, lower_key);
+  return r == 1;
+}
+
+// store[lower] = (display_key, value_str) — steals no refs to key objects.
+void store_set(PyObject* store, PyObject* lower_key, PyObject* display_key,
+               std::string_view value) {
+  PyObject* val =
+      PyUnicode_FromStringAndSize(value.data(), static_cast<Py_ssize_t>(value.size()));
+  if (!val) {
+    throw nb::python_error();
+  }
+  PyObject* pair = PyTuple_Pack(2, display_key, val);
+  Py_DECREF(val);
+  if (!pair) {
+    throw nb::python_error();
+  }
+  if (PyDict_SetItem(store, lower_key, pair) < 0) {
+    Py_DECREF(pair);
+    throw nb::python_error();
+  }
+  Py_DECREF(pair);
+}
+
+void store_setdefault(PyObject* store, PyObject* lower_key, PyObject* display_key,
+                      std::string_view value) {
+  if (!store_has(store, lower_key)) {
+    store_set(store, lower_key, display_key, value);
+  }
+}
+
+// Content length without building a Python int via Mapping when possible.
+std::size_t response_content_nbytes(PyObject* response) {
+  hybrid_header_names_init();
+  // Hot path: single-chunk HttpResponse._container
+  PyObject* container = PyObject_GetAttr(response, g_hh.name__container);
+  if (container && PyList_Check(container)) {
+    const Py_ssize_t n = PyList_GET_SIZE(container);
+    if (n == 1) {
+      PyObject* item = PyList_GET_ITEM(container, 0);
+      if (PyBytes_Check(item)) {
+        std::size_t sz = static_cast<std::size_t>(PyBytes_GET_SIZE(item));
+        Py_DECREF(container);
+        return sz;
+      }
+    } else if (n == 0) {
+      Py_DECREF(container);
+      return 0;
+    }
+  } else {
+    PyErr_Clear();
+  }
+  Py_XDECREF(container);
+  PyObject* content = PyObject_GetAttr(response, g_hh.name_content);
+  if (!content) {
+    throw nb::python_error();
+  }
+  Py_ssize_t len = PyObject_Size(content);
+  Py_DECREF(content);
+  if (len < 0) {
+    throw nb::python_error();
+  }
+  return static_cast<std::size_t>(len);
+}
+
 void apply_security_headers(nb::handle response, const nb::dict& actions) {
+  PyObject* store = response_header_store(response.ptr());
+  if (!store) {
+    // Fallback: Python Mapping API
+    nb::dict set_h = nb::cast<nb::dict>(actions["set"]);
+    nb::dict setdef = nb::cast<nb::dict>(actions["setdefault"]);
+    for (nb::handle item : set_h.attr("items")()) {
+      nb::tuple t = nb::cast<nb::tuple>(item);
+      response.attr("headers").attr("__setitem__")(t[0], t[1]);
+    }
+    for (nb::handle item : setdef.attr("items")()) {
+      nb::tuple t = nb::cast<nb::tuple>(item);
+      response.attr("headers").attr("setdefault")(t[0], t[1]);
+    }
+    return;
+  }
   nb::dict set_h = nb::cast<nb::dict>(actions["set"]);
   nb::dict setdef = nb::cast<nb::dict>(actions["setdefault"]);
   for (nb::handle item : set_h.attr("items")()) {
     nb::tuple t = nb::cast<nb::tuple>(item);
-    response.attr("headers").attr("__setitem__")(t[0], t[1]);
+    std::string key = nb::cast<std::string>(nb::str(t[0]));
+    std::string val = nb::cast<std::string>(nb::str(t[1]));
+    std::string lower = key;
+    for (char& c : lower) {
+      if (c >= 'A' && c <= 'Z') {
+        c = static_cast<char>(c - 'A' + 'a');
+      }
+    }
+    PyObject* lk =
+        PyUnicode_FromStringAndSize(lower.data(), static_cast<Py_ssize_t>(lower.size()));
+    PyObject* dk =
+        PyUnicode_FromStringAndSize(key.data(), static_cast<Py_ssize_t>(key.size()));
+    if (!lk || !dk) {
+      Py_XDECREF(lk);
+      Py_XDECREF(dk);
+      Py_DECREF(store);
+      throw nb::python_error();
+    }
+    try {
+      store_set(store, lk, dk, val);
+    } catch (...) {
+      Py_DECREF(lk);
+      Py_DECREF(dk);
+      Py_DECREF(store);
+      throw;
+    }
+    Py_DECREF(lk);
+    Py_DECREF(dk);
   }
   for (nb::handle item : setdef.attr("items")()) {
     nb::tuple t = nb::cast<nb::tuple>(item);
-    response.attr("headers").attr("setdefault")(t[0], t[1]);
+    std::string key = nb::cast<std::string>(nb::str(t[0]));
+    std::string val = nb::cast<std::string>(nb::str(t[1]));
+    std::string lower = key;
+    for (char& c : lower) {
+      if (c >= 'A' && c <= 'Z') {
+        c = static_cast<char>(c - 'A' + 'a');
+      }
+    }
+    PyObject* lk =
+        PyUnicode_FromStringAndSize(lower.data(), static_cast<Py_ssize_t>(lower.size()));
+    PyObject* dk =
+        PyUnicode_FromStringAndSize(key.data(), static_cast<Py_ssize_t>(key.size()));
+    if (!lk || !dk) {
+      Py_XDECREF(lk);
+      Py_XDECREF(dk);
+      Py_DECREF(store);
+      throw nb::python_error();
+    }
+    try {
+      store_setdefault(store, lk, dk, val);
+    } catch (...) {
+      Py_DECREF(lk);
+      Py_DECREF(dk);
+      Py_DECREF(store);
+      throw;
+    }
+    Py_DECREF(lk);
+    Py_DECREF(dk);
   }
+  Py_DECREF(store);
+}
+
+// True when process_request cannot produce a redirect (bench / common defaults).
+bool cfg_skip_process_request(nb::dict cfg) {
+  if (cfg.contains("skip_process_request") &&
+      !cfg["skip_process_request"].is_none()) {
+    return nb::cast<bool>(cfg["skip_process_request"]);
+  }
+  bool need = false;
+  if (cfg.contains("security")) {
+    nb::dict sec = nb::cast<nb::dict>(cfg["security"]);
+    if (sec.contains("redirect") && nb::cast<bool>(sec["redirect"])) {
+      need = true;
+    }
+  }
+  if (cfg.contains("common")) {
+    nb::dict common = nb::cast<nb::dict>(cfg["common"]);
+    if (common.contains("prepend_www") && nb::cast<bool>(common["prepend_www"])) {
+      need = true;
+    }
+  }
+  return !need;
 }
 
 }  // namespace
@@ -682,73 +911,162 @@ nb::object hybrid_process_request(nb::dict cfg, nb::handle request) {
 
 nb::object hybrid_process_response(nb::dict cfg, nb::handle request,
                                    nb::handle response) {
-  auto is_secure = [&]() {
-    return nb::cast<bool>(request.attr("is_secure")());
-  };
-  auto has_header = [](nb::handle resp, const char* name) {
-    return nb::cast<bool>(resp.attr("__contains__")(name));
-  };
+  hybrid_header_names_init();
+  PyObject* resp = response.ptr();
+  PyObject* store = response_header_store(resp);
 
-  // X-Frame-Options first (outermost response among header mw)
+  // Fallback to Mapping API if headers layout is unexpected.
+  if (!store) {
+    auto is_secure = [&]() {
+      return nb::cast<bool>(request.attr("is_secure")());
+    };
+    auto has_header = [](nb::handle r, const char* name) {
+      return nb::cast<bool>(r.attr("__contains__")(name));
+    };
+    if (cfg.contains("xframe")) {
+      nb::dict xf = nb::cast<nb::dict>(cfg["xframe"]);
+      bool has = !response.attr("get")("X-Frame-Options").is_none();
+      bool exempt = false;
+      if (nb::hasattr(response, "xframe_options_exempt")) {
+        exempt = nb::cast<bool>(response.attr("xframe_options_exempt"));
+      }
+      auto val = xframe_process_response(
+          has, exempt, nb::cast<std::string>(xf["setting_value"]));
+      if (val) {
+        response.attr("headers").attr("__setitem__")(
+            "X-Frame-Options", nb::str(val->c_str(), val->size()));
+      }
+    }
+    if (cfg.contains("common")) {
+      nb::dict common = nb::cast<nb::dict>(cfg["common"]);
+      bool do_cl = !common.contains("content_length") ||
+                   nb::cast<bool>(common["content_length"]);
+      if (do_cl) {
+        bool streaming = nb::cast<bool>(response.attr("streaming"));
+        std::size_t clen = 0;
+        if (!streaming) {
+          clen = response_content_nbytes(resp);
+        }
+        auto cl = common_content_length_header(
+            streaming, has_header(response, "Content-Length"), clen);
+        if (cl) {
+          response.attr("headers").attr("__setitem__")(
+              "Content-Length", nb::str(cl->c_str(), cl->size()));
+        }
+      }
+    }
+    if (cfg.contains("security")) {
+      nb::dict sec = nb::cast<nb::dict>(cfg["security"]);
+      nb::dict actions = security_process_response(
+          is_secure(), has_header(response, "Strict-Transport-Security"),
+          nb::cast<int>(sec["sts_seconds"]),
+          nb::cast<bool>(sec["sts_include_subdomains"]),
+          nb::cast<bool>(sec["sts_preload"]),
+          nb::cast<bool>(sec["content_type_nosniff"]),
+          has_header(response, "X-Content-Type-Options"),
+          sec.contains("referrer_policy") ? nb::handle(sec["referrer_policy"])
+                                          : nb::handle(nb::none()),
+          has_header(response, "Referrer-Policy"),
+          sec.contains("cross_origin_opener_policy")
+              ? nb::handle(sec["cross_origin_opener_policy"])
+              : nb::handle(nb::none()),
+          has_header(response, "Cross-Origin-Opener-Policy"));
+      apply_security_headers(response, actions);
+    }
+    return nb::borrow(response);
+  }
+
+  // --- Fast path: mutate headers._store directly --------------------------
+  // X-Frame-Options (outermost among header mw)
   if (cfg.contains("xframe")) {
     nb::dict xf = nb::cast<nb::dict>(cfg["xframe"]);
-    bool has = !response.attr("get")("X-Frame-Options").is_none();
+    bool has = store_has(store, g_hh.lower_xframe);
     bool exempt = false;
-    if (nb::hasattr(response, "xframe_options_exempt")) {
-      exempt = nb::cast<bool>(response.attr("xframe_options_exempt"));
+    PyObject* ex = PyObject_GetAttr(resp, g_hh.name_xframe_exempt);
+    if (ex) {
+      exempt = PyObject_IsTrue(ex) == 1;
+      Py_DECREF(ex);
+    } else {
+      PyErr_Clear();
     }
     auto val = xframe_process_response(
         has, exempt, nb::cast<std::string>(xf["setting_value"]));
     if (val) {
-      response.attr("headers").attr("__setitem__")(
-          "X-Frame-Options", nb::str(val->c_str(), val->size()));
+      store_set(store, g_hh.lower_xframe, g_hh.key_xframe, *val);
     }
   }
 
   // Content-Length
   if (cfg.contains("common")) {
     nb::dict common = nb::cast<nb::dict>(cfg["common"]);
-    bool do_cl = true;
-    if (common.contains("content_length")) {
-      do_cl = nb::cast<bool>(common["content_length"]);
-    }
+    bool do_cl = !common.contains("content_length") ||
+                 nb::cast<bool>(common["content_length"]);
     if (do_cl) {
-      bool streaming = nb::cast<bool>(response.attr("streaming"));
+      bool streaming = false;
+      PyObject* st = PyObject_GetAttr(resp, g_hh.name_streaming);
+      if (st) {
+        streaming = PyObject_IsTrue(st) == 1;
+        Py_DECREF(st);
+      } else {
+        PyErr_Clear();
+      }
       std::size_t clen = 0;
       if (!streaming) {
-        clen = static_cast<std::size_t>(
-            nb::len(nb::handle(response.attr("content"))));
+        clen = response_content_nbytes(resp);
       }
       auto cl = common_content_length_header(
-          streaming,
-          nb::cast<bool>(response.attr("has_header")("Content-Length")), clen);
+          streaming, store_has(store, g_hh.lower_content_length), clen);
       if (cl) {
-        response.attr("headers").attr("__setitem__")(
-            "Content-Length", nb::str(cl->c_str(), cl->size()));
+        store_set(store, g_hh.lower_content_length, g_hh.key_content_length,
+                  *cl);
       }
     }
   }
 
-  // Security headers
+  // Security headers — inline hot path (skip is_secure when HSTS off).
   if (cfg.contains("security")) {
     nb::dict sec = nb::cast<nb::dict>(cfg["security"]);
-    nb::dict actions = security_process_response(
-        is_secure(), has_header(response, "Strict-Transport-Security"),
-        nb::cast<int>(sec["sts_seconds"]),
-        nb::cast<bool>(sec["sts_include_subdomains"]),
-        nb::cast<bool>(sec["sts_preload"]),
-        nb::cast<bool>(sec["content_type_nosniff"]),
-        has_header(response, "X-Content-Type-Options"),
-        sec.contains("referrer_policy") ? nb::handle(sec["referrer_policy"])
-                                        : nb::handle(nb::none()),
-        has_header(response, "Referrer-Policy"),
-        sec.contains("cross_origin_opener_policy")
-            ? nb::handle(sec["cross_origin_opener_policy"])
-            : nb::handle(nb::none()),
-        has_header(response, "Cross-Origin-Opener-Policy"));
-    apply_security_headers(response, actions);
+    const int sts_seconds = nb::cast<int>(sec["sts_seconds"]);
+    const bool nosniff = nb::cast<bool>(sec["content_type_nosniff"]);
+    const bool has_ref = sec.contains("referrer_policy") &&
+                         !sec["referrer_policy"].is_none();
+    const bool has_coop = sec.contains("cross_origin_opener_policy") &&
+                          !sec["cross_origin_opener_policy"].is_none();
+
+    if (sts_seconds > 0) {
+      bool is_secure = nb::cast<bool>(request.attr("is_secure")());
+      if (is_secure && !store_has(store, g_hh.lower_sts)) {
+        std::string hsts = hsts_header_value(
+            sts_seconds, nb::cast<bool>(sec["sts_include_subdomains"]),
+            nb::cast<bool>(sec["sts_preload"]));
+        store_set(store, g_hh.lower_sts, g_hh.key_sts, hsts);
+      }
+    }
+    if (nosniff) {
+      store_setdefault(store, g_hh.lower_xcto, g_hh.key_xcto, "nosniff");
+    }
+    if (has_ref && !store_has(store, g_hh.lower_referrer)) {
+      // Rare on TE floor (usually None); fall back to full planner.
+      nb::dict actions = security_process_response(
+          false, true, 0, false, false, false, true,
+          nb::handle(sec["referrer_policy"]), false, nb::none(), true);
+      // Only apply referrer from setdefault.
+      nb::dict setdef = nb::cast<nb::dict>(actions["setdefault"]);
+      if (setdef.contains("Referrer-Policy")) {
+        store_set(store, g_hh.lower_referrer, g_hh.key_referrer,
+                  nb::cast<std::string>(nb::str(setdef["Referrer-Policy"])));
+      }
+    }
+    if (has_coop && !store_has(store, g_hh.lower_coop)) {
+      std::string coop =
+          nb::cast<std::string>(nb::str(sec["cross_origin_opener_policy"]));
+      if (!coop.empty()) {
+        store_set(store, g_hh.lower_coop, g_hh.key_coop, coop);
+      }
+    }
   }
 
+  Py_DECREF(store);
   return nb::borrow(response);
 }
 
@@ -864,24 +1182,38 @@ std::optional<nb::object> hybrid_exact_route_view(nb::dict bits,
 nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
                              nb::handle get_response) {
   // --- Security / Common process_request ---------------------------------
-  {
+  // Load-time skip when SSL redirect and PREPEND_WWW are both off (bench).
+  if (!cfg_skip_process_request(cfg)) {
     nb::object early = hybrid_process_request(cfg, request);
     if (!early.is_none()) {
       return early;
     }
   }
 
+  // Cookie header: META is the environ dict on WSGIRequest — C API get.
   nb::object meta = request.attr("META");
   std::string http_cookie;
-  try {
-    if (nb::hasattr(meta, "get")) {
-      nb::object raw = meta.attr("get")("HTTP_COOKIE", "");
-      if (!raw.is_none()) {
-        http_cookie = nb::cast<std::string>(nb::str(raw));
+  {
+    PyObject* m = meta.ptr();
+    if (PyDict_Check(m)) {
+      PyObject* raw = PyDict_GetItemString(m, "HTTP_COOKIE");  // borrowed
+      if (raw && raw != Py_None && PyUnicode_Check(raw)) {
+        Py_ssize_t n = 0;
+        const char* s = PyUnicode_AsUTF8AndSize(raw, &n);
+        if (s && n > 0) {
+          http_cookie.assign(s, static_cast<std::size_t>(n));
+        }
+      }
+    } else {
+      try {
+        nb::object raw = meta.attr("get")("HTTP_COOKIE", "");
+        if (!raw.is_none()) {
+          http_cookie = nb::cast<std::string>(nb::str(raw));
+        }
+      } catch (...) {
+        http_cookie.clear();
       }
     }
-  } catch (...) {
-    http_cookie.clear();
   }
 
   // --- Session attach ------------------------------------------------------
@@ -940,8 +1272,21 @@ nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
             unmasked = csrf_unmask_token(*secret, secret_len);
           }
           if (!unmasked.empty()) {
-            meta.attr("__setitem__")(
-                "CSRF_COOKIE", nb::str(unmasked.c_str(), unmasked.size()));
+            if (PyDict_Check(meta.ptr())) {
+              PyObject* v = PyUnicode_FromStringAndSize(
+                  unmasked.c_str(), static_cast<Py_ssize_t>(unmasked.size()));
+              if (!v) {
+                throw nb::python_error();
+              }
+              if (PyDict_SetItemString(meta.ptr(), "CSRF_COOKIE", v) < 0) {
+                Py_DECREF(v);
+                throw nb::python_error();
+              }
+              Py_DECREF(v);
+            } else {
+              meta.attr("__setitem__")(
+                  "CSRF_COOKIE", nb::str(unmasked.c_str(), unmasked.size()));
+            }
           }
         } else if (bits.contains("csrf_invalid_cookie") &&
                    !bits["csrf_invalid_cookie"].is_none()) {
@@ -999,11 +1344,17 @@ nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
   if (has_csrf && bits.contains("csrf_process_response") &&
       !bits["csrf_process_response"].is_none()) {
     bool needs = false;
-    try {
-      nb::object flag = meta.attr("get")("CSRF_COOKIE_NEEDS_UPDATE", false);
-      needs = nb::cast<bool>(flag);
-    } catch (...) {
-      needs = false;
+    if (PyDict_Check(meta.ptr())) {
+      PyObject* flag =
+          PyDict_GetItemString(meta.ptr(), "CSRF_COOKIE_NEEDS_UPDATE");
+      needs = flag && PyObject_IsTrue(flag) == 1;
+    } else {
+      try {
+        nb::object flag = meta.attr("get")("CSRF_COOKIE_NEEDS_UPDATE", false);
+        needs = nb::cast<bool>(flag);
+      } catch (...) {
+        needs = false;
+      }
     }
     if (needs) {
       response = bits["csrf_process_response"](request, response);

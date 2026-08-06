@@ -538,9 +538,11 @@ class BaseHandler:
                     self.adapt_method_mode(False, mw.process_exception)
                 )
 
+        ssl_redirect = bool(settings.SECURE_SSL_REDIRECT)
+        prepend_www = bool(settings.PREPEND_WWW)
         cfg = {
             "security": {
-                "redirect": bool(settings.SECURE_SSL_REDIRECT),
+                "redirect": ssl_redirect,
                 "redirect_host": settings.SECURE_SSL_HOST or "",
                 "exempt_patterns": list(settings.SECURE_REDIRECT_EXEMPT or ()),
                 "sts_seconds": int(settings.SECURE_HSTS_SECONDS or 0),
@@ -555,7 +557,7 @@ class BaseHandler:
                 ),
             },
             "common": {
-                "prepend_www": bool(settings.PREPEND_WWW),
+                "prepend_www": prepend_www,
                 "content_length": True,
             },
             "xframe": {
@@ -570,6 +572,13 @@ class BaseHandler:
             del cfg["common"]
         if self._HYBRID_XFRAME not in path_set:
             del cfg["xframe"]
+        # Load-time: skip Security/Common process_request when neither can
+        # produce a redirect (common TE / production-behind-TLS defaults).
+        need_req = (
+            (self._HYBRID_SECURITY in path_set and ssl_redirect)
+            or (self._HYBRID_COMMON in path_set and prepend_www)
+        )
+        cfg["skip_process_request"] = not need_req
 
         from django.contrib.auth.middleware import auser, get_user
         from django.contrib.auth.models import AnonymousUser
