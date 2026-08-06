@@ -263,4 +263,255 @@ nb::tuple session_cookie_expiry(bool expire_at_browser_close, int expiry_age_sec
                         nb::str(expires.c_str(), expires.size()));
 }
 
+nb::dict session_process_response_plan(bool accessed, bool modified, bool empty,
+                                       bool cookie_in_request,
+                                       bool save_every_request, int status_code,
+                                       bool expire_at_browser_close,
+                                       int expiry_age_seconds, double now_unix) {
+  nb::dict out;
+  out["need_vary"] = false;
+  out["saveable"] = false;
+  out["max_age"] = nb::none();
+  out["expires"] = nb::none();
+
+  if (cookie_in_request && empty) {
+    out["action"] = "delete";
+    out["need_vary"] = true;
+    return out;
+  }
+
+  out["need_vary"] = accessed;
+  if ((modified || save_every_request) && !empty) {
+    out["action"] = "save";
+    bool saveable = http_status_session_saveable(status_code);
+    out["saveable"] = saveable;
+    if (!expire_at_browser_close) {
+      auto exp = session_cookie_expiry(false, expiry_age_seconds, now_unix);
+      out["max_age"] = exp[0];
+      out["expires"] = exp[1];
+    }
+    // Python sets need_vary when a session cookie is written.
+    if (saveable) {
+      out["need_vary"] = true;
+    }
+    return out;
+  }
+  out["action"] = "noop";
+  return out;
+}
+
+std::optional<std::string> session_load_key(std::string_view cookie_value,
+                                            int min_length) {
+  if (session_key_missing(cookie_value)) {
+    return std::nullopt;
+  }
+  if (!is_valid_session_key(cookie_value, min_length, true)) {
+    return std::nullopt;
+  }
+  return std::string(cookie_value);
+}
+
+bool csrf_is_safe_method(std::string_view method) noexcept {
+  // GET, HEAD, OPTIONS, TRACE
+  auto eq = [](std::string_view a, const char* b) {
+    if (a.size() != std::char_traits<char>::length(b)) {
+      return false;
+    }
+    for (std::size_t i = 0; i < a.size(); ++i) {
+      char c = a[i];
+      if (c >= 'a' && c <= 'z') {
+        c = static_cast<char>(c - 'a' + 'A');
+      }
+      if (c != b[i]) {
+        return false;
+      }
+    }
+    return true;
+  };
+  return eq(method, "GET") || eq(method, "HEAD") || eq(method, "OPTIONS") ||
+         eq(method, "TRACE");
+}
+
+std::string csrf_process_view_gate(bool csrf_processing_done, bool csrf_exempt,
+                                   std::string_view method, bool dont_enforce) {
+  if (csrf_processing_done) {
+    return "done";
+  }
+  if (csrf_exempt) {
+    return "exempt";
+  }
+  if (csrf_is_safe_method(method) || dont_enforce) {
+    return "accept";
+  }
+  return "check";
+}
+
+bool csrf_secrets_match(std::string_view request_token, std::string_view csrf_secret,
+                        int secret_len, int token_len) {
+  if (secret_len <= 0) {
+    return false;
+  }
+  std::string tok(request_token);
+  if (static_cast<int>(tok.size()) == token_len) {
+    tok = csrf_unmask_token(tok, secret_len);
+  }
+  if (static_cast<int>(tok.size()) != secret_len ||
+      static_cast<int>(csrf_secret.size()) != secret_len) {
+    return false;
+  }
+  // constant-time compare
+  unsigned char diff = 0;
+  for (int i = 0; i < secret_len; ++i) {
+    diff |= static_cast<unsigned char>(tok[static_cast<std::size_t>(i)]) ^
+            static_cast<unsigned char>(csrf_secret[static_cast<std::size_t>(i)]);
+  }
+  return diff == 0;
+}
+
+int auth_login_required_gate(bool login_required,
+                             bool is_authenticated) noexcept {
+  if (!login_required) {
+    return 0;  // skip
+  }
+  if (is_authenticated) {
+    return 1;  // allow
+  }
+  return 2;  // redirect
+}
+
+bool is_native_stock_middleware_path(std::string_view dotted_path) noexcept {
+  return dotted_path == "django.middleware.security.SecurityMiddleware" ||
+         dotted_path == "django.middleware.clickjacking.XFrameOptionsMiddleware" ||
+         dotted_path == "django.middleware.common.CommonMiddleware" ||
+         dotted_path == "django.middleware.gzip.GZipMiddleware" ||
+         dotted_path == "django.middleware.http.ConditionalGetMiddleware" ||
+         dotted_path ==
+             "django.contrib.sessions.middleware.SessionMiddleware" ||
+         dotted_path ==
+             "django.contrib.auth.middleware.AuthenticationMiddleware" ||
+         dotted_path == "django.middleware.csrf.CsrfViewMiddleware";
+}
+
+namespace {
+
+void apply_security_headers(nb::handle response, const nb::dict& actions) {
+  nb::dict set_h = nb::cast<nb::dict>(actions["set"]);
+  nb::dict setdef = nb::cast<nb::dict>(actions["setdefault"]);
+  for (nb::handle item : set_h.attr("items")()) {
+    nb::tuple t = nb::cast<nb::tuple>(item);
+    response.attr("headers").attr("__setitem__")(t[0], t[1]);
+  }
+  for (nb::handle item : setdef.attr("items")()) {
+    nb::tuple t = nb::cast<nb::tuple>(item);
+    response.attr("headers").attr("setdefault")(t[0], t[1]);
+  }
+}
+
+}  // namespace
+
+nb::object native_stock_chain_call(nb::sequence specs, nb::handle request,
+                                   nb::handle get_response) {
+  // specs: list of dicts with "type" and type-specific config.
+  // process_request phase (forward). Session/auth process_request that need
+  // Python objects (SessionStore, SimpleLazyObject) are applied by the
+  // Python wrapper *before* this call; here we only run pure C++ request steps.
+  std::vector<nb::dict> spec_list;
+  for (nb::handle h : specs) {
+    spec_list.push_back(nb::cast<nb::dict>(h));
+  }
+
+  auto is_secure = [&]() {
+    return nb::cast<bool>(request.attr("is_secure")());
+  };
+  auto path_lstrip = [&]() {
+    return nb::cast<std::string>(
+        nb::str(request.attr("path")).attr("lstrip")("/"));
+  };
+  auto full_path = [&]() {
+    return nb::cast<std::string>(request.attr("get_full_path")());
+  };
+  auto host = [&]() {
+    return nb::cast<std::string>(request.attr("get_host")());
+  };
+  auto has_header = [](nb::handle response, const char* name) {
+    return nb::cast<bool>(response.attr("__contains__")(name));
+  };
+
+  for (const auto& spec : spec_list) {
+    std::string type = nb::cast<std::string>(spec["type"]);
+    if (type == "security") {
+      std::vector<std::string> pats;
+      if (spec.contains("exempt_patterns")) {
+        for (nb::handle p : spec["exempt_patterns"]) {
+          pats.push_back(nb::cast<std::string>(p));
+        }
+      }
+      auto url = security_process_request(
+          nb::cast<bool>(spec["redirect"]), is_secure(), path_lstrip(),
+          full_path(), nb::cast<std::string>(spec["redirect_host"]), host(),
+          pats);
+      if (url) {
+        nb::object cls = nb::module_::import_("django.http")
+                             .attr("HttpResponsePermanentRedirect");
+        return cls(nb::str(url->c_str(), url->size()));
+      }
+    }
+  }
+
+  // View + process_view middleware still behind get_response (Python).
+  nb::object response = get_response(request);
+
+  // process_response reverse
+  for (auto it = spec_list.rbegin(); it != spec_list.rend(); ++it) {
+    const auto& spec = *it;
+    std::string type = nb::cast<std::string>(spec["type"]);
+    if (type == "security") {
+      nb::dict actions = security_process_response(
+          is_secure(), has_header(response, "Strict-Transport-Security"),
+          nb::cast<int>(spec["sts_seconds"]),
+          nb::cast<bool>(spec["sts_include_subdomains"]),
+          nb::cast<bool>(spec["sts_preload"]),
+          nb::cast<bool>(spec["content_type_nosniff"]),
+          has_header(response, "X-Content-Type-Options"),
+          spec.contains("referrer_policy") ? nb::handle(spec["referrer_policy"])
+                                           : nb::handle(nb::none()),
+          has_header(response, "Referrer-Policy"),
+          spec.contains("cross_origin_opener_policy")
+              ? nb::handle(spec["cross_origin_opener_policy"])
+              : nb::handle(nb::none()),
+          has_header(response, "Cross-Origin-Opener-Policy"));
+      apply_security_headers(response, actions);
+    } else if (type == "xframe") {
+      bool has = !response.attr("get")("X-Frame-Options").is_none();
+      bool exempt = false;
+      if (nb::hasattr(response, "xframe_options_exempt")) {
+        exempt = nb::cast<bool>(response.attr("xframe_options_exempt"));
+      }
+      auto val = xframe_process_response(
+          has, exempt, nb::cast<std::string>(spec["setting_value"]));
+      if (val) {
+        response.attr("headers").attr("__setitem__")(
+            "X-Frame-Options", nb::str(val->c_str(), val->size()));
+      }
+    } else if (type == "common") {
+      bool streaming = nb::cast<bool>(response.attr("streaming"));
+      std::size_t clen = 0;
+      if (!streaming) {
+        clen = static_cast<std::size_t>(
+            nb::len(nb::handle(response.attr("content"))));
+      }
+      auto cl = common_content_length_header(
+          streaming,
+          nb::cast<bool>(response.attr("has_header")("Content-Length")), clen);
+      if (cl) {
+        response.attr("headers").attr("__setitem__")(
+            "Content-Length", nb::str(cl->c_str(), cl->size()));
+      }
+    }
+    // gzip still needs Python zlib — not in pure C++ chain body
+  }
+
+  return response;
+}
+
 }  // namespace django::native

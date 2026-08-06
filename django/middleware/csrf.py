@@ -189,7 +189,11 @@ class CsrfViewMiddleware(MiddlewareMixin):
 
     This middleware should be used in conjunction with the {% csrf_token %}
     template tag.
+
+    Dual-path: process_view early gate and token secret compare can run in C++.
     """
+
+    native_capable = True
 
     @cached_property
     def csrf_trusted_origins_hosts(self):
@@ -414,7 +418,18 @@ class CsrfViewMiddleware(MiddlewareMixin):
             reason = self._bad_token_message(exc.reason, token_source)
             raise RejectRequest(reason)
 
-        if not _does_token_match(request_csrf_token, csrf_secret):
+        from django import native as _native
+
+        if _native.AVAILABLE:
+            match = _native.csrf_secrets_match(
+                str(request_csrf_token),
+                str(csrf_secret),
+                CSRF_SECRET_LENGTH,
+                CSRF_TOKEN_LENGTH,
+            )
+        else:
+            match = _does_token_match(request_csrf_token, csrf_secret)
+        if not match:
             reason = self._bad_token_message("incorrect", token_source)
             raise RejectRequest(reason)
 
@@ -432,25 +447,38 @@ class CsrfViewMiddleware(MiddlewareMixin):
                 request.META["CSRF_COOKIE"] = csrf_secret
 
     def process_view(self, request, callback, callback_args, callback_kwargs):
-        if getattr(request, "csrf_processing_done", False):
-            return None
+        from django import native as _native
 
-        # Wait until request.META["CSRF_COOKIE"] has been manipulated before
-        # bailing out, so that get_token still works
-        if getattr(callback, "csrf_exempt", False):
-            return None
+        # Fat native gate: done / exempt / accept (safe methods) / check.
+        if _native.AVAILABLE:
+            gate = _native.csrf_process_view_gate(
+                bool(getattr(request, "csrf_processing_done", False)),
+                bool(getattr(callback, "csrf_exempt", False)),
+                request.method or "",
+                bool(getattr(request, "_dont_enforce_csrf_checks", False)),
+            )
+            if gate == "done" or gate == "exempt":
+                return None
+            if gate == "accept":
+                return self._accept(request)
+            # gate == "check" → origin/referer/token below
+        else:
+            if getattr(request, "csrf_processing_done", False):
+                return None
 
-        # Assume that anything not defined as 'safe' by RFC 9110 needs
-        # protection
-        if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
-            return self._accept(request)
+            # Wait until request.META["CSRF_COOKIE"] has been manipulated before
+            # bailing out, so that get_token still works
+            if getattr(callback, "csrf_exempt", False):
+                return None
 
-        if getattr(request, "_dont_enforce_csrf_checks", False):
-            # Mechanism to turn off CSRF checks for test suite. It comes after
-            # the creation of CSRF cookies, so that everything else continues
-            # to work exactly the same (e.g. cookies are sent, etc.), but
-            # before any branches that call the _reject method.
-            return self._accept(request)
+            # Assume that anything not defined as 'safe' by RFC 9110 needs
+            # protection
+            if request.method in ("GET", "HEAD", "OPTIONS", "TRACE"):
+                return self._accept(request)
+
+            if getattr(request, "_dont_enforce_csrf_checks", False):
+                # Mechanism to turn off CSRF checks for test suite.
+                return self._accept(request)
 
         # Reject the request if the Origin header doesn't match an allowed
         # value.

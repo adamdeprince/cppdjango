@@ -3490,6 +3490,77 @@ NB_MODULE(_native, m) {
       },
       nb::arg("expire_at_browser_close"), nb::arg("expiry_age_seconds"),
       nb::arg("now_unix"));
+  m.def(
+      "session_process_response_plan",
+      [](bool accessed, bool modified, bool empty, bool cookie_in_request,
+         bool save_every_request, int status_code, bool expire_at_browser_close,
+         int expiry_age_seconds, double now_unix) {
+        return django::native::session_process_response_plan(
+            accessed, modified, empty, cookie_in_request, save_every_request,
+            status_code, expire_at_browser_close, expiry_age_seconds, now_unix);
+      },
+      nb::arg("accessed"), nb::arg("modified"), nb::arg("empty"),
+      nb::arg("cookie_in_request"), nb::arg("save_every_request"),
+      nb::arg("status_code"), nb::arg("expire_at_browser_close"),
+      nb::arg("expiry_age_seconds"), nb::arg("now_unix"));
+  m.def(
+      "session_load_key",
+      [](nb::handle cookie_value, int min_length) -> nb::object {
+        if (cookie_value.is_none()) {
+          return nb::none();
+        }
+        std::string v = nb::cast<std::string>(nb::str(cookie_value));
+        auto key = django::native::session_load_key(v, min_length);
+        if (!key) {
+          return nb::none();
+        }
+        return nb::str(key->c_str(), key->size());
+      },
+      nb::arg("cookie_value"), nb::arg("min_length") = 8);
+  m.def(
+      "csrf_process_view_gate",
+      [](bool csrf_processing_done, bool csrf_exempt, const std::string& method,
+         bool dont_enforce) {
+        return django::native::csrf_process_view_gate(
+            csrf_processing_done, csrf_exempt, method, dont_enforce);
+      },
+      nb::arg("csrf_processing_done"), nb::arg("csrf_exempt"), nb::arg("method"),
+      nb::arg("dont_enforce"));
+  m.def(
+      "csrf_is_safe_method",
+      [](const std::string& method) {
+        return django::native::csrf_is_safe_method(method);
+      },
+      nb::arg("method"));
+  m.def(
+      "csrf_secrets_match",
+      [](const std::string& request_token, const std::string& csrf_secret,
+         int secret_len, int token_len) {
+        return django::native::csrf_secrets_match(request_token, csrf_secret,
+                                                  secret_len, token_len);
+      },
+      nb::arg("request_token"), nb::arg("csrf_secret"),
+      nb::arg("secret_len") = 32, nb::arg("token_len") = 64);
+  m.def(
+      "auth_login_required_gate",
+      [](bool login_required, bool is_authenticated) {
+        return django::native::auth_login_required_gate(login_required,
+                                                        is_authenticated);
+      },
+      nb::arg("login_required"), nb::arg("is_authenticated"));
+  m.def(
+      "is_native_stock_middleware_path",
+      [](const std::string& path) {
+        return django::native::is_native_stock_middleware_path(path);
+      },
+      nb::arg("dotted_path"));
+  m.def(
+      "native_stock_chain_call",
+      [](nb::sequence specs, nb::handle request, nb::handle get_response) {
+        return django::native::native_stock_chain_call(specs, request,
+                                                       get_response);
+      },
+      nb::arg("specs"), nb::arg("request"), nb::arg("get_response"));
 
   m.def("message_tags_join",
         [](const std::string& extra_tags, const std::string& level_tag) {

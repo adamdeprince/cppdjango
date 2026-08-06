@@ -79,4 +79,57 @@ namespace django::native {
                                               int expiry_age_seconds,
                                               double now_unix);
 
+// Session process_response plan (one crossing). Returns dict:
+//   action: "noop" | "delete" | "save"
+//   need_vary: bool
+//   saveable: bool  (only for save)
+//   max_age: int|None, expires: str|None
+[[nodiscard]] nb::dict session_process_response_plan(
+    bool accessed, bool modified, bool empty, bool cookie_in_request,
+    bool save_every_request, int status_code, bool expire_at_browser_close,
+    int expiry_age_seconds, double now_unix);
+
+// Normalize/validate session key from cookie; empty → invalid.
+[[nodiscard]] std::optional<std::string> session_load_key(
+    std::string_view cookie_value, int min_length = 8);
+
+// --- CSRF -----------------------------------------------------------------
+
+// Early process_view gate (before origin/referer/token).
+// Returns: "done" | "exempt" | "accept" | "check"
+[[nodiscard]] std::string csrf_process_view_gate(bool csrf_processing_done,
+                                                 bool csrf_exempt,
+                                                 std::string_view method,
+                                                 bool dont_enforce);
+
+// Safe methods per RFC 9110 as used by Django CSRF.
+[[nodiscard]] bool csrf_is_safe_method(std::string_view method) noexcept;
+
+// Token compare after format validation (handles masked token_len secrets).
+[[nodiscard]] bool csrf_secrets_match(std::string_view request_token,
+                                      std::string_view csrf_secret,
+                                      int secret_len, int token_len);
+
+// --- Auth -----------------------------------------------------------------
+
+// LoginRequiredMiddleware process_view gate.
+// 0 = skip (not required), 1 = allow (authenticated), 2 = need redirect
+[[nodiscard]] int auth_login_required_gate(bool login_required,
+                                           bool is_authenticated) noexcept;
+
+// --- Pure-C++ stock chain (only when every middleware is stock-native) ----
+
+// specs: list of dicts { "type": "security"|"xframe"|"common"|"gzip", ...config }
+// get_response: Python callable(request) -> response (view layer; may include
+// process_view middleware still in Python).
+// Runs process_request forward, get_response, process_response reverse.
+// Returns response or raises into Python.
+[[nodiscard]] nb::object native_stock_chain_call(nb::sequence specs,
+                                                 nb::handle request,
+                                                 nb::handle get_response);
+
+// True if path is a known fully-native stock middleware class path.
+[[nodiscard]] bool is_native_stock_middleware_path(
+    std::string_view dotted_path) noexcept;
+
 }  // namespace django::native

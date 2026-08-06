@@ -2749,6 +2749,111 @@ def session_cookie_expiry(expire_at_browser_close, expiry_age_seconds, now_unix)
     raise RuntimeError("native session_cookie_expiry unavailable")
 
 
+def session_process_response_plan(
+    accessed,
+    modified,
+    empty,
+    cookie_in_request,
+    save_every_request,
+    status_code,
+    expire_at_browser_close,
+    expiry_age_seconds,
+    now_unix,
+):
+    """One-crossing session process_response decision (action/need_vary/expiry)."""
+    impl = _impl()
+    if impl is not None:
+        return impl.session_process_response_plan(
+            bool(accessed),
+            bool(modified),
+            bool(empty),
+            bool(cookie_in_request),
+            bool(save_every_request),
+            int(status_code),
+            bool(expire_at_browser_close),
+            int(expiry_age_seconds),
+            float(now_unix),
+        )
+    raise RuntimeError("native session_process_response_plan unavailable")
+
+
+def session_load_key(cookie_value, min_length=8):
+    """Validate session cookie value; return key or None if missing/invalid."""
+    impl = _impl()
+    if impl is not None:
+        return impl.session_load_key(cookie_value, int(min_length))
+    raise RuntimeError("native session_load_key unavailable")
+
+
+def csrf_process_view_gate(csrf_processing_done, csrf_exempt, method, dont_enforce):
+    """Early CSRF process_view gate: done|exempt|accept|check."""
+    impl = _impl()
+    if impl is not None:
+        return impl.csrf_process_view_gate(
+            bool(csrf_processing_done),
+            bool(csrf_exempt),
+            str(method or ""),
+            bool(dont_enforce),
+        )
+    raise RuntimeError("native csrf_process_view_gate unavailable")
+
+
+def csrf_is_safe_method(method: str) -> bool:
+    impl = _impl()
+    if impl is not None:
+        return bool(impl.csrf_is_safe_method(str(method or "")))
+    m = (method or "").upper()
+    return m in ("GET", "HEAD", "OPTIONS", "TRACE")
+
+
+def csrf_secrets_match(request_token, csrf_secret, secret_len=32, token_len=64):
+    """Constant-time CSRF secret compare (handles masked tokens)."""
+    impl = _impl()
+    if impl is not None:
+        return bool(
+            impl.csrf_secrets_match(
+                str(request_token),
+                str(csrf_secret),
+                int(secret_len),
+                int(token_len),
+            )
+        )
+    raise RuntimeError("native csrf_secrets_match unavailable")
+
+
+def auth_login_required_gate(login_required, is_authenticated) -> int:
+    """0=skip, 1=allow, 2=need redirect."""
+    impl = _impl()
+    if impl is not None:
+        return int(
+            impl.auth_login_required_gate(
+                bool(login_required), bool(is_authenticated)
+            )
+        )
+    raise RuntimeError("native auth_login_required_gate unavailable")
+
+
+def is_native_stock_middleware_path(dotted_path: str) -> bool:
+    """True if path is a known dual-path stock middleware class."""
+    impl = _impl()
+    if impl is not None:
+        return bool(impl.is_native_stock_middleware_path(str(dotted_path or "")))
+    return False
+
+
+def native_stock_chain_call(specs, request, get_response):
+    """
+    Pure-C++ stock chain for fully-native header middleware stacks.
+
+    specs: list of dicts with type security|xframe|common and config.
+    get_response: Python view layer (may still run process_view hooks).
+    """
+    impl = _impl()
+    if impl is not None:
+        return impl.native_stock_chain_call(specs, request, get_response)
+    raise RuntimeError("native native_stock_chain_call unavailable")
+
+
 def message_tags_join(extra_tags: str, level_tag: str) -> str:
     impl = _impl()
     if impl is not None:

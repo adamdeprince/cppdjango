@@ -12,8 +12,10 @@ class SecurityMiddleware(MiddlewareMixin):
 
     Dual-path: process_request / process_response bodies run in C++ when
     native is available (one crossing per method). Chain iteration stays
-    in Python.
+    in Python (unless the whole stack is pure stock and uses the C++ chain).
     """
+
+    native_capable = True
 
     def __init__(self, get_response):
         super().__init__(get_response)

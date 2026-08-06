@@ -25,6 +25,14 @@ class BaseHandler:
     # Set in load_middleware: no view/template/exception middleware hooks.
     _middleware_hooks_empty = False
 
+    # Middleware paths whose full request/response bodies can run in the pure
+    # C++ stock chain (no Python process_request side effects required).
+    _NATIVE_STOCK_CHAIN_TYPES = {
+        "django.middleware.security.SecurityMiddleware": "security",
+        "django.middleware.clickjacking.XFrameOptionsMiddleware": "xframe",
+        "django.middleware.common.CommonMiddleware": "common",
+    }
+
     def load_middleware(self, is_async=False):
         """
         Populate middleware lists from settings.MIDDLEWARE.
@@ -35,11 +43,25 @@ class BaseHandler:
         self._view_middleware = []
         self._template_response_middleware = []
         self._exception_middleware = []
+        self._native_stock_chain = False
 
         get_response = self._get_response_async if is_async else self._get_response
         handler = convert_exception_to_response(get_response)
         handler_is_async = is_async
         from django import native as _native
+
+        # Optional pure-C++ chain: only when every entry is a fully-handled
+        # stock path (Security / XFrame / Common with no Python-only features).
+        # Hybrid stacks keep Python iteration + dual-path bodies (correct
+        # crossing budget: one Py→C++ per process_*).
+        stock_handler = self._try_native_stock_chain(
+            get_response, is_async, _native
+        )
+        if stock_handler is not None:
+            self._middleware_chain = stock_handler
+            self._middleware_hooks_empty = True
+            self._native_stock_chain = True
+            return
 
         for middleware_path in reversed(settings.MIDDLEWARE):
             middleware = import_string(middleware_path)
@@ -116,6 +138,76 @@ class BaseHandler:
             or self._template_response_middleware
             or self._exception_middleware
         )
+
+    def _try_native_stock_chain(self, get_response, is_async, _native):
+        """
+        If MIDDLEWARE is a pure stock Security/XFrame/Common stack that the
+        C++ chain fully implements, return a single convert_exception wrapper
+        around native_stock_chain_call. Otherwise return None (use Python walk).
+        """
+        if is_async or not getattr(_native, "AVAILABLE", False):
+            return None
+        paths = list(settings.MIDDLEWARE or ())
+        if not paths:
+            return None
+        chain_types = self._NATIVE_STOCK_CHAIN_TYPES
+        if any(p not in chain_types for p in paths):
+            return None
+        # CommonMiddleware process_request (UA deny, APPEND_SLASH, PREPEND_WWW)
+        # still needs Python / URL resolver — only pure-C++ when those are off.
+        if "django.middleware.common.CommonMiddleware" in paths:
+            if (
+                settings.APPEND_SLASH
+                or settings.PREPEND_WWW
+                or settings.DISALLOWED_USER_AGENTS
+            ):
+                return None
+        try:
+            specs = []
+            for path in paths:
+                kind = chain_types[path]
+                if kind == "security":
+                    specs.append(
+                        {
+                            "type": "security",
+                            "redirect": bool(settings.SECURE_SSL_REDIRECT),
+                            "redirect_host": settings.SECURE_SSL_HOST or "",
+                            "exempt_patterns": list(
+                                settings.SECURE_REDIRECT_EXEMPT or ()
+                            ),
+                            "sts_seconds": int(settings.SECURE_HSTS_SECONDS or 0),
+                            "sts_include_subdomains": bool(
+                                settings.SECURE_HSTS_INCLUDE_SUBDOMAINS
+                            ),
+                            "sts_preload": bool(settings.SECURE_HSTS_PRELOAD),
+                            "content_type_nosniff": bool(
+                                settings.SECURE_CONTENT_TYPE_NOSNIFF
+                            ),
+                            "referrer_policy": settings.SECURE_REFERRER_POLICY,
+                            "cross_origin_opener_policy": (
+                                settings.SECURE_CROSS_ORIGIN_OPENER_POLICY
+                            ),
+                        }
+                    )
+                elif kind == "xframe":
+                    specs.append(
+                        {
+                            "type": "xframe",
+                            "setting_value": getattr(
+                                settings, "X_FRAME_OPTIONS", "DENY"
+                            )
+                            or "DENY",
+                        }
+                    )
+                else:
+                    specs.append({"type": "common"})
+        except Exception:
+            return None
+
+        def stock_chain(request):
+            return _native.native_stock_chain_call(specs, request, get_response)
+
+        return convert_exception_to_response(stock_chain)
 
     def _any_atomic_requests(self):
         """True if any DB alias has ATOMIC_REQUESTS (checked live; tests toggle it)."""

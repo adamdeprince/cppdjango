@@ -18,6 +18,8 @@ class XFrameOptionsMiddleware(MiddlewareMixin):
     (subclass-friendly). Header uppercasing uses native when available.
     """
 
+    native_capable = True
+
     def process_response(self, request, response):
         # Don't set it if it's already in the response
         if response.get("X-Frame-Options") is not None:

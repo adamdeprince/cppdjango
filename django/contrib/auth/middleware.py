@@ -28,6 +28,12 @@ async def auser(request):
 
 
 class AuthenticationMiddleware(MiddlewareMixin):
+    """
+    Attach request.user as a SimpleLazyObject (always Python — user model API).
+    """
+
+    native_capable = True
+
     def process_request(self, request):
         if not hasattr(request, "session"):
             raise ImproperlyConfigured(
@@ -37,6 +43,7 @@ class AuthenticationMiddleware(MiddlewareMixin):
                 "'django.contrib.sessions.middleware.SessionMiddleware' before "
                 "'django.contrib.auth.middleware.AuthenticationMiddleware'."
             )
+        # Lazy load stays Python (auth backends / user model).
         request.user = SimpleLazyObject(lambda: get_user(request))
         request.auser = partial(auser, request)
 
@@ -46,24 +53,31 @@ class LoginRequiredMiddleware(MiddlewareMixin):
     Middleware that redirects all unauthenticated requests to a login page.
 
     Views using the login_not_required decorator will not be redirected.
+    Dual-path: gate decision in C++ (skip / allow / redirect).
     """
 
     redirect_field_name = REDIRECT_FIELD_NAME
+    native_capable = True
 
     def process_view(self, request, view_func, view_args, view_kwargs):
         from django import native as _native
 
-        login_required = getattr(view_func, "login_required", True)
-        # Dual-path: treat missing/True as requiring login (bool identity).
-        if _native.AVAILABLE:
-            if not bool(login_required):
-                return None
-        elif not login_required:
+        login_required = bool(getattr(view_func, "login_required", True))
+        # Do not touch request.user when the view is public — avoids a session
+        # / user DB load (see test_public_view_logged_in_performance).
+        if not login_required:
             return None
+        if _native.AVAILABLE:
+            gate = _native.auth_login_required_gate(
+                True,
+                bool(request.user.is_authenticated),
+            )
+            if gate == 1:
+                return None
+            return self.handle_no_permission(request, view_func)
 
         if request.user.is_authenticated:
             return None
-
         return self.handle_no_permission(request, view_func)
 
     def get_login_url(self, view_func):

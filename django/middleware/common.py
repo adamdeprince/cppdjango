@@ -28,8 +28,11 @@ class CommonMiddleware(MiddlewareMixin):
 
           This behavior can be customized by subclassing CommonMiddleware and
           overriding the response_redirect_class attribute.
+
+    Dual-path: Content-Length and PREPEND_WWW URL construction can run in C++.
     """
 
+    native_capable = True
     response_redirect_class = HttpResponsePermanentRedirect
 
     def process_request(self, request):
