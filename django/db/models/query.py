@@ -685,10 +685,99 @@ class QuerySet(AltersData):
                 raise TypeError("Complex aggregates require an alias")
             kwargs[arg.default_alias] = arg
 
+        native_agg = self._native_terminal_aggregate(kwargs)
+        if native_agg is not _FAST_PATH_MISS:
+            return native_agg
         return self.query.chain().get_aggregation(self.db, kwargs)
 
     async def aaggregate(self, *args, **kwargs):
         return await sync_to_async(self.aggregate)(*args, **kwargs)
+
+    def _native_terminal_update(self, kwargs):
+        handle = self._native_handle_for_sql()
+        if handle is None or not kwargs:
+            return _FAST_PATH_MISS
+        try:
+            from django.native import orm as native_orm
+
+            connection = connections[self.db]
+            qs = handle.clone()
+            for name, value in kwargs.items():
+                if LOOKUP_SEP in name or hasattr(value, "resolve_expression"):
+                    return _FAST_PATH_MISS
+                try:
+                    field = self.model._meta.get_field(name)
+                    prep = field.get_db_prep_save(value, connection)
+                except Exception:
+                    return _FAST_PATH_MISS
+                if not qs.add_update(name, prep):
+                    return _FAST_PATH_MISS
+            sql, params = qs.compile_sql()
+            if not sql:
+                return _FAST_PATH_MISS
+            with transaction.mark_for_rollback_on_error(using=self.db):
+                with connection.cursor() as cursor:
+                    cursor.execute(sql, params)
+                    rowcount = cursor.rowcount
+            if rowcount is None or rowcount < 0:
+                return _FAST_PATH_MISS
+            return rowcount
+        except Exception:
+            return _FAST_PATH_MISS
+
+    def _native_terminal_aggregate(self, kwargs):
+        """
+        .aggregate(Count/Sum/Avg/Min/Max) via native handle when possible.
+        """
+        try:
+            from django.native import orm as native_orm
+            from django.db.models.aggregates import Aggregate
+            from django.db.models.expressions import Star
+
+            connection = connections[self.db]
+            handle = self._native_handle_for_sql()
+            if handle is None:
+                if not self._simple_base_eligible(require_empty_where=True):
+                    return _FAST_PATH_MISS
+                handle = native_orm.build_queryset(self.model, connection)
+                if handle is None:
+                    return _FAST_PATH_MISS
+            qs = handle.clone()
+            qs.clear_select()
+            aliases = []
+            for alias, expr in kwargs.items():
+                if not isinstance(expr, Aggregate):
+                    return _FAST_PATH_MISS
+                func = expr.function
+                star = False
+                field_name = ""
+                distinct = bool(getattr(expr, "distinct", False))
+                sources = expr.get_source_expressions()
+                if not sources or isinstance(sources[0], Star):
+                    star = True
+                else:
+                    src = sources[0]
+                    name = getattr(src, "name", None)
+                    if name is None and hasattr(src, "target"):
+                        name = getattr(src.target, "name", None)
+                    if isinstance(name, str):
+                        field_name = name
+                    else:
+                        return _FAST_PATH_MISS
+                if not qs.annotate_aggregate(
+                    alias, func, field_name, distinct, star
+                ):
+                    return _FAST_PATH_MISS
+                aliases.append(alias)
+            sql, params = qs.compile_sql()
+            if not sql:
+                return _FAST_PATH_MISS
+            row = native_orm.execute_fetchall(connection, sql, params)
+            if not row:
+                return {a: None for a in aliases}
+            return dict(zip(aliases, row[0]))
+        except Exception:
+            return _FAST_PATH_MISS
 
     def count(self):
         """
@@ -730,8 +819,15 @@ class QuerySet(AltersData):
             fast = self._fast_path_simple_get(kwargs)
             if fast is not _FAST_PATH_MISS:
                 return fast
-        clone = self._chain() if self.query.combinator else self.filter(*args, **kwargs)
-        if self.query.can_filter() and not self.query.distinct_fields:
+        # Full native terminal: filter onto handle then fetch one.
+        if args or kwargs:
+            clone = self.filter(*args, **kwargs)
+        else:
+            clone = self._chain()
+        native_result = clone._native_terminal_get()
+        if native_result is not _FAST_PATH_MISS:
+            return native_result
+        if self.query.can_filter() and not clone.query.distinct_fields:
             clone = clone.order_by()
         limit = None
         if (
@@ -754,6 +850,85 @@ class QuerySet(AltersData):
                 num if not limit or num < limit else "more than %s" % (limit - 1),
             )
         )
+
+    def _native_terminal_get(self):
+        """get() via live native handle; returns object or _FAST_PATH_MISS."""
+        handle = self._native_handle_for_sql()
+        if handle is None:
+            return _FAST_PATH_MISS
+        if self._fields is not None:
+            return _FAST_PATH_MISS  # values_list get uses other path
+        try:
+            from django.native import orm as native_orm
+
+            connection = connections[self.db]
+            result = native_orm.materialize_models(
+                self.model, connection, handle, limit=MAX_GET_RESULTS
+            )
+            if result is None:
+                return _FAST_PATH_MISS
+            objs, prefetches = result
+            if not objs:
+                raise self.model.DoesNotExist(
+                    "%s matching query does not exist." % self.model._meta.object_name
+                )
+            if len(objs) > 1:
+                raise self.model.MultipleObjectsReturned(
+                    "get() returned more than one %s -- it returned %s!"
+                    % (self.model._meta.object_name, len(objs))
+                )
+            obj = objs[0]
+            if prefetches:
+                self._native_run_prefetch([obj], prefetches)
+            return obj
+        except (self.model.DoesNotExist, self.model.MultipleObjectsReturned):
+            raise
+        except Exception:
+            return _FAST_PATH_MISS
+
+    def _native_run_prefetch(self, objs, lookups):
+        """Run Django prefetch machinery for native-fetched instances."""
+        if not objs or not lookups:
+            return
+        try:
+            from django.db.models.query import prefetch_related_objects
+
+            prefetch_related_objects(objs, *lookups)
+        except Exception:
+            pass
+
+    def _native_terminal_fetch_all(self):
+        """ModelIterable _fetch_all via native handle."""
+        handle = self._native_handle_for_sql()
+        if handle is None:
+            return _FAST_PATH_MISS
+        if self._fields is not None:
+            return _FAST_PATH_MISS
+        if not issubclass(self._iterable_class, ModelIterable):
+            return _FAST_PATH_MISS
+        try:
+            from django.native import orm as native_orm
+
+            connection = connections[self.db]
+            h = handle.clone()
+            if self.query.is_sliced:
+                low = self.query.low_mark or 0
+                high = self.query.high_mark
+                if high is not None:
+                    h.set_limit(int(high - low))
+                if low:
+                    h.set_offset(int(low))
+            result = native_orm.materialize_models(self.model, connection, h)
+            if result is None:
+                return _FAST_PATH_MISS
+            objs, prefetches = result
+            if prefetches or self._prefetch_related_lookups:
+                lookups = list(prefetches) + list(self._prefetch_related_lookups)
+                self._native_run_prefetch(objs, lookups)
+                self._prefetch_done = True
+            return objs
+        except Exception:
+            return _FAST_PATH_MISS
 
     def _simple_base_eligible(self, *, require_empty_where=True):
         """Shared guards for simple single-table SELECT fast paths."""
@@ -2028,6 +2203,11 @@ class QuerySet(AltersData):
         if fast is not _FAST_PATH_MISS:
             self._result_cache = None
             return fast
+        # Live native handle (filter/exclude wired) → full UPDATE compile.
+        native_upd = self._native_terminal_update(kwargs)
+        if native_upd is not _FAST_PATH_MISS:
+            self._result_cache = None
+            return native_upd
         query = self.query.chain(sql.UpdateQuery)
         query.add_update_values(kwargs)
 
@@ -2425,14 +2605,12 @@ class QuerySet(AltersData):
     def _native_eligible_for_dataplane(self):
         """Query shapes the C++ data plane can still own."""
         query = self.query
+        # Annotations/select_related may be owned by the native handle itself.
         if (
             query.combinator
-            or query.annotations
             or query.extra
             or query.distinct_fields
-            or query.group_by
             or query.select_for_update
-            or query.distinct
         ):
             return False
         return True
@@ -2623,11 +2801,128 @@ class QuerySet(AltersData):
         obj = self._chain()
         if fields == (None,):
             obj.query.select_related = False
+            if getattr(obj, "_native_qs", None) is not None:
+                # Cannot clear joins easily; poison native for this branch.
+                obj._native_disabled = True
+                obj._native_qs = None
         elif fields:
             obj.query.add_select_related(fields)
+            obj._native_track_select_related(fields)
         else:
             obj.query.select_related = True
+            # unrestricted select_related — leave to Python compiler
+            obj._native_disabled = True
+            obj._native_qs = None
         return obj
+
+    def _native_track_select_related(self, fields):
+        if getattr(self, "_native_disabled", False):
+            return
+        try:
+            from django.native import orm as native_orm
+
+            if native_orm._orm() is None:
+                return
+            handle = getattr(self, "_native_qs", None)
+            if handle is None:
+                if not self._native_eligible_for_dataplane():
+                    return
+                handle = native_orm.build_queryset(
+                    self.model, connections[self.db]
+                )
+                if handle is None:
+                    return
+                self._native_qs = handle
+            else:
+                handle = handle.clone()
+                self._native_qs = handle
+            h = self._native_qs
+            if not h.base_attnames():
+                h.select_model_columns()
+            for path in fields:
+                if not isinstance(path, str) or not h.add_select_related(path):
+                    self._native_disabled = True
+                    self._native_qs = None
+                    return
+        except Exception:
+            self._native_disabled = True
+            self._native_qs = None
+
+    def _native_track_annotate(self, annotations, select=True):
+        """Mirror simple Aggregate / Subquery annotations onto native handle."""
+        if getattr(self, "_native_disabled", False) or not select:
+            return
+        try:
+            from django.native import orm as native_orm
+            from django.db.models.aggregates import Aggregate
+            from django.db.models.expressions import Star, Subquery
+
+            if native_orm._orm() is None:
+                return
+            handle = getattr(self, "_native_qs", None)
+            if handle is None:
+                if not self._native_eligible_for_dataplane():
+                    return
+                handle = native_orm.build_queryset(
+                    self.model, connections[self.db]
+                )
+                if handle is None:
+                    return
+                self._native_qs = handle
+            else:
+                self._native_qs = handle.clone()
+            h = self._native_qs
+            if not h.base_attnames() and not any(
+                True for _ in []  # keep select if already set
+            ):
+                # Model fetch annotations need base columns
+                h.select_model_columns()
+            for alias, expr in annotations.items():
+                if isinstance(expr, Aggregate):
+                    func = expr.function
+                    star = False
+                    field_name = ""
+                    distinct = bool(getattr(expr, "distinct", False))
+                    sources = expr.get_source_expressions()
+                    if not sources or isinstance(sources[0], Star):
+                        star = True
+                    else:
+                        src = sources[0]
+                        name = getattr(src, "name", None)
+                        if isinstance(name, str):
+                            field_name = name
+                        else:
+                            self._native_disabled = True
+                            self._native_qs = None
+                            return
+                    if not h.annotate_aggregate(
+                        alias, func, field_name, distinct, star
+                    ):
+                        self._native_disabled = True
+                        self._native_qs = None
+                        return
+                    # Aggregates with non-agg columns need GROUP BY
+                    h.group_by_selected_columns()
+                elif isinstance(expr, Subquery):
+                    # Lower inner queryset via Python compiler once; store SQL.
+                    try:
+                        compiler = expr.query.get_compiler(self.db)
+                        sql, params = compiler.as_sql()
+                    except Exception:
+                        self._native_disabled = True
+                        self._native_qs = None
+                        return
+                    if not h.annotate_sql(alias, sql, list(params)):
+                        self._native_disabled = True
+                        self._native_qs = None
+                        return
+                else:
+                    self._native_disabled = True
+                    self._native_qs = None
+                    return
+        except Exception:
+            self._native_disabled = True
+            self._native_qs = None
 
     def prefetch_related(self, *lookups):
         """
@@ -2649,6 +2944,9 @@ class QuerySet(AltersData):
         )
         if clear:
             clone._prefetch_related_lookups = ()
+            if getattr(clone, "_native_qs", None) is not None:
+                # Prefetch list cleared; leave handle otherwise intact.
+                pass
         else:
             for lookup in lookups:
                 if isinstance(lookup, Prefetch):
@@ -2662,7 +2960,36 @@ class QuerySet(AltersData):
                         "prefetch_related() is not supported with FilteredRelation."
                     )
             clone._prefetch_related_lookups = clone._prefetch_related_lookups + lookups
+            clone._native_track_prefetch(lookups)
         return clone
+
+    def _native_track_prefetch(self, lookups):
+        if getattr(self, "_native_disabled", False):
+            return
+        try:
+            from django.native import orm as native_orm
+
+            if native_orm._orm() is None:
+                return
+            handle = getattr(self, "_native_qs", None)
+            if handle is None:
+                if not self._native_eligible_for_dataplane():
+                    return
+                handle = native_orm.build_queryset(
+                    self.model, connections[self.db]
+                )
+                if handle is None:
+                    return
+                self._native_qs = handle
+            h = self._native_qs
+            for lookup in lookups:
+                if isinstance(lookup, Prefetch):
+                    path = lookup.prefetch_to
+                else:
+                    path = str(lookup)
+                h.add_prefetch(path)
+        except Exception:
+            pass  # prefetch is post-fetch; main query can still be native
 
     def annotate(self, *args, **kwargs):
         """
@@ -2702,6 +3029,7 @@ class QuerySet(AltersData):
         annotations.update(kwargs)
 
         clone = self._chain()
+        clone._native_track_annotate(annotations, select=select)
         names = self._fields
         if names is None:
             names = set(
@@ -3091,13 +3419,17 @@ class QuerySet(AltersData):
 
     def _fetch_all(self):
         # Pure Python control flow (native bool hops were net-negative on TE).
-        # Fortune-shaped values()/values_list() use the simple SELECT fast path.
+        # Prefer C++ data-plane terminals when a live handle exists.
         if self._result_cache is None:
             fast = self._fast_path_simple_values_fetch()
             if fast is not _FAST_PATH_MISS:
                 self._result_cache = fast
             else:
-                self._result_cache = list(self._iterable_class(self))
+                models = self._native_terminal_fetch_all()
+                if models is not _FAST_PATH_MISS:
+                    self._result_cache = models
+                else:
+                    self._result_cache = list(self._iterable_class(self))
         if self._prefetch_related_lookups and not self._prefetch_done:
             self._prefetch_related_objects()
 

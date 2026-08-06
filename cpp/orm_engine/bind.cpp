@@ -74,7 +74,9 @@ nb::tuple compile_to_tuple(const django::orm::QuerySet& self) {
 }
 
 // Python tree dict:
-//   {"kind": "and"|"or"|"not"|"atom", "children": [...], "key": str, "values": list}
+//   {"kind": "and"|"or"|"not"|"xor"|"atom", "children": [...],
+//    "key": str, "values": list,
+//    "rhs_sql": str, "rhs_params": list, "rhs_op": int}  # subquery atom
 django::orm::QNode q_node_from_python(nb::handle h) {
   django::orm::QNode node;
   nb::dict d = nb::cast<nb::dict>(h);
@@ -90,6 +92,16 @@ django::orm::QNode q_node_from_python(nb::handle h) {
   } else if (kind == "atom") {
     node.kind = 3;
     node.key = nb::cast<std::string>(d["key"]);
+    if (d.contains("rhs_sql")) {
+      node.has_rhs_sql = true;
+      node.rhs_sql = nb::cast<std::string>(d["rhs_sql"]);
+      node.rhs_op = d.contains("rhs_op") ? nb::cast<int>(d["rhs_op"]) : 0;
+      if (d.contains("rhs_params")) {
+        for (nb::handle x : nb::borrow(d["rhs_params"])) {
+          node.rhs_params.push_back(param_from_python(x));
+        }
+      }
+    }
     if (d.contains("values")) {
       nb::object vals = d["values"];
       if (nb::isinstance<nb::list>(vals) || nb::isinstance<nb::tuple>(vals)) {
@@ -264,7 +276,19 @@ void register_orm_engine(nb::module_& parent) {
             return self.apply_q(q_node_from_python(tree));
           },
           nb::arg("tree"),
-          "Apply a full Q-tree dict (and/or/not/atom) in C++.")
+          "Apply a full Q-tree dict (and/or/not/xor/atom) in C++.")
+      .def(
+          "filter_subquery",
+          [](django::orm::QuerySet& self, const std::string& field, int op,
+             const std::string& sql, nb::sequence params) {
+            std::vector<django::orm::ParamValue> ps;
+            for (nb::handle v : params) {
+              ps.push_back(param_from_python(v));
+            }
+            return self.filter_subquery(field, static_cast<django::orm::CmpOp>(op),
+                                        sql, std::move(ps));
+          },
+          nb::arg("field"), nb::arg("op"), nb::arg("sql"), nb::arg("params"))
       .def(
           "values_list",
           [](django::orm::QuerySet& self, nb::sequence names, bool flat) {
@@ -287,6 +311,52 @@ void register_orm_engine(nb::module_& parent) {
             return self.values(ns, true, django::orm::ResultMode::ValuesDict);
           },
           nb::arg("names"))
+      .def("clear_select", &django::orm::QuerySet::clear_select)
+      .def("select_model_columns", &django::orm::QuerySet::select_model_columns)
+      .def(
+          "annotate_aggregate",
+          [](django::orm::QuerySet& self, const std::string& alias,
+             const std::string& func, const std::string& field, bool distinct,
+             bool star) {
+            return self.annotate_aggregate(alias, func, field, distinct, star);
+          },
+          nb::arg("alias"), nb::arg("func"), nb::arg("field") = "",
+          nb::arg("distinct") = false, nb::arg("star") = false)
+      .def(
+          "annotate_sql",
+          [](django::orm::QuerySet& self, const std::string& alias,
+             const std::string& sql, nb::sequence params) {
+            std::vector<django::orm::ParamValue> ps;
+            for (nb::handle v : params) {
+              ps.push_back(param_from_python(v));
+            }
+            return self.annotate_sql(alias, sql, std::move(ps));
+          },
+          nb::arg("alias"), nb::arg("sql"), nb::arg("params"))
+      .def(
+          "group_by_fields",
+          [](django::orm::QuerySet& self, nb::sequence names) {
+            std::vector<std::string> ns;
+            for (nb::handle n : names) {
+              ns.push_back(nb::cast<std::string>(n));
+            }
+            return self.group_by_fields(ns);
+          },
+          nb::arg("names"))
+      .def("group_by_selected_columns",
+           &django::orm::QuerySet::group_by_selected_columns)
+      .def(
+          "add_select_related",
+          [](django::orm::QuerySet& self, const std::string& path) {
+            return self.add_select_related(path);
+          },
+          nb::arg("path"))
+      .def(
+          "add_prefetch",
+          [](django::orm::QuerySet& self, const std::string& lookup) {
+            self.add_prefetch(lookup);
+          },
+          nb::arg("lookup"))
       .def(
           "add_update",
           [](django::orm::QuerySet& self, const std::string& field,
@@ -301,9 +371,45 @@ void register_orm_engine(nb::module_& parent) {
             return self.order_by(field, desc);
           },
           nb::arg("field"), nb::arg("desc") = false)
+      .def(
+          "order_by_alias",
+          [](django::orm::QuerySet& self, const std::string& alias, bool desc) {
+            return self.order_by_alias(alias, desc);
+          },
+          nb::arg("alias"), nb::arg("desc") = false)
       .def("set_limit", &django::orm::QuerySet::set_limit, nb::arg("n"))
       .def("set_offset", &django::orm::QuerySet::set_offset, nb::arg("n"))
-      .def("compile_sql", &compile_to_tuple);
+      .def("set_distinct", &django::orm::QuerySet::set_distinct, nb::arg("v"))
+      .def("compile_sql", &compile_to_tuple)
+      .def("base_attnames",
+           [](const django::orm::QuerySet& self) {
+             return self.base_attnames();
+           })
+      .def("related_selects_info",
+           [](const django::orm::QuerySet& self) {
+             nb::list out;
+             for (const auto& rs : self.related_selects()) {
+               nb::dict d;
+               d["path"] = rs.path;
+               d["model_id"] = rs.model_id;
+               d["offset"] = rs.select_offset;
+               d["count"] = rs.select_count;
+               nb::list atts;
+               for (const auto& a : rs.field_attnames) {
+                 atts.append(a);
+               }
+               d["attnames"] = atts;
+               out.append(d);
+             }
+             return out;
+           })
+      .def("prefetch_lookups", [](const django::orm::QuerySet& self) {
+        nb::list out;
+        for (const auto& p : self.prefetches()) {
+          out.append(p.lookup);
+        }
+        return out;
+      });
 
   // CmpOp constants
   m.attr("OP_EQ") = 0;

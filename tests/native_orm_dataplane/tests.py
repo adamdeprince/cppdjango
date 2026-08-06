@@ -539,3 +539,81 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
 
         qs3 = World.objects.filter(Q(randomnumber=1) ^ Q(randomnumber=2))
         self.assertIsNotNone(qs3._native_qs)
+
+    def test_annotate_aggregate_and_subquery_compile(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "agg.T",
+            "t",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("n", "n", "n", "IntegerField", False, False),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        qs.clear_select()
+        self.assertTrue(qs.annotate_aggregate("c", "COUNT", "", False, True))
+        sql, params = qs.compile_sql()
+        self.assertIn("COUNT(*)", sql)
+        self.assertIn('AS "c"', sql)
+
+        qs2 = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        qs2.filter_eq("id", 1)
+        self.assertTrue(
+            qs2.annotate_sql("s", "SELECT 1", [])
+        )
+        sql2, _ = qs2.compile_sql()
+        self.assertIn("(SELECT 1)", sql2)
+
+        qs3 = orm.QuerySet.create(mid, orm.DIALECT_SQLITE)
+        self.assertTrue(
+            qs3.filter_subquery("id", orm.OP_IN, "SELECT %s", [1])
+        )
+        sql3, p3 = qs3.compile_sql()
+        self.assertIn("IN (SELECT %s)", sql3)
+        self.assertEqual(list(p3), [1])
+
+    def test_select_related_compile(self):
+        from django import _native
+
+        orm = _native.orm
+        orm.register_model(
+            "sr.Author",
+            "author",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("name", "name", "name", "CharField", False, False),
+            ],
+        )
+        mid = orm.register_model(
+            "sr.Book",
+            "book",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("title", "title", "title", "CharField", False, False),
+                _row(
+                    "author",
+                    "author_id",
+                    "author_id",
+                    "ForeignKey",
+                    False,
+                    False,
+                    "author",
+                    "id",
+                    "sr.Author",
+                    "fk",
+                ),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.select_model_columns())
+        self.assertTrue(qs.add_select_related("author"))
+        sql, params = qs.compile_sql()
+        self.assertIn("LEFT OUTER JOIN", sql)
+        self.assertIn('"author"', sql)
+        info = qs.related_selects_info()
+        self.assertEqual(len(info), 1)
+        self.assertEqual(info[0]["path"], "author")
+        self.assertGreater(info[0]["count"], 0)

@@ -1,7 +1,5 @@
 #include "orm_engine/queryset.hpp"
 
-#include <sstream>
-
 namespace django::orm {
 namespace {
 
@@ -30,6 +28,11 @@ QuerySet::QuerySet(ModelId model, DialectId dialect) {
   if (m) {
     query_.base_alias = m->db_table;
   }
+}
+
+QuerySet QuerySet::clone() const {
+  QuerySet c = *this;
+  return c;
 }
 
 std::optional<FieldId> QuerySet::resolve_field(std::string_view name) const {
@@ -140,10 +143,40 @@ bool QuerySet::filter_in(std::string_view field_name,
   return append_pred(std::move(p));
 }
 
+bool QuerySet::filter_subquery(std::string_view field_name, CmpOp op,
+                               std::string subquery_sql,
+                               std::vector<ParamValue> subquery_params) {
+  ColumnRef col;
+  CmpOp parsed = op;
+  bool isnull = false;
+  if (!resolve_lookup_key(field_name, col, parsed, isnull)) {
+    auto fid = resolve_field(field_name);
+    if (!fid) {
+      return false;
+    }
+    col.field = *fid;
+  }
+  Pred p;
+  p.op = op;
+  p.lhs = col;
+  p.rhs_is_sql = true;
+  // Ensure parentheses
+  if (subquery_sql.empty() || subquery_sql.front() != '(') {
+    p.rhs_sql = "(" + subquery_sql + ")";
+  } else {
+    p.rhs_sql = std::move(subquery_sql);
+  }
+  for (auto& v : subquery_params) {
+    p.rhs_sql_param_idxs.push_back(query_.add_param(std::move(v)));
+  }
+  return append_pred(std::move(p));
+}
+
 std::string QuerySet::ensure_join(const ModelSchema& local_model,
                                   std::string_view local_alias,
                                   std::string_view fk_name,
-                                  std::string_view path_prefix) {
+                                  std::string_view path_prefix,
+                                  JoinType join_type) {
   auto fit = local_model.field_by_name.find(std::string(fk_name));
   if (fit == local_model.field_by_name.end()) {
     return {};
@@ -170,20 +203,18 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
     if (rel.m2m_table.empty()) {
       return {};
     }
-    // JOIN through ON local.pk = through.m2m_column
-    // JOIN remote ON through.m2m_reverse = remote.pk
     std::string through_alias = "T" + std::to_string(++join_counter_);
     std::string remote_alias = "J" + std::to_string(++join_counter_);
     JoinEdge through;
-    through.type = JoinType::Inner;
+    through.type = join_type;
     through.alias = through_alias;
     through.table = rel.m2m_table;
     through.local_alias = std::string(local_alias);
     through.local_column = local_pk_col;
-    through.remote_column = rel.m2m_column.empty() ? std::string("from_id")
-                                                   : rel.m2m_column;
+    through.remote_column =
+        rel.m2m_column.empty() ? std::string("from_id") : rel.m2m_column;
     JoinEdge remote;
-    remote.type = JoinType::Inner;
+    remote.type = join_type;
     remote.alias = remote_alias;
     remote.table = rel.remote_table;
     remote.local_alias = through_alias;
@@ -199,24 +230,67 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
 
   std::string alias = "J" + std::to_string(++join_counter_);
   JoinEdge edge;
-  edge.type = JoinType::Inner;
+  edge.type = join_type;
   edge.alias = alias;
   edge.table = rel.remote_table;
   edge.local_alias = std::string(local_alias);
 
   if (rel.rel == RelKind::ReverseFK) {
-    // JOIN remote ON remote.fk = local.pk
     edge.local_column = local_pk_col;
     edge.remote_column =
         rel.remote_fk_column.empty() ? std::string("id") : rel.remote_fk_column;
   } else {
-    // Forward FK: JOIN remote ON local.fk = remote.pk
     edge.local_column = rel.column;
     edge.remote_column = remote_pk;
   }
   query_.joins.push_back(std::move(edge));
   join_aliases_[prefix] = alias;
   return alias;
+}
+
+std::string QuerySet::ensure_path_joins(std::string_view path, JoinType join_type,
+                                        const ModelSchema** out_model) {
+  auto parts = split_lookup_sep(path);
+  if (parts.empty()) {
+    return {};
+  }
+  const SchemaRegistry& reg = SchemaRegistry::instance();
+  const ModelSchema* current = reg.get(query_.model);
+  if (!current) {
+    return {};
+  }
+  std::string current_alias =
+      query_.base_alias.empty() ? current->db_table : query_.base_alias;
+  std::string path_prefix;
+  for (std::size_t i = 0; i < parts.size(); ++i) {
+    if (!path_prefix.empty()) {
+      path_prefix += "__";
+    }
+    path_prefix += parts[i];
+    std::string alias =
+        ensure_join(*current, current_alias, parts[i], path_prefix, join_type);
+    if (alias.empty()) {
+      return {};
+    }
+    auto fit = current->field_by_name.find(parts[i]);
+    if (fit == current->field_by_name.end()) {
+      return {};
+    }
+    const FieldSchema& fk = current->fields[fit->second];
+    const ModelSchema* remote =
+        fk.remote_model_label.empty()
+            ? nullptr
+            : reg.get_by_label(fk.remote_model_label);
+    if (!remote) {
+      return {};
+    }
+    current = remote;
+    current_alias = alias;
+  }
+  if (out_model) {
+    *out_model = current;
+  }
+  return current_alias;
 }
 
 bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& op,
@@ -252,7 +326,6 @@ bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& o
       query_.base_alias.empty() ? current->db_table : query_.base_alias;
   std::string path_prefix;
 
-  // Walk relation hops: path[0]..path[n-2]
   for (std::size_t i = 0; i + 1 < path.size(); ++i) {
     if (!path_prefix.empty()) {
       path_prefix += "__";
@@ -263,7 +336,6 @@ bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& o
     if (alias.empty()) {
       return false;
     }
-    // Advance to remote model schema when registered.
     auto fit = current->field_by_name.find(path[i]);
     if (fit == current->field_by_name.end()) {
       return false;
@@ -277,9 +349,8 @@ bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& o
       remote = reg.get_by_label(fk.remote_model_label);
     }
     if (!remote) {
-      // Last hop only: allow column_override without full remote schema.
       if (i + 2 != path.size()) {
-        return false;  // need intermediate schema for multi-hop
+        return false;
       }
       col.field = 0;
       col.table_alias = alias;
@@ -290,15 +361,12 @@ bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& o
     current_alias = alias;
   }
 
-  // Target field on `current` model at `current_alias`
   const std::string& target = path.back();
   auto tit = current->field_by_name.find(target);
   if (tit == current->field_by_name.end()) {
-    // Fall back to treating target as raw column name on current alias.
     col.field = 0;
     col.table_alias = current_alias;
     col.column_override = target;
-    // Only valid if we joined at least once (not base unresolved field).
     if (path.size() == 1) {
       return false;
     }
@@ -306,7 +374,6 @@ bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& o
   }
   const FieldSchema& tf = current->fields[tit->second];
   if (path.size() == 1) {
-    // Base model field — use field id so compile uses schema column.
     col.field = tf.id;
     col.table_alias.clear();
     col.column_override.clear();
@@ -355,6 +422,34 @@ std::optional<Pred> QuerySet::pred_from_key_values(
   return p;
 }
 
+std::optional<Pred> QuerySet::pred_from_q_atom(const QNode& node) {
+  if (node.has_rhs_sql) {
+    ColumnRef col;
+    CmpOp op = static_cast<CmpOp>(node.rhs_op);
+    bool isnull = false;
+    if (!resolve_lookup_key(node.key, col, op, isnull)) {
+      auto fid = resolve_field(node.key);
+      if (!fid) {
+        return std::nullopt;
+      }
+      col.field = *fid;
+    }
+    Pred p;
+    p.op = static_cast<CmpOp>(node.rhs_op);
+    p.lhs = col;
+    p.rhs_is_sql = true;
+    p.rhs_sql = node.rhs_sql;
+    if (p.rhs_sql.empty() || p.rhs_sql.front() != '(') {
+      p.rhs_sql = "(" + node.rhs_sql + ")";
+    }
+    for (const auto& v : node.rhs_params) {
+      p.rhs_sql_param_idxs.push_back(query_.add_param(v));
+    }
+    return p;
+  }
+  return pred_from_key_values(node.key, node.values);
+}
+
 bool QuerySet::filter_kwargs(
     const std::vector<std::pair<std::string, std::vector<ParamValue>>>& items,
     bool disjunctive) {
@@ -383,9 +478,8 @@ bool QuerySet::filter_kwargs(
 }
 
 std::optional<BoolExpr> QuerySet::lower_q_node(const QNode& node) {
-  // 0=And, 1=Or, 2=Not, 3=Atom, 4=Xor
   if (node.kind == 3) {
-    auto pred = pred_from_key_values(node.key, node.values);
+    auto pred = pred_from_q_atom(node);
     if (!pred) {
       return std::nullopt;
     }
@@ -433,7 +527,6 @@ bool QuerySet::apply_q(const QNode& node) {
   if (!expr) {
     return false;
   }
-  // Empty And with no children: no-op success
   if (expr->kind == BoolExpr::Kind::And && expr->children.empty() &&
       node.kind == 0) {
     return true;
@@ -442,7 +535,6 @@ bool QuerySet::apply_q(const QNode& node) {
     query_.where = std::move(*expr);
     query_.has_where = true;
   } else {
-    // Q from filter() ANDs with existing where
     bool_and_append(query_.where, std::move(*expr));
   }
   return true;
@@ -451,6 +543,8 @@ bool QuerySet::apply_q(const QNode& node) {
 bool QuerySet::values(const std::vector<std::string>& field_names, bool out_aliases,
                       ResultMode mode) {
   query_.select.clear();
+  query_.related_selects.clear();
+  query_.base_attnames.clear();
   query_.result_mode = mode;
   query_.kind = StmtKind::Select;
   for (const auto& name : field_names) {
@@ -465,8 +559,140 @@ bool QuerySet::values(const std::vector<std::string>& field_names, bool out_alia
       it.out_alias = name;
     }
     query_.select.push_back(std::move(it));
+    query_.base_attnames.push_back(name);
+  }
+  query_.base_select_count = static_cast<int>(query_.select.size());
+  return true;
+}
+
+void QuerySet::clear_select() {
+  query_.select.clear();
+  query_.base_attnames.clear();
+  query_.related_selects.clear();
+  query_.base_select_count = 0;
+  query_.kind = StmtKind::Select;
+}
+
+bool QuerySet::select_model_columns() {
+  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  if (!m) {
+    return false;
+  }
+  clear_select();
+  query_.result_mode = ResultMode::Model;
+  for (const auto& f : m->fields) {
+    if (f.column.empty()) {
+      continue;
+    }
+    SelectItem it;
+    it.col.field = f.id;
+    query_.select.push_back(std::move(it));
+    query_.base_attnames.push_back(f.attname.empty() ? f.name : f.attname);
+  }
+  query_.base_select_count = static_cast<int>(query_.select.size());
+  return !query_.select.empty();
+}
+
+bool QuerySet::annotate_aggregate(std::string alias, std::string func,
+                                  std::string field_name, bool distinct,
+                                  bool star) {
+  SelectItem it;
+  it.kind = SelectKind::Aggregate;
+  it.out_alias = std::move(alias);
+  it.agg_func = std::move(func);
+  it.agg_distinct = distinct;
+  it.agg_star = star;
+  if (!star) {
+    ColumnRef col;
+    CmpOp op = CmpOp::Eq;
+    bool isnull = false;
+    if (!resolve_lookup_key(field_name, col, op, isnull)) {
+      auto fid = resolve_field(field_name);
+      if (!fid) {
+        return false;
+      }
+      col.field = *fid;
+    }
+    it.col = col;
+  }
+  query_.select.push_back(std::move(it));
+  return true;
+}
+
+bool QuerySet::annotate_sql(std::string alias, std::string sql_fragment,
+                            std::vector<ParamValue> params) {
+  SelectItem it;
+  it.kind = SelectKind::SqlFragment;
+  it.out_alias = std::move(alias);
+  if (sql_fragment.empty() || sql_fragment.front() != '(') {
+    it.sql_fragment = "(" + sql_fragment + ")";
+  } else {
+    it.sql_fragment = std::move(sql_fragment);
+  }
+  for (auto& p : params) {
+    it.fragment_param_idxs.push_back(query_.add_param(std::move(p)));
+  }
+  query_.select.push_back(std::move(it));
+  return true;
+}
+
+bool QuerySet::group_by_fields(const std::vector<std::string>& field_names) {
+  for (const auto& name : field_names) {
+    ColumnRef col;
+    CmpOp op = CmpOp::Eq;
+    bool isnull = false;
+    if (!resolve_lookup_key(name, col, op, isnull)) {
+      auto fid = resolve_field(name);
+      if (!fid) {
+        return false;
+      }
+      col.field = *fid;
+    }
+    query_.group_by.push_back(col);
   }
   return true;
+}
+
+void QuerySet::group_by_selected_columns() { query_.group_by_all_selected = true; }
+
+bool QuerySet::add_select_related(std::string_view path) {
+  if (query_.select.empty()) {
+    if (!select_model_columns()) {
+      return false;
+    }
+  }
+  const ModelSchema* remote = nullptr;
+  std::string alias =
+      ensure_path_joins(path, JoinType::LeftOuter, &remote);
+  if (alias.empty() || !remote) {
+    return false;
+  }
+  RelatedSelect rs;
+  rs.path = std::string(path);
+  rs.join_alias = alias;
+  rs.model_id = remote->id;
+  rs.select_offset = static_cast<int>(query_.select.size());
+  for (const auto& f : remote->fields) {
+    if (f.column.empty()) {
+      continue;
+    }
+    SelectItem it;
+    it.kind = SelectKind::Column;
+    it.col.table_alias = alias;
+    it.col.column_override = f.column;
+    it.col.field = 0;
+    query_.select.push_back(std::move(it));
+    rs.field_attnames.push_back(f.attname.empty() ? f.name : f.attname);
+  }
+  rs.select_count = static_cast<int>(rs.field_attnames.size());
+  query_.related_selects.push_back(std::move(rs));
+  return true;
+}
+
+void QuerySet::add_prefetch(std::string_view lookup) {
+  PrefetchSpec p;
+  p.lookup = std::string(lookup);
+  query_.prefetches.push_back(std::move(p));
 }
 
 bool QuerySet::add_update(std::string_view field_name, ParamValue value) {
@@ -500,10 +726,28 @@ void QuerySet::set_delete() { query_.kind = StmtKind::Delete; }
 bool QuerySet::order_by(std::string_view field_name, bool desc) {
   auto fid = resolve_field(field_name);
   if (!fid) {
-    return false;
+    ColumnRef col;
+    CmpOp op = CmpOp::Eq;
+    bool isnull = false;
+    if (!resolve_lookup_key(field_name, col, op, isnull)) {
+      return false;
+    }
+    OrderItem o;
+    o.col = col;
+    o.desc = desc;
+    query_.order_by.push_back(o);
+    return true;
   }
   OrderItem o;
   o.col.field = *fid;
+  o.desc = desc;
+  query_.order_by.push_back(o);
+  return true;
+}
+
+bool QuerySet::order_by_alias(std::string_view alias, bool desc) {
+  OrderItem o;
+  o.alias = std::string(alias);
   o.desc = desc;
   query_.order_by.push_back(o);
   return true;
@@ -515,6 +759,7 @@ void QuerySet::clear_limits() {
   query_.limit = std::nullopt;
   query_.offset = 0;
 }
+void QuerySet::set_distinct(bool v) { query_.distinct = v; }
 
 CompiledSql QuerySet::compile(const SchemaRegistry& reg) const {
   return compile_query(query_, reg);

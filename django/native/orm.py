@@ -424,3 +424,74 @@ def execute_fetchone_pair(connection, sql: str, params=None):
             return None, False
         extra = cursor.fetchone() is not None
         return row, extra
+
+
+def materialize_models(model, connection, handle, *, limit=None):
+    """
+    Compile+fetch model rows from a native handle.
+    Returns (list[model], prefetch_lookups) or None on failure.
+    Applies select_related caches when related_selects_info is present.
+    """
+    from django.db import router
+
+    try:
+        qs = handle.clone()
+        if not qs.base_attnames():
+            if not qs.select_model_columns():
+                return None
+        if limit is not None:
+            qs.set_limit(int(limit))
+        sql, params = qs.compile_sql()
+        if not sql:
+            return None
+        rows = execute_fetchall(connection, sql, params)
+        attnames = list(qs.base_attnames())
+        related = list(qs.related_selects_info())
+        prefetches = list(qs.prefetch_lookups())
+        db = connection.alias
+        # Map model_id → model class via registry labels is hard; use path resolve.
+        objs = []
+        for row in rows:
+            base = row[: len(attnames)]
+            obj = model.from_db(db, attnames, base)
+            # select_related: fill deferred related objects from trailing cols
+            for rs in related:
+                off = int(rs["offset"])
+                cnt = int(rs["count"])
+                rel_atts = list(rs["attnames"])
+                rel_vals = row[off : off + cnt]
+                # Null PK → no related object
+                if not rel_vals or rel_vals[0] is None:
+                    continue
+                path = rs["path"]
+                # Resolve related model from path on root model
+                rel_model = model
+                field = None
+                for part in path.split("__"):
+                    field = rel_model._meta.get_field(part)
+                    rel_model = field.related_model
+                rel_obj = rel_model.from_db(db, rel_atts, rel_vals)
+                if field is not None:
+                    if hasattr(field, "set_cached_value"):
+                        field.set_cached_value(obj, rel_obj)
+                    elif hasattr(field, "get_cache_name"):
+                        setattr(obj, field.get_cache_name(), rel_obj)
+            objs.append(obj)
+        return objs, prefetches
+    except Exception:
+        return None
+
+
+def materialize_aggregate(connection, handle):
+    """Run aggregate-style select; return dict alias→value or None."""
+    try:
+        sql, params = handle.compile_sql()
+        if not sql:
+            return None
+        rows = execute_fetchall(connection, sql, params)
+        if not rows:
+            return {}
+        # Alias order follows select list; Python caller passes alias names.
+        return rows[0]
+    except Exception:
+        return None

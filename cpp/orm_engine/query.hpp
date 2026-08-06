@@ -28,7 +28,6 @@ enum class StmtKind : std::uint8_t { Select = 0, Update, Delete };
 
 enum class JoinType : std::uint8_t { Inner = 0, LeftOuter };
 
-// Bound parameter stored in the query's arena (typed, no Python).
 struct ParamValue {
   enum class Kind : std::uint8_t {
     None = 0,
@@ -74,15 +73,17 @@ struct ParamValue {
 
 struct ColumnRef {
   FieldId field = 0;
-  // empty → base table (model db_table)
   std::string table_alias;
-  // If set, emit this column name instead of schema field column (join paths).
   std::string column_override;
 };
 
 struct Pred {
   CmpOp op = CmpOp::Eq;
   ColumnRef lhs{};
+  // Optional: RHS is a SQL fragment (subquery) instead of params.
+  bool rhs_is_sql = false;
+  std::string rhs_sql;  // e.g. "(SELECT ...)" already parenthesized
+  std::vector<std::uint32_t> rhs_sql_param_idxs;
   std::vector<std::uint32_t> param_idxs;
   bool is_null_negated = false;
 };
@@ -94,23 +95,39 @@ struct BoolExpr {
   std::vector<BoolExpr> children;
 };
 
+enum class SelectKind : std::uint8_t {
+  Column = 0,
+  Aggregate = 1,
+  SqlFragment = 2,  // annotation subquery / expression SQL
+};
+
 struct SelectItem {
+  SelectKind kind = SelectKind::Column;
   ColumnRef col{};
   std::string out_alias;
+  // Aggregate
+  std::string agg_func;  // COUNT, SUM, AVG, MIN, MAX
+  bool agg_distinct = false;
+  bool agg_star = false;  // COUNT(*)
+  // SqlFragment
+  std::string sql_fragment;
+  std::vector<std::uint32_t> fragment_param_idxs;
 };
 
 struct OrderItem {
   ColumnRef col{};
   bool desc = false;
+  // Order by annotation alias
+  std::string alias;
 };
 
 struct JoinEdge {
   JoinType type = JoinType::Inner;
-  std::string alias;          // joined table alias
-  std::string table;          // physical table name
-  std::string local_alias;    // left side alias
-  std::string local_column;   // FK column on left
-  std::string remote_column;  // PK column on right
+  std::string alias;
+  std::string table;
+  std::string local_alias;
+  std::string local_column;
+  std::string remote_column;
 };
 
 struct Assignment {
@@ -124,6 +141,24 @@ enum class ResultMode : std::uint8_t {
   ValuesList,
   ValuesListFlat,
   ValuesDict,
+  AggregateDict,  // .aggregate() → single row of named aggs
+};
+
+// Prefetch plan: executed after main query (ids known).
+struct PrefetchSpec {
+  std::string lookup;       // path e.g. "author" or "book_set"
+  std::string related_name; // optional
+  // Filter serialized as Q-tree JSON is applied in Python for flexibility.
+};
+
+// select_related column mapping for materialize
+struct RelatedSelect {
+  std::string path;          // "author" or "author__country"
+  std::string join_alias;
+  ModelId model_id = 0;
+  std::vector<std::string> field_attnames;  // order of selected cols
+  int select_offset = 0;     // index into result row where these cols start
+  int select_count = 0;
 };
 
 struct Query {
@@ -134,15 +169,29 @@ struct Query {
   std::vector<JoinEdge> joins;
   BoolExpr where{};
   bool has_where = false;
+  BoolExpr having{};
+  bool has_having = false;
   std::vector<OrderItem> order_by;
+  // GROUP BY: column refs and/or annotation aliases
+  std::vector<ColumnRef> group_by;
+  std::vector<std::string> group_by_aliases;
+  bool group_by_all_selected = false;
   std::optional<std::uint64_t> limit;
   std::uint64_t offset = 0;
   bool distinct = false;
   ResultMode result_mode = ResultMode::Model;
-  std::vector<Assignment> assignments;  // UPDATE SET
+  std::vector<Assignment> assignments;
   std::vector<ParamValue> params;
-  // alias → table name for resolve (base alias = db_table)
   std::string base_alias;
+
+  // select_related bookkeeping for from_db of related models
+  std::vector<RelatedSelect> related_selects;
+  // prefetch_related lookups (Python runs secondary queries)
+  std::vector<PrefetchSpec> prefetches;
+
+  // Concrete field attnames selected for base model (materialize)
+  std::vector<std::string> base_attnames;
+  int base_select_count = 0;
 
   std::uint32_t add_param(ParamValue v) {
     auto idx = static_cast<std::uint32_t>(params.size());
@@ -159,7 +208,6 @@ struct Query {
 void bool_and_append(BoolExpr& dest, BoolExpr child);
 void bool_or_append(BoolExpr& dest, BoolExpr child);
 
-// Parse "exact" / "gt" / "in" / "isnull" / …
 [[nodiscard]] std::optional<CmpOp> cmp_op_from_lookup(std::string_view lookup);
 
 }  // namespace django::orm

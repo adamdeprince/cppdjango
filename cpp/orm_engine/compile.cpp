@@ -42,9 +42,51 @@ void emit_column(std::string& out, DialectId d, const Query& q,
   append_quoted(out, d, f->column);
 }
 
+void emit_rhs_sql(std::string& out, std::vector<std::uint32_t>& order,
+                  const Pred& p) {
+  out += p.rhs_sql;
+  for (auto idx : p.rhs_sql_param_idxs) {
+    order.push_back(idx);
+  }
+}
+
 void emit_pred(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
                const Query& q, const ModelSchema& m, const Pred& p) {
   emit_column(out, d, q, m, p.lhs);
+  if (p.rhs_is_sql) {
+    switch (p.op) {
+      case CmpOp::Eq:
+        out += " = ";
+        emit_rhs_sql(out, order, p);
+        return;
+      case CmpOp::Ne:
+        out += " <> ";
+        emit_rhs_sql(out, order, p);
+        return;
+      case CmpOp::In:
+        out += " IN ";
+        emit_rhs_sql(out, order, p);
+        return;
+      case CmpOp::Lt:
+        out += " < ";
+        emit_rhs_sql(out, order, p);
+        return;
+      case CmpOp::Lte:
+        out += " <= ";
+        emit_rhs_sql(out, order, p);
+        return;
+      case CmpOp::Gt:
+        out += " > ";
+        emit_rhs_sql(out, order, p);
+        return;
+      case CmpOp::Gte:
+        out += " >= ";
+        emit_rhs_sql(out, order, p);
+        return;
+      case CmpOp::IsNull:
+        break;
+    }
+  }
   switch (p.op) {
     case CmpOp::Eq:
       out += " = %s";
@@ -163,6 +205,40 @@ void emit_bool(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
   }
 }
 
+void emit_select_item(std::string& out, std::vector<std::uint32_t>& order,
+                      DialectId d, const Query& q, const ModelSchema& m,
+                      const SelectItem& it) {
+  switch (it.kind) {
+    case SelectKind::Column:
+      emit_column(out, d, q, m, it.col);
+      break;
+    case SelectKind::Aggregate: {
+      out += it.agg_func.empty() ? "COUNT" : it.agg_func;
+      out += '(';
+      if (it.agg_distinct) {
+        out += "DISTINCT ";
+      }
+      if (it.agg_star) {
+        out += '*';
+      } else {
+        emit_column(out, d, q, m, it.col);
+      }
+      out += ')';
+      break;
+    }
+    case SelectKind::SqlFragment:
+      out += it.sql_fragment;
+      for (auto idx : it.fragment_param_idxs) {
+        order.push_back(idx);
+      }
+      break;
+  }
+  if (!it.out_alias.empty()) {
+    out += " AS ";
+    append_quoted(out, d, it.out_alias);
+  }
+}
+
 CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
   CompiledSql result;
   const DialectId d = q.dialect;
@@ -192,11 +268,7 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
     if (i) {
       sql += ", ";
     }
-    emit_column(sql, d, q, m, items[i].col);
-    if (!items[i].out_alias.empty()) {
-      sql += " AS ";
-      append_quoted(sql, d, items[i].out_alias);
-    }
+    emit_select_item(sql, order, d, q, m, items[i]);
   }
 
   sql += " FROM ";
@@ -226,13 +298,53 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
     emit_bool(sql, order, d, q, m, q.where);
   }
 
+  if (!q.group_by.empty() || !q.group_by_aliases.empty() || q.group_by_all_selected) {
+    sql += " GROUP BY ";
+    bool first = true;
+    if (q.group_by_all_selected) {
+      for (const auto& it : items) {
+        if (it.kind != SelectKind::Column) {
+          continue;
+        }
+        if (!first) {
+          sql += ", ";
+        }
+        first = false;
+        emit_column(sql, d, q, m, it.col);
+      }
+    }
+    for (const auto& g : q.group_by) {
+      if (!first) {
+        sql += ", ";
+      }
+      first = false;
+      emit_column(sql, d, q, m, g);
+    }
+    for (const auto& a : q.group_by_aliases) {
+      if (!first) {
+        sql += ", ";
+      }
+      first = false;
+      append_quoted(sql, d, a);
+    }
+  }
+
+  if (q.has_having) {
+    sql += " HAVING ";
+    emit_bool(sql, order, d, q, m, q.having);
+  }
+
   if (!q.order_by.empty()) {
     sql += " ORDER BY ";
     for (std::size_t i = 0; i < q.order_by.size(); ++i) {
       if (i) {
         sql += ", ";
       }
-      emit_column(sql, d, q, m, q.order_by[i].col);
+      if (!q.order_by[i].alias.empty()) {
+        append_quoted(sql, d, q.order_by[i].alias);
+      } else {
+        emit_column(sql, d, q, m, q.order_by[i].col);
+      }
       if (q.order_by[i].desc) {
         sql += " DESC";
       }
