@@ -1,5 +1,6 @@
 #include "middleware.hpp"
 
+#include "cache.hpp"  // patch_vary_headers
 #include "cookie.hpp"
 #include "orm.hpp"  // hsts, csrf_unmask, session helpers, etc.
 #include "request_utils.hpp"  // is_same_domain
@@ -9,6 +10,7 @@
 #include <regex>
 #include <sstream>
 #include <utility>
+#include <vector>
 
 namespace django::native {
 namespace {
@@ -528,7 +530,12 @@ struct HybridHeaderNames {
   PyObject* key_referrer = nullptr;
   PyObject* lower_coop = nullptr;
   PyObject* key_coop = nullptr;
+  PyObject* lower_vary = nullptr;
+  PyObject* key_vary = nullptr;
   PyObject* str_nosniff = nullptr;
+  PyObject* name_accessed = nullptr;
+  PyObject* name_modified = nullptr;
+  PyObject* name_session = nullptr;
 };
 HybridHeaderNames g_hh;
 
@@ -555,7 +562,12 @@ void hybrid_header_names_init() {
   g_hh.key_referrer = intern("Referrer-Policy");
   g_hh.lower_coop = intern("cross-origin-opener-policy");
   g_hh.key_coop = intern("Cross-Origin-Opener-Policy");
+  g_hh.lower_vary = intern("vary");
+  g_hh.key_vary = intern("Vary");
   g_hh.str_nosniff = intern("nosniff");
+  g_hh.name_accessed = intern("accessed");
+  g_hh.name_modified = intern("modified");
+  g_hh.name_session = intern("session");
   g_hh.ready = true;
 }
 
@@ -746,6 +758,47 @@ bool cfg_skip_process_request(nb::dict cfg) {
     }
   }
   return !need;
+}
+
+// SessionMiddleware process_response when session was read but not modified:
+// only patch Vary: Cookie (no is_empty / plan / set_cookie).
+void hybrid_patch_vary_cookie(nb::handle response) {
+  hybrid_header_names_init();
+  PyObject* store = response_header_store(response.ptr());
+  std::string existing;
+  if (store && store_has(store, g_hh.lower_vary)) {
+    PyObject* pair = PyDict_GetItem(store, g_hh.lower_vary);  // borrowed
+    if (pair && PyTuple_Check(pair) && PyTuple_GET_SIZE(pair) >= 2) {
+      PyObject* val = PyTuple_GET_ITEM(pair, 1);
+      if (val && PyUnicode_Check(val)) {
+        Py_ssize_t n = 0;
+        const char* s = PyUnicode_AsUTF8AndSize(val, &n);
+        if (s) {
+          existing.assign(s, static_cast<std::size_t>(n));
+        }
+      }
+    }
+  }
+  static const std::vector<std::string> cookie_hdr = {"Cookie"};
+  std::string merged = patch_vary_headers(existing, cookie_hdr);
+  if (store) {
+    store_set(store, g_hh.lower_vary, g_hh.key_vary, merged);
+    Py_DECREF(store);
+  } else {
+    response.attr("headers").attr("__setitem__")(
+        "Vary", nb::str(merged.c_str(), merged.size()));
+  }
+}
+
+bool session_flag(PyObject* session, PyObject* name) {
+  PyObject* v = PyObject_GetAttr(session, name);
+  if (!v) {
+    PyErr_Clear();
+    return false;
+  }
+  int r = PyObject_IsTrue(v);
+  Py_DECREF(v);
+  return r == 1;
 }
 
 }  // namespace
@@ -1362,21 +1415,58 @@ nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
   }
 
   // --- Session process_response --------------------------------------------
-  // ColdSession with accessed=False → pure no-op without calling Python mw.
+  // Cold / untouched: no-op.
+  // Read-only access (view loaded session, no write): only Vary: Cookie in C++
+  //   unless session is empty with a Cookie header (may need delete_cookie).
+  // Modified / save-every / empty-delete: Python SessionMiddleware.
   if (!bits["session_store"].is_none()) {
+    hybrid_header_names_init();
     bool save_every = false;
     if (bits.contains("save_every_request")) {
       save_every = nb::cast<bool>(bits["save_every_request"]);
     }
     bool accessed = false;
     bool modified = false;
-    try {
-      accessed = nb::cast<bool>(request.attr("session").attr("accessed"));
-      modified = nb::cast<bool>(request.attr("session").attr("modified"));
-    } catch (...) {
+    bool empty = false;
+    bool have_flags = false;
+    PyObject* session = PyObject_GetAttr(request.ptr(), g_hh.name_session);
+    if (session) {
+      accessed = session_flag(session, g_hh.name_accessed);
+      modified = session_flag(session, g_hh.name_modified);
+      if (accessed && !modified && !save_every) {
+        PyObject* empty_m = PyObject_GetAttrString(session, "is_empty");
+        if (empty_m) {
+          PyObject* args = PyTuple_New(0);
+          PyObject* er = args ? PyObject_CallObject(empty_m, args) : nullptr;
+          Py_XDECREF(args);
+          Py_DECREF(empty_m);
+          if (er) {
+            empty = PyObject_IsTrue(er) == 1;
+            Py_DECREF(er);
+            have_flags = true;
+          } else {
+            PyErr_Clear();
+            accessed = true;  // force Python path
+          }
+        } else {
+          PyErr_Clear();
+          accessed = true;
+        }
+      } else {
+        have_flags = true;
+      }
+      Py_DECREF(session);
+    } else {
+      PyErr_Clear();
       accessed = true;  // force Python path on error
     }
-    if (session_response_needs_work(accessed, modified, save_every)) {
+    const bool may_delete =
+        accessed && !modified && !save_every && empty && !http_cookie.empty();
+    if (have_flags && accessed && !modified && !save_every && !may_delete) {
+      // Stock: need_vary only (read path, session still valid or no cookie).
+      hybrid_patch_vary_cookie(response);
+    } else if (session_response_needs_work(accessed, modified, save_every) ||
+               may_delete) {
       if (bits.contains("session_process_response") &&
           !bits["session_process_response"].is_none()) {
         response = bits["session_process_response"](request, response);

@@ -53,6 +53,25 @@ class SessionStore(SessionBase):
             self._session_key = None
 
     def load(self):
+        # Dual-path: fetch only session_data (skip full model instance) when
+        # native is on — warm GET that reads session is the hybrid hot path.
+        if _native.AVAILABLE:
+            try:
+                data = self.model.objects.values_list(
+                    "session_data", flat=True
+                ).get(
+                    session_key=self.session_key,
+                    expire_date__gt=timezone.now(),
+                )
+            except (self.model.DoesNotExist, SuspiciousOperation) as e:
+                if isinstance(e, SuspiciousOperation):
+                    logger = logging.getLogger(
+                        "django.security.%s" % e.__class__.__name__
+                    )
+                    logger.warning(str(e))
+                self._session_key = None
+                return {}
+            return self.decode(data)
         s = self._get_session_from_db()
         if not s:
             return {}
@@ -60,6 +79,23 @@ class SessionStore(SessionBase):
         return self.decode(s.session_data)
 
     async def aload(self):
+        if _native.AVAILABLE:
+            try:
+                data = await self.model.objects.values_list(
+                    "session_data", flat=True
+                ).aget(
+                    session_key=self.session_key,
+                    expire_date__gt=timezone.now(),
+                )
+            except (self.model.DoesNotExist, SuspiciousOperation) as e:
+                if isinstance(e, SuspiciousOperation):
+                    logger = logging.getLogger(
+                        "django.security.%s" % e.__class__.__name__
+                    )
+                    logger.warning(str(e))
+                self._session_key = None
+                return {}
+            return self.decode(data)
         s = await self._aget_session_from_db()
         if not s:
             return {}
