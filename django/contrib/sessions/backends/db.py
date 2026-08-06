@@ -53,25 +53,39 @@ class SessionStore(SessionBase):
             self._session_key = None
 
     def load(self):
-        # Dual-path: fetch only session_data (skip full model instance) when
-        # native is on — warm GET that reads session is the hybrid hot path.
+        # Dual-path: one-shot SQL for session_data (no ORM model instance) when
+        # native is on — warm GET that reads the session is the hybrid hot path.
         if _native.AVAILABLE:
             try:
-                data = self.model.objects.values_list(
-                    "session_data", flat=True
-                ).get(
-                    session_key=self.session_key,
-                    expire_date__gt=timezone.now(),
-                )
-            except (self.model.DoesNotExist, SuspiciousOperation) as e:
-                if isinstance(e, SuspiciousOperation):
-                    logger = logging.getLogger(
-                        "django.security.%s" % e.__class__.__name__
+                from django.db import connections
+
+                using = router.db_for_read(self.model, instance=None) or "default"
+                conn = connections[using]
+                table = conn.ops.quote_name(self.model._meta.db_table)
+                with conn.cursor() as cursor:
+                    cursor.execute(
+                        f"SELECT session_data FROM {table} "
+                        "WHERE session_key = %s AND expire_date > %s",
+                        [self.session_key, timezone.now()],
                     )
-                    logger.warning(str(e))
+                    row = cursor.fetchone()
+            except SuspiciousOperation as e:
+                logger = logging.getLogger(
+                    "django.security.%s" % e.__class__.__name__
+                )
+                logger.warning(str(e))
                 self._session_key = None
                 return {}
-            return self.decode(data)
+            except DatabaseError:
+                # Fallback to ORM on unexpected DB errors.
+                s = self._get_session_from_db()
+                if not s:
+                    return {}
+                return self.decode(s.session_data)
+            if not row:
+                self._session_key = None
+                return {}
+            return self.decode(row[0])
         s = self._get_session_from_db()
         if not s:
             return {}
@@ -79,23 +93,7 @@ class SessionStore(SessionBase):
         return self.decode(s.session_data)
 
     async def aload(self):
-        if _native.AVAILABLE:
-            try:
-                data = await self.model.objects.values_list(
-                    "session_data", flat=True
-                ).aget(
-                    session_key=self.session_key,
-                    expire_date__gt=timezone.now(),
-                )
-            except (self.model.DoesNotExist, SuspiciousOperation) as e:
-                if isinstance(e, SuspiciousOperation):
-                    logger = logging.getLogger(
-                        "django.security.%s" % e.__class__.__name__
-                    )
-                    logger.warning(str(e))
-                self._session_key = None
-                return {}
-            return self.decode(data)
+        # Async keeps ORM (no async cursor path here); sync load is the TE floor.
         s = await self._aget_session_from_db()
         if not s:
             return {}
