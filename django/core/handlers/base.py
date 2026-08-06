@@ -82,12 +82,17 @@ class BaseHandler:
         if stock_handler is not None:
             self._middleware_chain = stock_handler
             self._middleware_hooks_empty = True
-            # Pure stock chain still needs get_response (not lean_view_only) so
-            # security/xframe process_* run via native_stock_chain_call.
+            # Pure stock: C++ outer + native_stock_chain_call around lean view.
             self._lean_view_only = False
             self._use_native_wsgi_outer = bool(_native.AVAILABLE) and not is_async
             self._exact_routes = self._build_exact_route_table()
             self._pin_lean_urlconf()
+            if self._use_native_wsgi_outer:
+                from functools import partial
+
+                self._stock_view = partial(
+                    _native.wsgi_lean_get_response, self
+                )
             return
 
         for middleware_path in reversed(settings.MIDDLEWARE):

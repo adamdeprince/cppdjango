@@ -1,6 +1,7 @@
 #include "wsgi_handler.hpp"
 
-#include "orm.hpp"  // wsgi_request_path
+#include "middleware.hpp"  // native_stock_chain_call
+#include "orm.hpp"         // wsgi_request_path
 
 #include <Python.h>
 
@@ -854,11 +855,14 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
   }
   nb::object request = nb::steal<nb::object>(request_o);
 
-  // lean_view_only (empty MIDDLEWARE): C++ exact-route + view.
-  // Otherwise (pure stock chain or hybrid): Python get_response so the
-  // middleware onion / native_stock_chain_call still runs.
+  // Path selection (flags frozen at load_middleware):
+  //   lean_view_only     → exact routes + view only (empty MIDDLEWARE)
+  //   native_stock_chain → C++ stock chain around lean view (Security/XFrame/…)
+  //   else (hybrid)      → Python get_response (full middleware onion)
   nb::object response;
   bool lean_view = false;
+  bool stock_chain = false;
+  nb::object stock_specs;
   {
     PyObject* flag =
         PyObject_GetAttrString(handler.ptr(), "_lean_view_only");
@@ -867,21 +871,53 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
       Py_DECREF(flag);
     } else {
       PyErr_Clear();
-      // Back-compat: empty hooks + no stock chain flag
-      PyObject* empty =
-          PyObject_GetAttr(handler.ptr(), g_lean.name__middleware_hooks_empty);
-      if (empty) {
-        lean_view = truthy(empty);
-        Py_DECREF(empty);
+    }
+    PyObject* sc =
+        PyObject_GetAttrString(handler.ptr(), "_native_stock_chain");
+    if (sc) {
+      stock_chain = truthy(sc);
+      Py_DECREF(sc);
+    } else {
+      PyErr_Clear();
+    }
+    if (stock_chain) {
+      PyObject* specs =
+          PyObject_GetAttrString(handler.ptr(), "_native_stock_specs");
+      if (specs && specs != Py_None) {
+        stock_specs = nb::steal<nb::object>(specs);
       } else {
+        Py_XDECREF(specs);
         PyErr_Clear();
+        stock_chain = false;
       }
     }
   }
   try {
     if (lean_view) {
       response = wsgi_lean_get_response(handler, request);
+    } else if (stock_chain) {
+      // Pure stock: C++ security/xframe/common around lean view.
+      // handler._stock_view is partial(wsgi_lean_get_response, handler)
+      // set at load_middleware.
+      nb::object stock_view = handler.attr("_stock_view");
+      response = native_stock_chain_call(
+          nb::cast<nb::sequence>(stock_specs), request, stock_view);
+      response.attr("_resource_closers")
+          .attr("append")(request.attr("close"));
+      if (nb::cast<int>(response.attr("status_code")) >= 400) {
+        nb::object log_response =
+            nb::module_::import_("django.utils.log").attr("log_response");
+        nb::dict kw;
+        kw["response"] = response;
+        kw["request"] = request;
+        nb::tuple log_args = nb::make_tuple(
+            nb::str("%s: %s"), response.attr("reason_phrase"),
+            request.attr("path"));
+        nb::steal<nb::object>(
+            PyObject_Call(log_response.ptr(), log_args.ptr(), kw.ptr()));
+      }
     } else {
+      // Hybrid: full Python middleware onion.
       PyObject* gr =
           PyObject_GetAttrString(handler.ptr(), "get_response");
       if (!gr) {
