@@ -29,7 +29,7 @@ Python MiddlewareMixin / handler chain
 | `GZipMiddleware` | `gzip_process_response_plan` |
 | `ConditionalGetMiddleware` | `conditional_needs_etag` |
 | `SessionMiddleware` | `session_load_key`, `session_process_response_plan`, `session_cookie_expiry` |
-| `CsrfViewMiddleware` | `csrf_process_view_gate`, `csrf_secrets_match` (+ existing token helpers) |
+| `CsrfViewMiddleware` | `csrf_process_view_gate`, `csrf_secrets_match`, `csrf_origin_verified`, `csrf_check_referer` (+ token helpers) |
 | `AuthenticationMiddleware` | marked `native_capable` (user load stays Python / lazy) |
 | `LoginRequiredMiddleware` | `auth_login_required_gate` |
 
