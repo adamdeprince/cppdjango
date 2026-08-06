@@ -1,9 +1,13 @@
 #include "signing.hpp"
 
+#include "crypto.hpp"
+
 #include <climits>
 #include <cstdint>
 #include <string>
 #include <string_view>
+
+#include <zlib.h>
 
 namespace django::native {
 namespace {
@@ -184,6 +188,122 @@ bool signer_sep_unsafe(std::string_view sep) noexcept {
     }
   }
   return true;  // only urlsafe chars → unsafe as separator
+}
+
+namespace {
+
+std::optional<std::string> zlib_decompress(std::string_view in) {
+  if (in.empty()) {
+    return std::string{};
+  }
+  z_stream strm{};
+  if (inflateInit(&strm) != Z_OK) {
+    return std::nullopt;
+  }
+  strm.next_in =
+      reinterpret_cast<Bytef*>(const_cast<char*>(in.data()));
+  strm.avail_in = static_cast<uInt>(in.size());
+  std::string out;
+  out.resize(in.size() * 4 + 64);
+  int ret = Z_OK;
+  while (ret == Z_OK) {
+    if (strm.total_out >= out.size()) {
+      out.resize(out.size() * 2 + 64);
+    }
+    strm.next_out = reinterpret_cast<Bytef*>(out.data() + strm.total_out);
+    strm.avail_out = static_cast<uInt>(out.size() - strm.total_out);
+    ret = inflate(&strm, Z_NO_FLUSH);
+  }
+  const uLong total = strm.total_out;
+  inflateEnd(&strm);
+  if (ret != Z_STREAM_END) {
+    return std::nullopt;
+  }
+  out.resize(static_cast<std::size_t>(total));
+  return out;
+}
+
+}  // namespace
+
+std::optional<std::string> signing_base64_hmac(std::string_view salt,
+                                              std::string_view value,
+                                              std::string_view key,
+                                              std::string_view algorithm) {
+  auto algo = hash_algo_from_name(algorithm);
+  if (!algo) {
+    return std::nullopt;
+  }
+  try {
+    std::string dig = salted_hmac_digest(*algo, salt, key, value);
+    return b64_encode(dig);
+  } catch (...) {
+    return std::nullopt;
+  }
+}
+
+std::optional<std::string> signing_unsign_object_bytes(
+    std::string_view signed_value, std::string_view salt,
+    std::string_view secret, std::string_view algorithm, std::string_view sep,
+    double max_age_seconds, double now_unix) {
+  if (sep.empty() || signed_value.empty()) {
+    return std::nullopt;
+  }
+  // value + sep + sig  (rsplit)
+  const auto sig_pos = signed_value.rfind(sep);
+  if (sig_pos == std::string_view::npos || sig_pos == 0) {
+    return std::nullopt;
+  }
+  const std::string_view value = signed_value.substr(0, sig_pos);
+  const std::string_view sig =
+      signed_value.substr(sig_pos + sep.size());
+  if (sig.empty()) {
+    return std::nullopt;
+  }
+
+  // base64_hmac(salt + "signer", value, secret, algorithm)
+  std::string key_salt;
+  key_salt.reserve(salt.size() + 6);
+  key_salt.append(salt);
+  key_salt.append("signer");
+  auto expected = signing_base64_hmac(key_salt, value, secret, algorithm);
+  if (!expected || !constant_time_compare(sig, *expected)) {
+    return std::nullopt;
+  }
+
+  // TimestampSigner: value is base64d + sep + timestamp
+  const auto ts_pos = value.rfind(sep);
+  if (ts_pos == std::string_view::npos) {
+    return std::nullopt;
+  }
+  std::string_view base64d = value.substr(0, ts_pos);
+  const std::string_view ts_str = value.substr(ts_pos + sep.size());
+  if (max_age_seconds >= 0.0) {
+    auto ts = b62_decode(ts_str);
+    if (!ts) {
+      return std::nullopt;
+    }
+    const double now = now_unix > 0.0 ? now_unix : 0.0;
+    // Caller should pass now; if 0, skip age (treat as no check).
+    if (now > 0.0) {
+      const double age = now - static_cast<double>(*ts);
+      if (age > max_age_seconds) {
+        return std::nullopt;
+      }
+    }
+  }
+
+  bool decompress = !base64d.empty() && base64d.front() == '.';
+  if (decompress) {
+    base64d = base64d.substr(1);
+  }
+  auto data = b64_decode(base64d);
+  if (!data) {
+    return std::nullopt;
+  }
+  if (decompress) {
+    return zlib_decompress(*data);
+  }
+  return data;
 }
 
 }  // namespace django::native

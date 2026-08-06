@@ -113,6 +113,18 @@ def b64_decode(s):
 
 
 def base64_hmac(salt, value, key, algorithm="sha1"):
+    if _native.AVAILABLE:
+        try:
+            out = _native.signing_base64_hmac(
+                salt if isinstance(salt, str) else force_bytes(salt).decode("utf-8"),
+                value if isinstance(value, str) else force_bytes(value).decode("utf-8"),
+                key if isinstance(key, str) else force_bytes(key).decode("utf-8"),
+                algorithm,
+            )
+            if out is not None:
+                return out
+        except Exception:
+            pass
     return b64_encode(
         salted_hmac(salt, value, key, algorithm=algorithm).digest()
     ).decode()
@@ -206,6 +218,29 @@ def loads(
 
     The serializer is expected to accept a bytestring.
     """
+    # Hot path (sessions): no max_age → full unsign+b64(+zlib) in C++.
+    if _native.AVAILABLE and max_age is None and isinstance(s, str):
+        primary = key if key is not None else settings.SECRET_KEY
+        keys = [primary]
+        if fallback_keys is not None:
+            keys.extend(fallback_keys)
+        else:
+            keys.extend(settings.SECRET_KEY_FALLBACKS)
+        algo = "sha256"  # TimestampSigner / Signer default
+        for k in keys:
+            if k is None:
+                continue
+            if isinstance(k, (bytes, bytearray)):
+                k = k.decode("utf-8", errors="surrogateescape")
+            try:
+                raw = _native.signing_unsign_object_bytes(
+                    s, salt, k, algo, ":", -1.0, 0.0
+                )
+            except Exception:
+                raw = None
+            if raw is not None:
+                return serializer().loads(raw)
+        # Fall through to Python for identical BadSignature messaging / edge cases.
     return TimestampSigner(
         key=key, salt=salt, fallback_keys=fallback_keys
     ).unsign_object(

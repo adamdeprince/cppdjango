@@ -82,7 +82,9 @@ target_include_directories(_native PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/cpp)
 
 # OpenSSL for HMAC / PBKDF2 / RAND (system crypto, not homebrew invent)
 find_package(OpenSSL REQUIRED)
-target_link_libraries(_native PRIVATE OpenSSL::Crypto)
+# zlib for signing.loads decompress (session encode uses compress=True)
+find_package(ZLIB REQUIRED)
+target_link_libraries(_native PRIVATE OpenSSL::Crypto ZLIB::ZLIB)
 
 target_compile_definitions(
   _native

@@ -388,6 +388,42 @@ def signing_b64_decode(data: str) -> bytes:
     return fallbacks.signing_b64_decode(data)
 
 
+def signing_base64_hmac(salt: str, value: str, key: str, algorithm: str = "sha1"):
+    """Django signing.base64_hmac (urlsafe b64 of salted_hmac digest)."""
+    impl = _impl()
+    if impl is not None:
+        return impl.signing_base64_hmac(salt, value, key, algorithm)
+    return None
+
+
+def signing_unsign_object_bytes(
+    signed_value: str,
+    salt: str,
+    secret: str,
+    algorithm: str = "sha256",
+    sep: str = ":",
+    max_age_seconds: float = -1.0,
+    now_unix: float = 0.0,
+):
+    """
+    TimestampSigner.unsign_object payload bytes.
+
+    Returns bytes on success, None if the signature does not match (try next key).
+    """
+    impl = _impl()
+    if impl is not None:
+        return impl.signing_unsign_object_bytes(
+            signed_value,
+            salt,
+            secret,
+            algorithm,
+            sep,
+            max_age_seconds,
+            now_unix,
+        )
+    return None
+
+
 def constant_time_compare(a, b) -> bool:
     impl = _impl()
     if impl is not None:

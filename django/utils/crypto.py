@@ -17,6 +17,21 @@ class InvalidAlgorithm(ValueError):
     pass
 
 
+class _HmacResult:
+    """Lightweight stand-in for hmac.HMAC when digest is precomputed in C++."""
+
+    __slots__ = ("_d",)
+
+    def __init__(self, d):
+        self._d = d
+
+    def digest(self):
+        return self._d
+
+    def hexdigest(self):
+        return self._d.hex()
+
+
 def salted_hmac(key_salt, value, secret=None, *, algorithm="sha1"):
     """
     Return the HMAC of 'value', using a key generated from key_salt and a
@@ -39,18 +54,9 @@ def salted_hmac(key_salt, value, secret=None, *, algorithm="sha1"):
         ) from e
     if _native.AVAILABLE and algorithm in {"sha1", "sha256", "sha384", "sha512", "md5"}:
         # OpenSSL path: return an object with .digest() matching hmac.HMAC API.
+        # Use a process-lifetime class (not a per-call class) — signing.loads
+        # hits this on every session decode.
         digest = _native.salted_hmac_digest(algorithm, key_salt, secret, value)
-
-        class _HmacResult:
-            def __init__(self, d):
-                self._d = d
-
-            def digest(self):
-                return self._d
-
-            def hexdigest(self):
-                return self._d.hex()
-
         return _HmacResult(digest)
     # We need to generate a derived key from our base key. We can do this by
     # passing the key_salt and our base key through a pseudo-random function.

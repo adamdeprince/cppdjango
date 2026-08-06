@@ -1273,6 +1273,39 @@ NB_MODULE(_native, m) {
       nb::arg("data"));
 
   m.def(
+      "signing_base64_hmac",
+      [](const std::string& salt, const std::string& value,
+         const std::string& key, const std::string& algorithm) -> nb::object {
+        auto v = django::native::signing_base64_hmac(salt, value, key, algorithm);
+        if (!v) {
+          return nb::none();
+        }
+        return nb::str(v->c_str(), v->size());
+      },
+      nb::arg("salt"), nb::arg("value"), nb::arg("key"),
+      nb::arg("algorithm") = "sha1",
+      "Django base64_hmac: urlsafe b64 of salted_hmac digest.");
+
+  m.def(
+      "signing_unsign_object_bytes",
+      [](const std::string& signed_value, const std::string& salt,
+         const std::string& secret, const std::string& algorithm,
+         const std::string& sep, double max_age_seconds,
+         double now_unix) -> nb::object {
+        auto v = django::native::signing_unsign_object_bytes(
+            signed_value, salt, secret, algorithm, sep, max_age_seconds,
+            now_unix);
+        if (!v) {
+          return nb::none();
+        }
+        return nb::bytes(v->data(), v->size());
+      },
+      nb::arg("signed_value"), nb::arg("salt"), nb::arg("secret"),
+      nb::arg("algorithm") = "sha256", nb::arg("sep") = ":",
+      nb::arg("max_age_seconds") = -1.0, nb::arg("now_unix") = 0.0,
+      "TimestampSigner.unsign_object payload bytes (None if bad signature).");
+
+  m.def(
       "constant_time_compare",
       [](nb::object a, nb::object b) {
         std::string sa, sb;
