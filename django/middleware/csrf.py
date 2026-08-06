@@ -338,6 +338,9 @@ class CsrfViewMiddleware(MiddlewareMixin):
         from django import native as _native
 
         referer = request.META.get("HTTP_REFERER")
+        if referer is None:
+            raise RejectRequest(REASON_NO_REFERER)
+
         if _native.AVAILABLE:
             good_referer = (
                 settings.SESSION_COOKIE_DOMAIN
@@ -347,34 +350,29 @@ class CsrfViewMiddleware(MiddlewareMixin):
             if good_referer is None:
                 try:
                     good_referer = request.get_host()
-                except DisallowedHost:
+                except (DisallowedHost, KeyError):
                     good_referer = ""
             else:
                 server_port = request.get_port()
                 if server_port not in ("443", "80"):
                     good_referer = "%s:%s" % (good_referer, server_port)
             reason = _native.csrf_check_referer(
-                referer or "",
+                referer,
                 good_referer or "",
                 list(self.csrf_trusted_origins_hosts),
             )
             if not reason:
                 return
-            if reason == "no_referer":
-                raise RejectRequest(REASON_NO_REFERER)
             if reason == "malformed":
                 raise RejectRequest(REASON_MALFORMED_REFERER)
             if reason == "insecure":
                 raise RejectRequest(REASON_INSECURE_REFERER)
-            # bad — include referer URL when possible
+            # bad (or unexpected) — include referer URL when possible
             try:
-                shown = urlsplit(referer).geturl() if referer else ""
+                shown = urlsplit(referer).geturl()
             except ValueError:
-                shown = referer or ""
+                shown = referer
             raise RejectRequest(REASON_BAD_REFERER % shown)
-
-        if referer is None:
-            raise RejectRequest(REASON_NO_REFERER)
 
         try:
             referer = urlsplit(referer)

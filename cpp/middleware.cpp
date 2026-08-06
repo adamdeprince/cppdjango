@@ -399,7 +399,18 @@ OriginParts split_origin_like(std::string_view url) {
     return out;
   }
   out.netloc = std::string(rest.substr(0, i));
-  out.ok = !out.scheme.empty() && !out.netloc.empty();
+  if (out.scheme.empty() || out.netloc.empty()) {
+    return out;
+  }
+  // urlsplit raises ValueError on incomplete IPv6 (e.g. "https://[").
+  auto lb = out.netloc.find('[');
+  if (lb != std::string::npos) {
+    auto rb = out.netloc.find(']', lb);
+    if (rb == std::string::npos) {
+      return out;  // ok stays false
+    }
+  }
+  out.ok = true;
   return out;
 }
 
@@ -435,12 +446,13 @@ bool csrf_origin_verified(
 std::string csrf_check_referer(std::string_view referer_header,
                                std::string_view good_referer,
                                const std::vector<std::string>& trusted_hosts) {
+  // Callers treat missing header as no_referer before invoking this.
+  // Empty string / non-URL → malformed (matches urlsplit empty scheme/netloc).
   if (referer_header.empty()) {
-    return "no_referer";
+    return "malformed";
   }
   auto ref = split_origin_like(referer_header);
   if (!ref.ok) {
-    // Also reject if scheme/netloc empty after partial parse
     return "malformed";
   }
   // Lowercase compare for scheme
