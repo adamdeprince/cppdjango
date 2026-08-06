@@ -150,4 +150,25 @@ namespace django::native {
 [[nodiscard]] bool is_native_stock_middleware_path(
     std::string_view dotted_path) noexcept;
 
+// --- Hybrid plan (Security/Common/XFrame batched; Session/Auth stay Python) -
+
+// process_request batch: SSL redirect + optional PREPEND_WWW.
+// cfg dict keys: security{redirect,redirect_host,exempt_patterns},
+//                common{prepend_www} (optional).
+// Returns HttpResponsePermanentRedirect or None.
+[[nodiscard]] nb::object hybrid_process_request(nb::dict cfg,
+                                                nb::handle request);
+
+// process_response batch: X-Frame-Options, Content-Length, security headers.
+// Mutates response; returns it. cfg: security{...}, xframe{setting_value},
+// common{enabled bool}.
+[[nodiscard]] nb::object hybrid_process_response(nb::dict cfg,
+                                                 nb::handle request,
+                                                 nb::handle response);
+
+// Session process_response: True if a full plan is needed; False = pure no-op
+// (not accessed, not modified, not save-every-request).
+[[nodiscard]] bool session_response_needs_work(bool accessed, bool modified,
+                                               bool save_every_request) noexcept;
+
 }  // namespace django::native

@@ -2889,6 +2889,33 @@ def native_stock_chain_call(specs, request, get_response):
     raise RuntimeError("native native_stock_chain_call unavailable")
 
 
+def hybrid_process_request(cfg, request):
+    """Batched Security/Common process_request. Returns redirect or None."""
+    impl = _impl()
+    if impl is not None:
+        return impl.hybrid_process_request(cfg, request)
+    raise RuntimeError("native hybrid_process_request unavailable")
+
+
+def hybrid_process_response(cfg, request, response):
+    """Batched XFrame + Content-Length + Security process_response."""
+    impl = _impl()
+    if impl is not None:
+        return impl.hybrid_process_response(cfg, request, response)
+    raise RuntimeError("native hybrid_process_response unavailable")
+
+
+def session_response_needs_work(accessed, modified, save_every_request) -> bool:
+    """False when SessionMiddleware process_response is a pure no-op."""
+    impl = _impl()
+    if impl is not None:
+        return bool(
+            impl.session_response_needs_work(
+                bool(accessed), bool(modified), bool(save_every_request)
+            )
+        )
+    return bool(accessed or modified or save_every_request)
+
 def message_tags_join(extra_tags: str, level_tag: str) -> str:
     impl = _impl()
     if impl is not None:

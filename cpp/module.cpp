@@ -3583,7 +3583,26 @@ NB_MODULE(_native, m) {
                                                        get_response);
       },
       nb::arg("specs"), nb::arg("request"), nb::arg("get_response"));
-
+  m.def(
+      "hybrid_process_request",
+      [](nb::dict cfg, nb::handle request) {
+        return django::native::hybrid_process_request(cfg, request);
+      },
+      nb::arg("cfg"), nb::arg("request"));
+  m.def(
+      "hybrid_process_response",
+      [](nb::dict cfg, nb::handle request, nb::handle response) {
+        return django::native::hybrid_process_response(cfg, request, response);
+      },
+      nb::arg("cfg"), nb::arg("request"), nb::arg("response"));
+  m.def(
+      "session_response_needs_work",
+      [](bool accessed, bool modified, bool save_every_request) {
+        return django::native::session_response_needs_work(
+            accessed, modified, save_every_request);
+      },
+      nb::arg("accessed"), nb::arg("modified"),
+      nb::arg("save_every_request"));
   m.def("message_tags_join",
         [](const std::string& extra_tags, const std::string& level_tag) {
           return django::native::message_tags_join(extra_tags, level_tag);

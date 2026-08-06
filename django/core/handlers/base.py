@@ -95,6 +95,24 @@ class BaseHandler:
                 )
             return
 
+        # Flattened hybrid: one plan for Security/Common/XFrame; Session/Auth/CSRF
+        # stay thin Python. Avoids 6-deep MiddlewareMixin onion.
+        hybrid_handler = self._install_hybrid_flattened_chain(
+            get_response, is_async, _native
+        )
+        if hybrid_handler is not None:
+            self._middleware_chain = hybrid_handler
+            self._middleware_hooks_empty = not (
+                self._view_middleware
+                or self._template_response_middleware
+                or self._exception_middleware
+            )
+            self._lean_view_only = False
+            self._use_native_wsgi_outer = True
+            self._exact_routes = self._build_exact_route_table()
+            self._pin_lean_urlconf()
+            return
+
         for middleware_path in reversed(settings.MIDDLEWARE):
             middleware = import_string(middleware_path)
             middleware_can_sync = getattr(middleware, "sync_capable", True)
@@ -397,6 +415,165 @@ class BaseHandler:
             )
 
         return convert_exception_to_response(stock_chain)
+
+    # Known hybrid middleware paths (process_request/response order in settings).
+    _HYBRID_SESSION = "django.contrib.sessions.middleware.SessionMiddleware"
+    _HYBRID_CSRF = "django.middleware.csrf.CsrfViewMiddleware"
+    _HYBRID_AUTH = "django.contrib.auth.middleware.AuthenticationMiddleware"
+    _HYBRID_SECURITY = "django.middleware.security.SecurityMiddleware"
+    _HYBRID_COMMON = "django.middleware.common.CommonMiddleware"
+    _HYBRID_XFRAME = "django.middleware.clickjacking.XFrameOptionsMiddleware"
+
+    def _install_hybrid_flattened_chain(self, get_response, is_async, _native):
+        """
+        When every MIDDLEWARE entry is stock dual-path native and the stack
+        includes Session/CSRF/Auth (cannot be pure C++ stock chain), install a
+        single chain callable:
+
+          hybrid_process_request (Security+Common)
+          → Session/CSRF/Auth process_request (Python)
+          → get_response (view middleware + view)
+          → CSRF/Session process_response (Python)
+          → hybrid_process_response (XFrame+Content-Length+Security)
+
+        process_view hooks (CSRF) are registered on the handler as usual.
+        """
+        if is_async or not getattr(_native, "AVAILABLE", False):
+            return None
+        paths = list(settings.MIDDLEWARE or ())
+        if not paths:
+            return None
+        classification = self._middleware_native_at_load
+        if not classification or not all(c.get("native") for c in classification):
+            return None
+        path_set = set(paths)
+        # Need at least one Python-only-body link; pure stock already handled.
+        if not (
+            self._HYBRID_SESSION in path_set
+            or self._HYBRID_AUTH in path_set
+            or self._HYBRID_CSRF in path_set
+        ):
+            return None
+        # Only known stock paths (no custom middleware).
+        known = {
+            self._HYBRID_SECURITY,
+            self._HYBRID_SESSION,
+            self._HYBRID_COMMON,
+            self._HYBRID_CSRF,
+            self._HYBRID_AUTH,
+            self._HYBRID_XFRAME,
+            "django.middleware.gzip.GZipMiddleware",
+            "django.middleware.http.ConditionalGetMiddleware",
+            "django.contrib.auth.middleware.LoginRequiredMiddleware",
+        }
+        if any(p not in known for p in paths):
+            return None
+        # GZip still needs Python zlib mid-response — skip flatten if present.
+        if "django.middleware.gzip.GZipMiddleware" in path_set:
+            return None
+        if "django.middleware.http.ConditionalGetMiddleware" in path_set:
+            return None
+
+        # Instantiate middleware for process_* only (get_response unused).
+        def _noop(request):
+            return None
+
+        instances = {}
+        for p in paths:
+            cls = import_string(p)
+            try:
+                instances[p] = cls(_noop)
+            except MiddlewareNotUsed:
+                continue
+            except Exception:
+                return None
+
+        session_mw = instances.get(self._HYBRID_SESSION)
+        csrf_mw = instances.get(self._HYBRID_CSRF)
+        auth_mw = instances.get(self._HYBRID_AUTH)
+
+        # Register process_view / exception / template hooks.
+        self._view_middleware = []
+        self._template_response_middleware = []
+        self._exception_middleware = []
+        for p in paths:
+            mw = instances.get(p)
+            if mw is None:
+                continue
+            if hasattr(mw, "process_view"):
+                self._view_middleware.append(
+                    self.adapt_method_mode(is_async, mw.process_view)
+                )
+            if hasattr(mw, "process_template_response"):
+                self._template_response_middleware.append(
+                    self.adapt_method_mode(is_async, mw.process_template_response)
+                )
+            if hasattr(mw, "process_exception"):
+                self._exception_middleware.append(
+                    self.adapt_method_mode(False, mw.process_exception)
+                )
+
+        cfg = {
+            "security": {
+                "redirect": bool(settings.SECURE_SSL_REDIRECT),
+                "redirect_host": settings.SECURE_SSL_HOST or "",
+                "exempt_patterns": list(settings.SECURE_REDIRECT_EXEMPT or ()),
+                "sts_seconds": int(settings.SECURE_HSTS_SECONDS or 0),
+                "sts_include_subdomains": bool(
+                    settings.SECURE_HSTS_INCLUDE_SUBDOMAINS
+                ),
+                "sts_preload": bool(settings.SECURE_HSTS_PRELOAD),
+                "content_type_nosniff": bool(settings.SECURE_CONTENT_TYPE_NOSNIFF),
+                "referrer_policy": settings.SECURE_REFERRER_POLICY,
+                "cross_origin_opener_policy": (
+                    settings.SECURE_CROSS_ORIGIN_OPENER_POLICY
+                ),
+            },
+            "common": {
+                "prepend_www": bool(settings.PREPEND_WWW),
+                "content_length": True,
+            },
+            "xframe": {
+                "setting_value": getattr(settings, "X_FRAME_OPTIONS", "DENY")
+                or "DENY",
+            },
+        }
+        # Drop sections for middleware not in the stack.
+        if self._HYBRID_SECURITY not in path_set:
+            del cfg["security"]
+        if self._HYBRID_COMMON not in path_set:
+            del cfg["common"]
+        if self._HYBRID_XFRAME not in path_set:
+            del cfg["xframe"]
+
+        def hybrid_chain(
+            request,
+            *,
+            _cfg=cfg,
+            _session=session_mw,
+            _csrf=csrf_mw,
+            _auth=auth_mw,
+            _get_response=get_response,
+            _n=_native,
+        ):
+            early = _n.hybrid_process_request(_cfg, request)
+            if early is not None:
+                return early
+            if _session is not None:
+                _session.process_request(request)
+            if _csrf is not None:
+                _csrf.process_request(request)
+            if _auth is not None:
+                _auth.process_request(request)
+            response = _get_response(request)
+            if _csrf is not None:
+                response = _csrf.process_response(request, response)
+            if _session is not None:
+                response = _session.process_response(request, response)
+            return _n.hybrid_process_response(_cfg, request, response)
+
+        self._hybrid_flattened = True
+        return convert_exception_to_response(hybrid_chain)
 
     def _any_atomic_requests(self):
         """True if any DB alias has ATOMIC_REQUESTS (checked live; tests toggle it)."""

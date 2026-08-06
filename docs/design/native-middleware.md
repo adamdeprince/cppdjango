@@ -77,10 +77,26 @@ native_stock_chain_call(frozen_specs, request, get_response)
   → process_response reverse (security headers, xframe, content-length)
 ```
 
-Any stack that includes Session, CSRF, Auth, GZip, ConditionalGet, or custom
-middleware keeps the Python walk + dual-path bodies. Those paths are still
-**marked native at load** in `_middleware_native_at_load` when they are stock
-dual-path ports (`native_capable` / `is_native_stock_middleware_path`).
+### Flattened hybrid plan (Session/CSRF/Auth stacks)
+
+When every `MIDDLEWARE` entry is stock dual-path native **and** the stack
+includes Session, CSRF, or Auth (cannot be pure C++ stock chain),
+`load_middleware` installs a **single** chain callable instead of a 6-deep
+`MiddlewareMixin` onion:
+
+```text
+hybrid_process_request(cfg)     # C++: Security SSL + Common PREPEND_WWW
+→ Session / CSRF / Auth process_request   # Python (session has no-op fast path)
+→ get_response                  # view middleware (CSRF process_view) + view
+→ CSRF / Session process_response         # Python (session skips if untouched)
+→ hybrid_process_response(cfg)  # C++: XFrame + Content-Length + Security headers
+```
+
+Session fast no-op: if `not accessed and not modified and not
+SESSION_SAVE_EVERY_REQUEST`, `process_response` returns immediately
+(`session_response_needs_work`).
+
+GZip / ConditionalGet / custom middleware still use the Python onion.
 
 `is_native_stock_middleware_path(path)` reports known dual-path stock classes
 (introspection / eligibility helpers).

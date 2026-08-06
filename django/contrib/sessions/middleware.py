@@ -26,7 +26,11 @@ class SessionMiddleware(MiddlewareMixin):
 
     def process_request(self, request):
         session_key = request.COOKIES.get(settings.SESSION_COOKIE_NAME)
-        if self._use_native and session_key is not None:
+        if session_key is None:
+            # No cookie: empty SessionStore (no key validation hop).
+            request.session = self.SessionStore(None)
+            return
+        if self._use_native:
             session_key = _native.session_load_key(session_key)
         request.session = self.SessionStore(session_key)
 
@@ -39,6 +43,21 @@ class SessionMiddleware(MiddlewareMixin):
         try:
             accessed = request.session.accessed
             modified = request.session.modified
+        except AttributeError:
+            return response
+
+        # Fast no-op: session never touched and we do not save every request.
+        # Skips is_empty() / native plan / Vary work (hybrid TE path).
+        save_every = bool(settings.SESSION_SAVE_EVERY_REQUEST)
+        if self._use_native:
+            if not _native.session_response_needs_work(
+                bool(accessed), bool(modified), save_every
+            ):
+                return response
+        elif not accessed and not modified and not save_every:
+            return response
+
+        try:
             empty = request.session.is_empty()
         except AttributeError:
             return response
@@ -47,7 +66,7 @@ class SessionMiddleware(MiddlewareMixin):
         if self._use_native:
             # Avoid get_expiry_* until we know we may save — those touch the
             # session dict and would load from the DB on every response.
-            may_save = (modified or settings.SESSION_SAVE_EVERY_REQUEST) and not empty
+            may_save = (modified or save_every) and not empty
             if may_save:
                 expire_browser = bool(request.session.get_expire_at_browser_close())
                 expiry_age = int(request.session.get_expiry_age() or 0)
@@ -59,7 +78,7 @@ class SessionMiddleware(MiddlewareMixin):
                 bool(modified),
                 bool(empty),
                 cookie_name in request.COOKIES,
-                bool(settings.SESSION_SAVE_EVERY_REQUEST),
+                save_every,
                 int(response.status_code),
                 expire_browser,
                 expiry_age,
@@ -110,7 +129,7 @@ class SessionMiddleware(MiddlewareMixin):
             need_vary_cookie = True
         else:
             need_vary_cookie = accessed
-            if (modified or settings.SESSION_SAVE_EVERY_REQUEST) and not empty:
+            if (modified or save_every) and not empty:
                 if request.session.get_expire_at_browser_close():
                     max_age = None
                     expires = None

@@ -625,4 +625,135 @@ nb::object native_stock_chain_call(nb::sequence specs, nb::handle request,
   return response;
 }
 
+nb::object hybrid_process_request(nb::dict cfg, nb::handle request) {
+  auto is_secure = [&]() {
+    return nb::cast<bool>(request.attr("is_secure")());
+  };
+  auto path_lstrip = [&]() {
+    return nb::cast<std::string>(
+        nb::str(request.attr("path")).attr("lstrip")("/"));
+  };
+  auto full_path = [&]() {
+    return nb::cast<std::string>(request.attr("get_full_path")());
+  };
+  auto host = [&]() {
+    return nb::cast<std::string>(request.attr("get_host")());
+  };
+
+  // Security SSL redirect
+  if (cfg.contains("security")) {
+    nb::dict sec = nb::cast<nb::dict>(cfg["security"]);
+    std::vector<std::string> pats;
+    if (sec.contains("exempt_patterns")) {
+      for (nb::handle p : sec["exempt_patterns"]) {
+        pats.push_back(nb::cast<std::string>(p));
+      }
+    }
+    auto url = security_process_request(
+        nb::cast<bool>(sec["redirect"]), is_secure(), path_lstrip(),
+        full_path(), nb::cast<std::string>(sec["redirect_host"]), host(), pats);
+    if (url) {
+      nb::object cls = nb::module_::import_("django.http")
+                           .attr("HttpResponsePermanentRedirect");
+      return cls(nb::str(url->c_str(), url->size()));
+    }
+  }
+
+  // Common PREPEND_WWW (usually off on benches)
+  if (cfg.contains("common")) {
+    nb::dict common = nb::cast<nb::dict>(cfg["common"]);
+    if (common.contains("prepend_www") &&
+        nb::cast<bool>(common["prepend_www"])) {
+      std::string h = host();
+      std::string scheme = nb::cast<std::string>(request.attr("scheme"));
+      std::string path = full_path();
+      auto url = common_www_redirect_url(true, h, scheme, path);
+      if (url) {
+        nb::object cls = nb::module_::import_("django.http")
+                             .attr("HttpResponsePermanentRedirect");
+        return cls(nb::str(url->c_str(), url->size()));
+      }
+    }
+  }
+
+  return nb::none();
+}
+
+nb::object hybrid_process_response(nb::dict cfg, nb::handle request,
+                                   nb::handle response) {
+  auto is_secure = [&]() {
+    return nb::cast<bool>(request.attr("is_secure")());
+  };
+  auto has_header = [](nb::handle resp, const char* name) {
+    return nb::cast<bool>(resp.attr("__contains__")(name));
+  };
+
+  // X-Frame-Options first (outermost response among header mw)
+  if (cfg.contains("xframe")) {
+    nb::dict xf = nb::cast<nb::dict>(cfg["xframe"]);
+    bool has = !response.attr("get")("X-Frame-Options").is_none();
+    bool exempt = false;
+    if (nb::hasattr(response, "xframe_options_exempt")) {
+      exempt = nb::cast<bool>(response.attr("xframe_options_exempt"));
+    }
+    auto val = xframe_process_response(
+        has, exempt, nb::cast<std::string>(xf["setting_value"]));
+    if (val) {
+      response.attr("headers").attr("__setitem__")(
+          "X-Frame-Options", nb::str(val->c_str(), val->size()));
+    }
+  }
+
+  // Content-Length
+  if (cfg.contains("common")) {
+    nb::dict common = nb::cast<nb::dict>(cfg["common"]);
+    bool do_cl = true;
+    if (common.contains("content_length")) {
+      do_cl = nb::cast<bool>(common["content_length"]);
+    }
+    if (do_cl) {
+      bool streaming = nb::cast<bool>(response.attr("streaming"));
+      std::size_t clen = 0;
+      if (!streaming) {
+        clen = static_cast<std::size_t>(
+            nb::len(nb::handle(response.attr("content"))));
+      }
+      auto cl = common_content_length_header(
+          streaming,
+          nb::cast<bool>(response.attr("has_header")("Content-Length")), clen);
+      if (cl) {
+        response.attr("headers").attr("__setitem__")(
+            "Content-Length", nb::str(cl->c_str(), cl->size()));
+      }
+    }
+  }
+
+  // Security headers
+  if (cfg.contains("security")) {
+    nb::dict sec = nb::cast<nb::dict>(cfg["security"]);
+    nb::dict actions = security_process_response(
+        is_secure(), has_header(response, "Strict-Transport-Security"),
+        nb::cast<int>(sec["sts_seconds"]),
+        nb::cast<bool>(sec["sts_include_subdomains"]),
+        nb::cast<bool>(sec["sts_preload"]),
+        nb::cast<bool>(sec["content_type_nosniff"]),
+        has_header(response, "X-Content-Type-Options"),
+        sec.contains("referrer_policy") ? nb::handle(sec["referrer_policy"])
+                                        : nb::handle(nb::none()),
+        has_header(response, "Referrer-Policy"),
+        sec.contains("cross_origin_opener_policy")
+            ? nb::handle(sec["cross_origin_opener_policy"])
+            : nb::handle(nb::none()),
+        has_header(response, "Cross-Origin-Opener-Policy"));
+    apply_security_headers(response, actions);
+  }
+
+  return nb::borrow(response);
+}
+
+bool session_response_needs_work(bool accessed, bool modified,
+                                 bool save_every_request) noexcept {
+  return accessed || modified || save_every_request;
+}
+
 }  // namespace django::native
