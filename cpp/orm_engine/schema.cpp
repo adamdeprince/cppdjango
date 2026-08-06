@@ -12,7 +12,7 @@ void index_fields(ModelSchema& schema) {
   for (auto& f : schema.fields) {
     f.id = fid++;
     schema.field_by_name[f.name] = f.id;
-    if (f.attname != f.name) {
+    if (f.attname != f.name && !f.attname.empty()) {
       schema.field_by_name[f.attname] = f.id;
     }
     if (f.primary_key) {
@@ -124,6 +124,22 @@ FieldType field_type_from_class_name(std::string_view class_name) {
     return FieldType::ForeignKey;
   }
   return FieldType::Other;
+}
+
+RelKind rel_kind_from_string(std::string_view s) {
+  if (s == "fk" || s == "forward_fk") {
+    return RelKind::ForwardFK;
+  }
+  if (s == "rev_fk" || s == "reverse_fk") {
+    return RelKind::ReverseFK;
+  }
+  if (s == "m2m" || s == "forward_m2m") {
+    return RelKind::ForwardM2M;
+  }
+  if (s == "rev_m2m" || s == "reverse_m2m") {
+    return RelKind::ReverseM2M;
+  }
+  return RelKind::None;
 }
 
 }  // namespace django::orm

@@ -1,8 +1,9 @@
 """
 Python facade for the native ORM data plane.
 
-Query build + SQL compile live in C++. This module exports schema from Meta,
-bridges kwargs / Q trees, and runs execute/materialize in few crossings.
+Query build + SQL compile live in C++. This module exports schema from Meta
+(including reverse FK and M2M), bridges kwargs / Q trees (incl. XOR), and
+runs execute/materialize in few crossings.
 """
 
 from __future__ import annotations
@@ -49,11 +50,46 @@ def model_id(label: str) -> int | None:
     return orm.model_id(label)
 
 
+def _field_row(
+    name,
+    attname,
+    column,
+    class_name,
+    pk,
+    null,
+    remote_table="",
+    remote_pk="",
+    remote_label="",
+    rel_kind="",
+    m2m_table="",
+    m2m_column="",
+    m2m_reverse="",
+    remote_fk_column="",
+):
+    return (
+        name,
+        attname,
+        column,
+        class_name,
+        bool(pk),
+        bool(null),
+        remote_table or "",
+        remote_pk or "",
+        remote_label or "",
+        rel_kind or "",
+        m2m_table or "",
+        m2m_column or "",
+        m2m_reverse or "",
+        remote_fk_column or "",
+    )
+
+
 def register_model_from_meta(model, _seen: set | None = None) -> int | None:
     """
     Snapshot model._meta into the C++ SchemaRegistry.
 
-    Recursively exports related models so multi-hop joins can resolve columns.
+    Includes forward FK, reverse FK, and M2M relation hops. Recursively
+    exports related models for multi-hop joins.
     """
     orm = _orm()
     if orm is None:
@@ -67,36 +103,130 @@ def register_model_from_meta(model, _seen: set | None = None) -> int | None:
     _seen.add(label)
 
     fields = []
+
+    # Concrete local fields (columns + forward FK).
     for f in opts.concrete_fields:
         if not f.column:
             continue
-        remote_table = ""
-        remote_pk = ""
-        remote_label = ""
+        remote_table = remote_pk = remote_label = rel_kind = ""
         if f.is_relation and (f.many_to_one or f.one_to_one):
             try:
                 remote_model = f.remote_field.model
-                # Ensure remote schema exists for multi-hop.
                 register_model_from_meta(remote_model, _seen)
                 remote = remote_model._meta
                 remote_table = remote.db_table
                 remote_pk = remote.pk.column
                 remote_label = f"{remote.app_label}.{remote.object_name}"
+                rel_kind = "fk"
             except Exception:
-                remote_table = ""
+                pass
         fields.append(
-            (
+            _field_row(
                 f.name,
                 f.attname,
                 f.column,
                 f.__class__.__name__,
-                bool(f.primary_key),
-                bool(f.null),
+                f.primary_key,
+                f.null,
                 remote_table,
                 remote_pk,
                 remote_label,
+                rel_kind,
             )
         )
+
+    # Forward M2M (not auto-created reverse side).
+    for f in opts.many_to_many:
+        if f.auto_created:
+            continue
+        try:
+            remote_model = f.remote_field.model
+            register_model_from_meta(remote_model, _seen)
+            remote = remote_model._meta
+            through = f.remote_field.through._meta
+            # Columns on through pointing to each side.
+            m2m_column = f.m2m_column_name()
+            m2m_reverse = f.m2m_reverse_name()
+            fields.append(
+                _field_row(
+                    f.name,
+                    f.name,
+                    "",
+                    "ManyToManyField",
+                    False,
+                    True,
+                    remote.db_table,
+                    remote.pk.column,
+                    f"{remote.app_label}.{remote.object_name}",
+                    "m2m",
+                    through.db_table,
+                    m2m_column,
+                    m2m_reverse,
+                    "",
+                )
+            )
+        except Exception:
+            continue
+
+    # Reverse relations (reverse FK and reverse M2M).
+    for rel in opts.related_objects:
+        accessor = rel.get_accessor_name()
+        if not accessor:
+            continue
+        try:
+            remote_model = rel.related_model
+            register_model_from_meta(remote_model, _seen)
+            remote = remote_model._meta
+            remote_label = f"{remote.app_label}.{remote.object_name}"
+            if rel.many_to_many:
+                # Reverse M2M: through from the field on the other side.
+                field = rel.field
+                through = field.remote_field.through._meta
+                # From this model, through column to us is m2m_reverse_name on
+                # the forward field, and to remote is m2m_column_name.
+                m2m_column = field.m2m_reverse_name()
+                m2m_reverse = field.m2m_column_name()
+                fields.append(
+                    _field_row(
+                        accessor,
+                        accessor,
+                        "",
+                        "ManyToManyRel",
+                        False,
+                        True,
+                        remote.db_table,
+                        remote.pk.column,
+                        remote_label,
+                        "rev_m2m",
+                        through.db_table,
+                        m2m_column,
+                        m2m_reverse,
+                        "",
+                    )
+                )
+            else:
+                # Reverse FK / O2O
+                fields.append(
+                    _field_row(
+                        accessor,
+                        accessor,
+                        "",
+                        "ManyToOneRel",
+                        False,
+                        True,
+                        remote.db_table,
+                        remote.pk.column,
+                        remote_label,
+                        "rev_fk",
+                        "",
+                        "",
+                        "",
+                        rel.field.column,
+                    )
+                )
+        except Exception:
+            continue
+
     return orm.register_model(label, opts.db_table, fields)
 
 
@@ -113,38 +243,33 @@ def dialect_for_connection(connection) -> int | None:
 
 def q_to_tree(node) -> dict | None:
     """
-    Lower a Django Q (or (key, value) child) to a JSON-like tree for C++ apply_q.
+    Lower a Django Q (or (key, value) child) to a tree for C++ apply_q.
 
-    Returns None if the tree contains unsupported nodes (expressions, XOR, …).
+    Supports AND / OR / XOR / NOT and simple value atoms. Returns None on
+    unsupported nodes (F(), subqueries, …).
     """
     from django.db.models import Q
     from django.db.models.lookups import Lookup
 
     if isinstance(node, Q):
-        if node.connector == Q.XOR:
-            return None  # not yet
-        if node.negated:
-            # NOT (children combined with connector)
-            inner_connector = node.connector or Q.AND
-            kind = "or" if inner_connector == Q.OR else "and"
-            children = []
-            for c in node.children:
-                lc = q_to_tree(c)
-                if lc is None:
-                    return None
-                children.append(lc)
-            body = {"kind": kind, "children": children}
-            return {"kind": "not", "children": [body]}
-        kind = "or" if node.connector == Q.OR else "and"
+        connector = node.connector or Q.AND
+        if connector == Q.XOR:
+            kind = "xor"
+        elif connector == Q.OR:
+            kind = "or"
+        else:
+            kind = "and"
         children = []
         for c in node.children:
             lc = q_to_tree(c)
             if lc is None:
                 return None
             children.append(lc)
-        return {"kind": kind, "children": children}
+        body = {"kind": kind, "children": children}
+        if node.negated:
+            return {"kind": "not", "children": [body]}
+        return body
 
-    # (lookup, value) pair from Q kwargs / children
     if isinstance(node, tuple) and len(node) == 2 and isinstance(node[0], str):
         key, val = node
         simple = (str, int, float, bool, type(None), bytes)
@@ -156,7 +281,6 @@ def q_to_tree(node) -> dict | None:
         elif isinstance(val, simple):
             values = [val]
         else:
-            # F(), expressions, model instances without prep — miss
             return None
         return {"kind": "atom", "key": key, "values": values}
 
@@ -166,7 +290,6 @@ def q_to_tree(node) -> dict | None:
 
 
 def apply_q(qs, q_obj) -> bool:
-    """Apply a Django Q to a native QuerySet handle. Returns False on miss."""
     tree = q_to_tree(q_obj)
     if tree is None:
         return False
@@ -181,10 +304,6 @@ def build_queryset(
     disjunctive=False,
     q=None,
 ):
-    """
-    Create a C++ QuerySet for model, optionally applying kwargs and/or a Q tree.
-    Returns native QuerySet handle or None.
-    """
     orm = _orm()
     if orm is None:
         return None
@@ -262,9 +381,7 @@ def compile_update(
     update_kwargs: dict,
     q=None,
 ) -> tuple[str, list] | None:
-    qs = build_queryset(
-        model, connection, kwargs=filter_kwargs or None, q=q
-    )
+    qs = build_queryset(model, connection, kwargs=filter_kwargs or None, q=q)
     if qs is None or not update_kwargs:
         return None
     for name, value in update_kwargs.items():
@@ -283,9 +400,7 @@ def compile_delete(
     filter_kwargs: dict | None = None,
     q=None,
 ) -> tuple[str, list] | None:
-    qs = build_queryset(
-        model, connection, kwargs=filter_kwargs or None, q=q
-    )
+    qs = build_queryset(model, connection, kwargs=filter_kwargs or None, q=q)
     if qs is None:
         return None
     qs.set_delete()

@@ -148,23 +148,72 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
   if (fit == local_model.field_by_name.end()) {
     return {};
   }
-  const FieldSchema& fk = local_model.fields[fit->second];
-  if (!fk.is_relation || fk.remote_table.empty()) {
+  const FieldSchema& rel = local_model.fields[fit->second];
+  if (!rel.is_relation() || rel.remote_table.empty()) {
     return {};
   }
   std::string prefix(path_prefix);
   if (auto jt = join_aliases_.find(prefix); jt != join_aliases_.end()) {
     return jt->second;
   }
+
+  const FieldSchema* local_pk = nullptr;
+  if (local_model.pk_field < local_model.fields.size()) {
+    local_pk = &local_model.fields[local_model.pk_field];
+  }
+  std::string local_pk_col =
+      local_pk && !local_pk->column.empty() ? local_pk->column : "id";
+  std::string remote_pk =
+      rel.remote_pk_column.empty() ? std::string("id") : rel.remote_pk_column;
+
+  if (rel.rel == RelKind::ForwardM2M || rel.rel == RelKind::ReverseM2M) {
+    if (rel.m2m_table.empty()) {
+      return {};
+    }
+    // JOIN through ON local.pk = through.m2m_column
+    // JOIN remote ON through.m2m_reverse = remote.pk
+    std::string through_alias = "T" + std::to_string(++join_counter_);
+    std::string remote_alias = "J" + std::to_string(++join_counter_);
+    JoinEdge through;
+    through.type = JoinType::Inner;
+    through.alias = through_alias;
+    through.table = rel.m2m_table;
+    through.local_alias = std::string(local_alias);
+    through.local_column = local_pk_col;
+    through.remote_column = rel.m2m_column.empty() ? std::string("from_id")
+                                                   : rel.m2m_column;
+    JoinEdge remote;
+    remote.type = JoinType::Inner;
+    remote.alias = remote_alias;
+    remote.table = rel.remote_table;
+    remote.local_alias = through_alias;
+    remote.local_column = rel.m2m_reverse_column.empty()
+                              ? std::string("to_id")
+                              : rel.m2m_reverse_column;
+    remote.remote_column = remote_pk;
+    query_.joins.push_back(std::move(through));
+    query_.joins.push_back(std::move(remote));
+    join_aliases_[prefix] = remote_alias;
+    return remote_alias;
+  }
+
   std::string alias = "J" + std::to_string(++join_counter_);
   JoinEdge edge;
   edge.type = JoinType::Inner;
   edge.alias = alias;
-  edge.table = fk.remote_table;
+  edge.table = rel.remote_table;
   edge.local_alias = std::string(local_alias);
-  edge.local_column = fk.column;
-  edge.remote_column =
-      fk.remote_pk_column.empty() ? std::string("id") : fk.remote_pk_column;
+
+  if (rel.rel == RelKind::ReverseFK) {
+    // JOIN remote ON remote.fk = local.pk
+    edge.local_column = local_pk_col;
+    edge.remote_column =
+        rel.remote_fk_column.empty() ? std::string("id") : rel.remote_fk_column;
+  } else {
+    // Forward FK: JOIN remote ON local.fk = remote.pk
+    edge.local_column = rel.column;
+    edge.remote_column = remote_pk;
+  }
   query_.joins.push_back(std::move(edge));
   join_aliases_[prefix] = alias;
   return alias;
@@ -220,6 +269,9 @@ bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& o
       return false;
     }
     const FieldSchema& fk = current->fields[fit->second];
+    if (!fk.is_relation()) {
+      return false;
+    }
     const ModelSchema* remote = nullptr;
     if (!fk.remote_model_label.empty()) {
       remote = reg.get_by_label(fk.remote_model_label);
@@ -331,7 +383,7 @@ bool QuerySet::filter_kwargs(
 }
 
 std::optional<BoolExpr> QuerySet::lower_q_node(const QNode& node) {
-  // 0=And, 1=Or, 2=Not, 3=Atom
+  // 0=And, 1=Or, 2=Not, 3=Atom, 4=Xor
   if (node.kind == 3) {
     auto pred = pred_from_key_values(node.key, node.values);
     if (!pred) {
@@ -349,15 +401,16 @@ std::optional<BoolExpr> QuerySet::lower_q_node(const QNode& node) {
     }
     return bool_not(std::move(*child));
   }
-  if (node.kind != 0 && node.kind != 1) {
+  if (node.kind != 0 && node.kind != 1 && node.kind != 4) {
     return std::nullopt;
   }
   if (node.children.empty()) {
-    // Empty AND → true (no filter); empty OR → false — match Django roughly
-    // by emitting a no-op atom for AND and 0=1 style via empty Or children
-    // compile already maps empty And to 1=1 and empty Or to 0=1.
     BoolExpr e;
-    e.kind = node.kind == 0 ? BoolExpr::Kind::And : BoolExpr::Kind::Or;
+    if (node.kind == 4) {
+      e.kind = BoolExpr::Kind::Xor;
+    } else {
+      e.kind = node.kind == 0 ? BoolExpr::Kind::And : BoolExpr::Kind::Or;
+    }
     return e;
   }
   std::vector<BoolExpr> kids;
@@ -368,6 +421,9 @@ std::optional<BoolExpr> QuerySet::lower_q_node(const QNode& node) {
       return std::nullopt;
     }
     kids.push_back(std::move(*lc));
+  }
+  if (node.kind == 4) {
+    return bool_xor(std::move(kids));
   }
   return node.kind == 0 ? bool_and(std::move(kids)) : bool_or(std::move(kids));
 }

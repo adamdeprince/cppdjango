@@ -23,6 +23,13 @@ BoolExpr bool_or(std::vector<BoolExpr> kids) {
   return e;
 }
 
+BoolExpr bool_xor(std::vector<BoolExpr> kids) {
+  BoolExpr e;
+  e.kind = BoolExpr::Kind::Xor;
+  e.children = std::move(kids);
+  return e;
+}
+
 BoolExpr bool_not(BoolExpr child) {
   BoolExpr e;
   e.kind = BoolExpr::Kind::Not;

@@ -126,6 +126,40 @@ void emit_bool(std::string& out, std::vector<std::uint32_t>& order, DialectId d,
       }
       break;
     }
+    case BoolExpr::Kind::Xor: {
+      // Portable rewrite (matches Django when backend lacks XOR):
+      //   (c0 OR c1 OR ...) AND (1 = [MOD](sum(CASE WHEN ci THEN 1 ELSE 0), 2))
+      if (e.children.empty()) {
+        out += "0=1";
+        return;
+      }
+      out += "((";
+      for (std::size_t i = 0; i < e.children.size(); ++i) {
+        if (i) {
+          out += " OR ";
+        }
+        emit_bool(out, order, d, q, m, e.children[i]);
+      }
+      out += ") AND (1 = ";
+      if (e.children.size() > 2) {
+        out += "MOD(";
+      }
+      out += '(';
+      for (std::size_t i = 0; i < e.children.size(); ++i) {
+        if (i) {
+          out += " + ";
+        }
+        out += "CASE WHEN ";
+        emit_bool(out, order, d, q, m, e.children[i]);
+        out += " THEN 1 ELSE 0 END";
+      }
+      out += ')';
+      if (e.children.size() > 2) {
+        out += ", 2)";
+      }
+      out += "))";
+      break;
+    }
   }
 }
 
@@ -143,7 +177,10 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
   std::vector<SelectItem> items = q.select;
   if (items.empty()) {
     for (const auto& f : m.fields) {
-      if (f.is_relation && f.column.empty()) {
+      if (f.is_relation() && f.column.empty()) {
+        continue;
+      }
+      if (f.column.empty()) {
         continue;
       }
       SelectItem it;

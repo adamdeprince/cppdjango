@@ -5,6 +5,12 @@ from django.test import SimpleTestCase
 from django.test.utils import isolate_apps
 
 
+def _row(*args):
+    """Pad field descriptors to the 14-tuple register_model format."""
+    row = list(args) + [""] * 14
+    return tuple(row[:14])
+
+
 class OrmDataPlaneUnitTests(SimpleTestCase):
     def setUp(self):
         from django import native
@@ -96,16 +102,16 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
             "test.Author",
             "author",
             [
-                ("id", "id", "id", "AutoField", True, False, "", "", ""),
-                ("name", "name", "name", "CharField", False, False, "", "", ""),
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("name", "name", "name", "CharField", False, False),
             ],
         )
         mid = orm.register_model(
             "test.Book",
             "book",
             [
-                ("id", "id", "id", "AutoField", True, False, "", "", ""),
-                (
+                _row("id", "id", "id", "AutoField", True, False),
+                _row(
                     "author",
                     "author_id",
                     "author_id",
@@ -115,6 +121,7 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
                     "author",
                     "id",
                     "test.Author",
+                    "fk",
                 ),
             ],
         )
@@ -362,3 +369,173 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         self.assertIn(" OR ", sql)
         self.assertIn("Ada", params)
         self.assertIn("US", params)
+
+    def test_q_xor(self):
+        from django.db.models import Q
+        from django.native import orm
+
+        class Item(models.Model):
+            a = models.IntegerField()
+            b = models.IntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane"
+
+        class _Conn:
+            vendor = "sqlite"
+
+        q = Q(a=1) ^ Q(b=2)
+        tree = orm.q_to_tree(q)
+        self.assertEqual(tree["kind"], "xor")
+        compiled = orm.compile_select(Item, _Conn(), q=q)
+        self.assertIsNotNone(compiled)
+        sql, params = compiled
+        self.assertIn("CASE WHEN", sql)
+        self.assertIn(" OR ", sql)
+        self.assertEqual(params.count(1) + params.count(2), len(params))
+
+    def test_reverse_fk_and_m2m_joins(self):
+        """Reverse FK and M2M join SQL via explicit schema rows."""
+        from django import _native
+
+        orm = _native.orm
+        # Book model (remote for reverse FK / M2M target)
+        orm.register_model(
+            "rel.Book",
+            "book",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("title", "title", "title", "CharField", False, False),
+                _row(
+                    "author",
+                    "author_id",
+                    "author_id",
+                    "ForeignKey",
+                    False,
+                    False,
+                    "author",
+                    "id",
+                    "rel.Author",
+                    "fk",
+                ),
+            ],
+        )
+        orm.register_model(
+            "rel.Tag",
+            "tag",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("name", "name", "name", "CharField", False, False),
+            ],
+        )
+        # Author with reverse FK accessor "books"
+        author_id = orm.register_model(
+            "rel.Author",
+            "author",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("name", "name", "name", "CharField", False, False),
+                _row(
+                    "books",
+                    "books",
+                    "",
+                    "ManyToOneRel",
+                    False,
+                    True,
+                    "book",
+                    "id",
+                    "rel.Book",
+                    "rev_fk",
+                    "",
+                    "",
+                    "",
+                    "author_id",
+                ),
+            ],
+        )
+        # Book with M2M tags (re-register with m2m field)
+        book_id = orm.register_model(
+            "rel.Book",
+            "book",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("title", "title", "title", "CharField", False, False),
+                _row(
+                    "author",
+                    "author_id",
+                    "author_id",
+                    "ForeignKey",
+                    False,
+                    False,
+                    "author",
+                    "id",
+                    "rel.Author",
+                    "fk",
+                ),
+                _row(
+                    "tags",
+                    "tags",
+                    "",
+                    "ManyToManyField",
+                    False,
+                    True,
+                    "tag",
+                    "id",
+                    "rel.Tag",
+                    "m2m",
+                    "book_tags",
+                    "book_id",
+                    "tag_id",
+                    "",
+                ),
+            ],
+        )
+        qs = orm.QuerySet.create(author_id, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.filter_kwargs({"books__title": "Dune"}, False))
+        sql, params = qs.compile_sql()
+        self.assertIn("INNER JOIN", sql)
+        self.assertIn('"book"', sql)
+        self.assertIn("author_id", sql)
+        self.assertEqual(list(params), ["Dune"])
+
+        qs2 = orm.QuerySet.create(book_id, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs2.filter_kwargs({"tags__name": "scifi"}, False))
+        sql2, params2 = qs2.compile_sql()
+        self.assertGreaterEqual(sql2.count("INNER JOIN"), 2)
+        self.assertIn("book_tags", sql2)
+        self.assertEqual(list(params2), ["scifi"])
+
+    def test_stock_filter_exclude_wires_native_handle(self):
+        from django.db.models import Q
+        from django.native import orm
+
+        class World(models.Model):
+            randomnumber = models.IntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane_wire"
+
+        class _Conn:
+            vendor = "sqlite"
+
+        # Simulate Manager.all().filter via QuerySet construction
+        qs = World.objects.all()
+        qs = qs.filter(randomnumber__gt=5)
+        self.assertIsNotNone(getattr(qs, "_native_qs", None))
+        self.assertFalse(getattr(qs, "_native_disabled", True))
+
+        qs2 = qs.exclude(randomnumber=99)
+        self.assertIsNotNone(qs2._native_qs)
+
+        # values_list fetch uses native handle
+        # (no DB rows required for compile path via handle)
+        handle = qs2._native_handle_for_sql()
+        self.assertIsNotNone(handle)
+        h = handle.clone()
+        self.assertTrue(h.values_list(["id", "randomnumber"], False))
+        sql, params = h.compile_sql()
+        self.assertIn(">", sql)
+        self.assertIn("NOT", sql)
+
+        qs3 = World.objects.filter(Q(randomnumber=1) ^ Q(randomnumber=2))
+        self.assertIsNotNone(qs3._native_qs)

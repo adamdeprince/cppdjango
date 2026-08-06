@@ -33,6 +33,15 @@ enum class FieldType : std::uint8_t {
   Other,
 };
 
+// How this field participates in joins when used as a path hop.
+enum class RelKind : std::uint8_t {
+  None = 0,
+  ForwardFK = 1,   // local.column → remote.pk
+  ReverseFK = 2,   // remote.remote_fk_column → local.pk
+  ForwardM2M = 3,  // through table
+  ReverseM2M = 4,
+};
+
 struct FieldSchema {
   FieldId id = 0;
   std::string name;
@@ -41,11 +50,19 @@ struct FieldSchema {
   FieldType type = FieldType::Other;
   bool primary_key = false;
   bool nullable = false;
-  // FK: remote table/pk for simple joins (denormalized).
-  bool is_relation = false;
+
+  RelKind rel = RelKind::None;
   std::string remote_table;
   std::string remote_pk_column;
   std::string remote_model_label;
+  // Reverse FK: column on remote table pointing at local PK.
+  std::string remote_fk_column;
+  // M2M through table.
+  std::string m2m_table;
+  std::string m2m_column;          // through col → this model
+  std::string m2m_reverse_column;  // through col → remote model
+
+  [[nodiscard]] bool is_relation() const { return rel != RelKind::None; }
 };
 
 struct ModelSchema {
@@ -76,5 +93,6 @@ class SchemaRegistry {
 };
 
 [[nodiscard]] FieldType field_type_from_class_name(std::string_view class_name);
+[[nodiscard]] RelKind rel_kind_from_string(std::string_view s);
 
 }  // namespace django::orm

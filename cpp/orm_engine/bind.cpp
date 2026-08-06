@@ -85,6 +85,8 @@ django::orm::QNode q_node_from_python(nb::handle h) {
     node.kind = 1;
   } else if (kind == "not") {
     node.kind = 2;
+  } else if (kind == "xor") {
+    node.kind = 4;
   } else if (kind == "atom") {
     node.kind = 3;
     node.key = nb::cast<std::string>(d["key"]);
@@ -121,8 +123,11 @@ void register_orm_engine(nb::module_& parent) {
   m.def(
       "register_model",
       [](const std::string& label, const std::string& db_table, nb::list fields) {
-        // fields: (name, attname, column, class_name, pk, null,
-        //          remote_table, remote_pk_col, remote_label)  — last 3 optional
+        // fields tuple (min 6, full 14):
+        // 0 name, 1 attname, 2 column, 3 class_name, 4 pk, 5 null,
+        // 6 remote_table, 7 remote_pk, 8 remote_label,
+        // 9 rel_kind ("fk"|"rev_fk"|"m2m"|"rev_m2m"|""),
+        // 10 m2m_table, 11 m2m_column, 12 m2m_reverse_column, 13 remote_fk_column
         django::orm::ModelSchema schema;
         schema.label = label;
         schema.db_table = db_table;
@@ -136,14 +141,27 @@ void register_orm_engine(nb::module_& parent) {
               nb::cast<std::string>(t[3]));
           f.primary_key = nb::cast<bool>(t[4]);
           f.nullable = nb::cast<bool>(t[5]);
-          if (nb::len(t) >= 9) {
+          const Py_ssize_t n = nb::len(t);
+          if (n >= 9) {
             f.remote_table = nb::cast<std::string>(t[6]);
             f.remote_pk_column = nb::cast<std::string>(t[7]);
             f.remote_model_label = nb::cast<std::string>(t[8]);
-            f.is_relation = !f.remote_table.empty();
-            if (f.is_relation) {
-              f.type = django::orm::FieldType::ForeignKey;
-            }
+          }
+          if (n >= 10) {
+            f.rel = django::orm::rel_kind_from_string(nb::cast<std::string>(t[9]));
+          } else if (!f.remote_table.empty()) {
+            f.rel = django::orm::RelKind::ForwardFK;
+          }
+          if (n >= 13) {
+            f.m2m_table = nb::cast<std::string>(t[10]);
+            f.m2m_column = nb::cast<std::string>(t[11]);
+            f.m2m_reverse_column = nb::cast<std::string>(t[12]);
+          }
+          if (n >= 14) {
+            f.remote_fk_column = nb::cast<std::string>(t[13]);
+          }
+          if (f.rel != django::orm::RelKind::None) {
+            f.type = django::orm::FieldType::ForeignKey;
           }
           schema.fields.push_back(std::move(f));
         }

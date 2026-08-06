@@ -305,12 +305,16 @@ class QuerySet(AltersData):
         self._fields = None
         self._defer_next_filter = False
         self._deferred_filter = None
+        # C++ ORM data-plane handle (optional). Poisoned via _native_disabled.
+        self._native_qs = None
+        self._native_disabled = False
 
     @property
     def query(self):
         if self._deferred_filter:
             negate, args, kwargs = self._deferred_filter
             self._filter_or_exclude_inplace(negate, args, kwargs)
+            self._native_track_filter(negate, args, kwargs)
             self._deferred_filter = None
         return self._query
 
@@ -939,15 +943,11 @@ class QuerySet(AltersData):
 
     def _fast_path_simple_values_fetch(self):
         """
-        Fast path for::
+        Fast path for values()/values_list() via C++ data plane.
 
-            list(Model.objects.values('id', 'message'))
-            list(Model.objects.values_list('id', 'message'))
-
-        unfiltered single-table scans (fortune-shaped) via C++ data plane.
+        Prefers a live ``_native_qs`` handle (from filter/exclude wiring);
+        otherwise builds a simple unfiltered select for fortune-shaped scans.
         """
-        if not self._simple_base_eligible():
-            return _FAST_PATH_MISS
         if self._fields is None:
             return _FAST_PATH_MISS
         if self._iterable_class not in (
@@ -964,15 +964,35 @@ class QuerySet(AltersData):
         try:
             from django.native import orm as native_orm
 
-            compiled = native_orm.compile_select(
-                self.model,
-                connection,
-                field_names=list(self._fields),
-                kwargs=None,
-            )
-            if compiled is None:
+            handle = self._native_handle_for_sql()
+            if handle is not None:
+                qs = handle.clone()
+                flat = self._iterable_class is FlatValuesListIterable
+                if not qs.values_list(list(self._fields), flat):
+                    return _FAST_PATH_MISS
+                if self.query.is_sliced:
+                    # Respect high/low marks when set.
+                    low = self.query.low_mark or 0
+                    high = self.query.high_mark
+                    if high is not None:
+                        qs.set_limit(int(high - low))
+                    if low:
+                        qs.set_offset(int(low))
+                sql, params = qs.compile_sql()
+            elif self._simple_base_eligible():
+                compiled = native_orm.compile_select(
+                    self.model,
+                    connection,
+                    field_names=list(self._fields),
+                    kwargs=None,
+                )
+                if compiled is None:
+                    return _FAST_PATH_MISS
+                sql, params = compiled
+            else:
                 return _FAST_PATH_MISS
-            sql, params = compiled
+            if not sql:
+                return _FAST_PATH_MISS
             rows = native_orm.execute_fetchall(connection, sql, params)
         except Exception:
             return _FAST_PATH_MISS
@@ -2381,6 +2401,7 @@ class QuerySet(AltersData):
             clone._deferred_filter = negate, args, kwargs
         else:
             clone._filter_or_exclude_inplace(negate, args, kwargs)
+            clone._native_track_filter(negate, args, kwargs)
         return clone
 
     def _filter_or_exclude_inplace(self, negate, args, kwargs):
@@ -2400,6 +2421,75 @@ class QuerySet(AltersData):
             self._query.add_q(~Q(*args, **kwargs))
         else:
             self._query.add_q(Q(*args, **kwargs))
+
+    def _native_eligible_for_dataplane(self):
+        """Query shapes the C++ data plane can still own."""
+        query = self.query
+        if (
+            query.combinator
+            or query.annotations
+            or query.extra
+            or query.distinct_fields
+            or query.group_by
+            or query.select_for_update
+            or query.distinct
+        ):
+            return False
+        return True
+
+    def _native_track_filter(self, negate, args, kwargs):
+        """
+        Mirror filter/exclude onto a C++ QuerySet handle when possible.
+
+        On miss, poison the handle so we never mix partial native state.
+        """
+        if getattr(self, "_native_disabled", False):
+            return
+        if not args and not kwargs:
+            return
+        try:
+            from django.native import orm as native_orm
+
+            if native_orm._orm() is None:
+                self._native_disabled = True
+                return
+            if not self._native_eligible_for_dataplane():
+                self._native_disabled = True
+                self._native_qs = None
+                return
+            q_obj = Q(*args, **kwargs)
+            if negate:
+                q_obj = ~q_obj
+            handle = getattr(self, "_native_qs", None)
+            if handle is None:
+                handle = native_orm.build_queryset(
+                    self.model, connections[self.db], q=q_obj
+                )
+                if handle is None:
+                    self._native_disabled = True
+                    self._native_qs = None
+                    return
+                self._native_qs = handle
+            else:
+                cloned = handle.clone()
+                if not native_orm.apply_q(cloned, q_obj):
+                    self._native_disabled = True
+                    self._native_qs = None
+                    return
+                self._native_qs = cloned
+        except Exception:
+            self._native_disabled = True
+            self._native_qs = None
+
+    def _native_handle_for_sql(self):
+        if getattr(self, "_native_disabled", False):
+            return None
+        handle = getattr(self, "_native_qs", None)
+        if handle is None:
+            return None
+        if not self._native_eligible_for_dataplane():
+            return None
+        return handle
 
     def complex_filter(self, filter_obj):
         """
@@ -2984,6 +3074,19 @@ class QuerySet(AltersData):
         c._known_related_objects = self._known_related_objects
         c._iterable_class = self._iterable_class
         c._fields = self._fields
+        # Native data-plane handle (cloned; mutations must not alias parent).
+        parent_native = getattr(self, "_native_qs", None)
+        if parent_native is not None:
+            try:
+                c._native_qs = parent_native.clone()
+            except Exception:
+                c._native_qs = None
+                c._native_disabled = True
+            else:
+                c._native_disabled = getattr(self, "_native_disabled", False)
+        else:
+            c._native_qs = None
+            c._native_disabled = getattr(self, "_native_disabled", False)
         return c
 
     def _fetch_all(self):

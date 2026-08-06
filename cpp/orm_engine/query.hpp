@@ -88,7 +88,7 @@ struct Pred {
 };
 
 struct BoolExpr {
-  enum class Kind : std::uint8_t { Atom = 0, And, Or, Not };
+  enum class Kind : std::uint8_t { Atom = 0, And, Or, Not, Xor };
   Kind kind = Kind::Atom;
   Pred atom{};
   std::vector<BoolExpr> children;
@@ -154,6 +154,7 @@ struct Query {
 [[nodiscard]] BoolExpr bool_atom(Pred p);
 [[nodiscard]] BoolExpr bool_and(std::vector<BoolExpr> kids);
 [[nodiscard]] BoolExpr bool_or(std::vector<BoolExpr> kids);
+[[nodiscard]] BoolExpr bool_xor(std::vector<BoolExpr> kids);
 [[nodiscard]] BoolExpr bool_not(BoolExpr child);
 void bool_and_append(BoolExpr& dest, BoolExpr child);
 void bool_or_append(BoolExpr& dest, BoolExpr child);
