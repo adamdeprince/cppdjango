@@ -24,6 +24,12 @@ class BaseHandler:
     _middleware_chain = None
     # Set in load_middleware: no view/template/exception middleware hooks.
     _middleware_hooks_empty = False
+    # Pure-C++ stock chain: decided only in load_middleware from settings
+    # (never re-scanned on a request).
+    _native_stock_chain = False
+    _native_stock_specs = None
+    # Per-path native classification frozen at load_middleware (debug/metrics).
+    _middleware_native_at_load = None
 
     # Middleware paths whose full request/response bodies can run in the pure
     # C++ stock chain (no Python process_request side effects required).
@@ -39,28 +45,32 @@ class BaseHandler:
 
         Must be called after the environment is fixed (see __call__ in
         subclasses).
+
+        Native-chain eligibility is resolved here (settings/handler init),
+        not on the request path. The request loop only uses the frozen
+        ``_middleware_chain`` / ``_native_stock_*`` state.
         """
         self._view_middleware = []
         self._template_response_middleware = []
         self._exception_middleware = []
         self._native_stock_chain = False
+        self._native_stock_specs = None
+        self._middleware_native_at_load = None
 
         get_response = self._get_response_async if is_async else self._get_response
         handler = convert_exception_to_response(get_response)
         handler_is_async = is_async
         from django import native as _native
 
-        # Optional pure-C++ chain: only when every entry is a fully-handled
-        # stock path (Security / XFrame / Common with no Python-only features).
-        # Hybrid stacks keep Python iteration + dual-path bodies (correct
-        # crossing budget: one Py→C++ per process_*).
-        stock_handler = self._try_native_stock_chain(
+        # --- Load-time native classification (settings.MIDDLEWARE once) -----
+        # Every path is classified here. Request handling never re-inspects
+        # the MIDDLEWARE list for stock-chain eligibility.
+        stock_handler = self._install_native_stock_chain_if_eligible(
             get_response, is_async, _native
         )
         if stock_handler is not None:
             self._middleware_chain = stock_handler
             self._middleware_hooks_empty = True
-            self._native_stock_chain = True
             return
 
         for middleware_path in reversed(settings.MIDDLEWARE):
@@ -139,23 +149,60 @@ class BaseHandler:
             or self._exception_middleware
         )
 
-    def _try_native_stock_chain(self, get_response, is_async, _native):
+    def _classify_middleware_at_load(self, paths, _native):
         """
-        If MIDDLEWARE is a pure stock Security/XFrame/Common stack that the
-        C++ chain fully implements, return a single convert_exception wrapper
-        around native_stock_chain_call. Otherwise return None (use Python walk).
+        Classify each MIDDLEWARE dotted path once at load_middleware time.
+
+        Returns a list of dicts:
+          {"path": str, "native": bool, "chain_type": str|None}
+        chain_type is set only for classes fully implementable by
+        native_stock_chain_call (security|xframe|common).
+
+        Never call this from the request path.
         """
-        if is_async or not getattr(_native, "AVAILABLE", False):
-            return None
-        paths = list(settings.MIDDLEWARE or ())
-        if not paths:
-            return None
         chain_types = self._NATIVE_STOCK_CHAIN_TYPES
-        if any(p not in chain_types for p in paths):
+        native_available = bool(getattr(_native, "AVAILABLE", False))
+        out = []
+        for path in paths:
+            chain_type = chain_types.get(path)
+            if native_available and chain_type is not None:
+                is_native = True
+            elif native_available and _native.is_native_stock_middleware_path(path):
+                is_native = True
+            else:
+                # Fall back to class attribute for dual-path stock ports.
+                try:
+                    cls = import_string(path)
+                    is_native = native_available and bool(
+                        getattr(cls, "native_capable", False)
+                    )
+                except Exception:
+                    is_native = False
+            out.append(
+                {
+                    "path": path,
+                    "native": is_native,
+                    "chain_type": chain_type,
+                }
+            )
+        return out
+
+    def _build_native_stock_specs(self, classification):
+        """
+        Build frozen C++ chain specs from load-time classification + settings.
+
+        Snapshots security/xframe settings now so the request path does not
+        re-read settings for chain structure (config values are baked in).
+        Returns None if the stack is not pure-C++-chain eligible.
+        """
+        if not classification:
+            return None
+        # Every link must be a pure-C++-chain type (not merely dual-path native).
+        if any(c["chain_type"] is None for c in classification):
             return None
         # CommonMiddleware process_request (UA deny, APPEND_SLASH, PREPEND_WWW)
         # still needs Python / URL resolver — only pure-C++ when those are off.
-        if "django.middleware.common.CommonMiddleware" in paths:
+        if any(c["chain_type"] == "common" for c in classification):
             if (
                 settings.APPEND_SLASH
                 or settings.PREPEND_WWW
@@ -164,8 +211,8 @@ class BaseHandler:
                 return None
         try:
             specs = []
-            for path in paths:
-                kind = chain_types[path]
+            for c in classification:
+                kind = c["chain_type"]
                 if kind == "security":
                     specs.append(
                         {
@@ -201,11 +248,43 @@ class BaseHandler:
                     )
                 else:
                     specs.append({"type": "common"})
+            return specs
         except Exception:
             return None
 
-        def stock_chain(request):
-            return _native.native_stock_chain_call(specs, request, get_response)
+    def _install_native_stock_chain_if_eligible(
+        self, get_response, is_async, _native
+    ):
+        """
+        Load-time only: if every MIDDLEWARE entry is pure-C++-chainable,
+        freeze specs on the handler and return a single chain callable.
+        Otherwise freeze the classification for hybrid stacks and return None
+        (Python walk + dual-path bodies).
+        """
+        paths = list(settings.MIDDLEWARE or ())
+        classification = self._classify_middleware_at_load(paths, _native)
+        self._middleware_native_at_load = classification
+
+        if is_async or not getattr(_native, "AVAILABLE", False):
+            self._native_stock_chain = False
+            self._native_stock_specs = None
+            return None
+
+        specs = self._build_native_stock_specs(classification)
+        if specs is None:
+            self._native_stock_chain = False
+            self._native_stock_specs = None
+            return None
+
+        # Freeze: request path uses only these attributes.
+        self._native_stock_chain = True
+        self._native_stock_specs = specs
+
+        def stock_chain(request, *, _handler=self, _get_response=get_response, _n=_native):
+            # No MIDDLEWARE / eligibility checks here — frozen at load.
+            return _n.native_stock_chain_call(
+                _handler._native_stock_specs, request, _get_response
+            )
 
         return convert_exception_to_response(stock_chain)
 
