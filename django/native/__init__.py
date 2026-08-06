@@ -3388,6 +3388,15 @@ def wsgi_handler_call(handler, environ, start_response):
     raise RuntimeError("native wsgi_handler_call unavailable")
 
 
+def wsgi_pack_start_response(response, start_response, environ=None):
+    """Pack HttpResponse into start_response (C++ _store walk)."""
+    impl = _impl()
+    if impl is not None:
+        return impl.wsgi_pack_start_response(
+            response, start_response, environ if environ is not None else {}
+        )
+    raise RuntimeError("native wsgi_pack_start_response unavailable")
+
 def wsgi_request_try_lean_init(request, environ) -> bool:
     """GET/HEAD empty-body WSGIRequest init in C++. True if applied."""
     impl = _impl()

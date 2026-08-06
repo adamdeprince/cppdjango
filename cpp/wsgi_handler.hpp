@@ -37,4 +37,11 @@ namespace django::native {
 // True when environ is GET/HEAD with no body (lean request eligible).
 [[nodiscard]] bool wsgi_environ_is_lean_get(nb::handle environ) noexcept;
 
+// Pack HttpResponse into start_response(status, headers) using C API
+// (_store walk, cached "200 OK", skip empty cookies). Returns response
+// (or file_wrapper result). Used by the lean WSGI outer loop.
+[[nodiscard]] nb::object wsgi_pack_start_response(nb::handle response,
+                                                  nb::handle start_response,
+                                                  nb::handle environ);
+
 }  // namespace django::native

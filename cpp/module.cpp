@@ -4400,6 +4400,14 @@ NB_MODULE(_native, m) {
       "Native lean WSGI loop: slim request, exact routes, view, "
       "start_response packing.");
   m.def(
+      "wsgi_pack_start_response",
+      [](nb::handle response, nb::handle start_response, nb::handle environ) {
+        return django::native::wsgi_pack_start_response(
+            response, start_response, environ);
+      },
+      nb::arg("response"), nb::arg("start_response"), nb::arg("environ"),
+      "Pack HttpResponse into start_response via C API (_store walk).");
+  m.def(
       "wsgi_request_try_lean_init",
       [](nb::handle request, nb::handle environ) {
         return django::native::wsgi_request_try_lean_init(request, environ);

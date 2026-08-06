@@ -787,38 +787,71 @@ nb::object hybrid_call_view(nb::handle callback, nb::handle request,
 }
 
 // Exact-route table lookup → call view. Returns nullopt if miss.
+// Prefers exact_callbacks (path → view) for empty-args routes.
 std::optional<nb::object> hybrid_exact_route_view(nb::dict bits,
                                                   nb::handle request) {
-  if (!bits.contains("exact_routes") || bits["exact_routes"].is_none()) {
-    return std::nullopt;
-  }
-  nb::dict table = nb::cast<nb::dict>(bits["exact_routes"]);
   nb::object path_info = request.attr("path_info");
-  if (!table.contains(path_info)) {
-    return std::nullopt;
+  nb::object callback;
+  nb::object args = nb::tuple();
+  nb::object kwargs = nb::dict();
+  bool found = false;
+
+  if (bits.contains("exact_callbacks") && !bits["exact_callbacks"].is_none()) {
+    nb::dict cbs = nb::cast<nb::dict>(bits["exact_callbacks"]);
+    if (cbs.contains(path_info)) {
+      callback = cbs[path_info];
+      found = true;
+    }
   }
-  nb::tuple entry = nb::cast<nb::tuple>(table[path_info]);
-  nb::object callback = nb::borrow(nb::object(entry[0]));
-  nb::object args =
-      nb::len(entry) > 1 ? nb::borrow(nb::object(entry[1])) : nb::tuple();
-  nb::object kwargs =
-      nb::len(entry) > 2 ? nb::borrow(nb::object(entry[2])) : nb::dict();
-  // Optional ResolverMatch for debug/reverse (skip on hot path unless bits say).
-  if (bits.contains("set_resolver_match") &&
-      nb::cast<bool>(bits["set_resolver_match"])) {
-    nb::object url_name =
-        nb::len(entry) > 3 ? nb::borrow(nb::object(entry[3])) : nb::none();
-    nb::object route =
-        nb::len(entry) > 4 ? nb::borrow(nb::object(entry[4])) : nb::none();
-    nb::object RM =
-        nb::module_::import_("django.urls.resolvers").attr("ResolverMatch");
-    request.attr("resolver_match") =
-        RM(callback, args, kwargs, url_name, nb::none(), nb::none(), route);
+  if (!found) {
+    if (!bits.contains("exact_routes") || bits["exact_routes"].is_none()) {
+      return std::nullopt;
+    }
+    nb::dict table = nb::cast<nb::dict>(bits["exact_routes"]);
+    if (!table.contains(path_info)) {
+      return std::nullopt;
+    }
+    nb::tuple entry = nb::cast<nb::tuple>(table[path_info]);
+    callback = entry[0];
+    args = nb::len(entry) > 1 ? nb::object(entry[1]) : nb::tuple();
+    kwargs = nb::len(entry) > 2 ? nb::object(entry[2]) : nb::dict();
+    if (bits.contains("set_resolver_match") &&
+        nb::cast<bool>(bits["set_resolver_match"])) {
+      nb::object url_name =
+          nb::len(entry) > 3 ? nb::object(entry[3]) : nb::none();
+      nb::object route =
+          nb::len(entry) > 4 ? nb::object(entry[4]) : nb::none();
+      nb::object RM =
+          nb::module_::import_("django.urls.resolvers").attr("ResolverMatch");
+      request.attr("resolver_match") =
+          RM(callback, args, kwargs, url_name, nb::none(), nb::none(), route);
+    } else {
+      request.attr("resolver_match") = nb::none();
+    }
+    found = true;
   } else {
     request.attr("resolver_match") = nb::none();
   }
-  nb::object response = hybrid_call_view(callback, request, args, kwargs);
-  // Skip check_response when non-None (stock TE views always return HttpResponse).
+
+  // Hot path: Call(view, (request,)) — no kwargs alloc for empty-args routes.
+  nb::object response;
+  if ((args.is_none() ||
+       (PyTuple_Check(args.ptr()) && PyTuple_GET_SIZE(args.ptr()) == 0)) &&
+      (kwargs.is_none() ||
+       (PyDict_Check(kwargs.ptr()) && PyDict_GET_SIZE(kwargs.ptr()) == 0))) {
+    PyObject* t = PyTuple_Pack(1, request.ptr());
+    if (!t) {
+      throw nb::python_error();
+    }
+    PyObject* result = PyObject_Call(callback.ptr(), t, nullptr);
+    Py_DECREF(t);
+    if (!result) {
+      throw nb::python_error();
+    }
+    response = nb::steal<nb::object>(result);
+  } else {
+    response = hybrid_call_view(callback, request, args, kwargs);
+  }
   if (response.is_none() && bits.contains("check_response") &&
       !bits["check_response"].is_none()) {
     bits["check_response"](response, callback);

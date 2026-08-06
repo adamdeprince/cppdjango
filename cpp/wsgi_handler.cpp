@@ -36,9 +36,13 @@ struct LeanCache {
   PyObject* name_status_code = nullptr;
   PyObject* name_cookies = nullptr;
   PyObject* name_items = nullptr;
+  PyObject* name_headers = nullptr;
+  PyObject* name__store = nullptr;
+  PyObject* name__reason_phrase = nullptr;
   PyObject* name_wsgi_status_line = nullptr;
   PyObject* name__handler_class = nullptr;
   PyObject* name__exact_routes = nullptr;
+  PyObject* name__exact_callbacks = nullptr;
   PyObject* name_request_class = nullptr;
   PyObject* name__middleware_hooks_empty = nullptr;
   PyObject* name__any_atomic_requests = nullptr;
@@ -106,9 +110,13 @@ void lean_cache_init() {
   g_lean.name_status_code = intern("status_code");
   g_lean.name_cookies = intern("cookies");
   g_lean.name_items = intern("items");
+  g_lean.name_headers = intern("headers");
+  g_lean.name__store = intern("_store");
+  g_lean.name__reason_phrase = intern("_reason_phrase");
   g_lean.name_wsgi_status_line = intern("wsgi_status_line");
   g_lean.name__handler_class = intern("_handler_class");
   g_lean.name__exact_routes = intern("_exact_routes");
+  g_lean.name__exact_callbacks = intern("_exact_callbacks");
   g_lean.name_request_class = intern("request_class");
   g_lean.name__middleware_hooks_empty = intern("_middleware_hooks_empty");
   g_lean.name__any_atomic_requests = intern("_any_atomic_requests");
@@ -626,27 +634,44 @@ nb::object wsgi_lean_get_response(nb::handle handler, nb::handle request) {
   bool decref_args = false;
   bool decref_kwargs = false;
 
-  // Exact-route table (item 2: no ResolverMatch construction).
-  PyObject* exact = PyObject_GetAttr(h, g_lean.name__exact_routes);
-  if (exact && exact != Py_None && PyDict_Check(exact)) {
-    PyObject* path_info = PyObject_GetAttr(req, g_lean.name_path_info);
-    if (path_info) {
-      PyObject* entry = PyDict_GetItem(exact, path_info);  // borrowed
-      Py_DECREF(path_info);
-      if (entry && PyTuple_Check(entry) && PyTuple_GET_SIZE(entry) >= 3) {
-        callback = PyTuple_GET_ITEM(entry, 0);  // borrowed
-        args = PyTuple_GET_ITEM(entry, 1);
-        kwargs = PyTuple_GET_ITEM(entry, 2);
-        // Item 2: leave resolver_match as None (set in lean init / unset).
-        // Views on the floor do not use it; saves ResolverMatch allocation.
+  // Prefer pre-bound exact_callbacks (path → view) for empty-args routes.
+  PyObject* path_info = PyObject_GetAttr(req, g_lean.name_path_info);
+  if (path_info) {
+    PyObject* cbs = PyObject_GetAttr(h, g_lean.name__exact_callbacks);
+    if (cbs && cbs != Py_None && PyDict_Check(cbs)) {
+      PyObject* cb = PyDict_GetItem(cbs, path_info);  // borrowed
+      if (cb != nullptr) {
+        callback = cb;
+        args = g_lean.empty_tuple;
+        kwargs = g_lean.empty_dict;
         set_attr_none(req, g_lean.name_resolver_match);
         resolved = true;
       }
     } else {
       PyErr_Clear();
     }
+    Py_XDECREF(cbs);
+    // Full exact_routes table (callback, args, kwargs, ...)
+    if (!resolved) {
+      PyObject* exact = PyObject_GetAttr(h, g_lean.name__exact_routes);
+      if (exact && exact != Py_None && PyDict_Check(exact)) {
+        PyObject* entry = PyDict_GetItem(exact, path_info);  // borrowed
+        if (entry && PyTuple_Check(entry) && PyTuple_GET_SIZE(entry) >= 3) {
+          callback = PyTuple_GET_ITEM(entry, 0);  // borrowed
+          args = PyTuple_GET_ITEM(entry, 1);
+          kwargs = PyTuple_GET_ITEM(entry, 2);
+          set_attr_none(req, g_lean.name_resolver_match);
+          resolved = true;
+        }
+      } else {
+        PyErr_Clear();
+      }
+      Py_XDECREF(exact);
+    }
+    Py_DECREF(path_info);
+  } else {
+    PyErr_Clear();
   }
-  Py_XDECREF(exact);
 
   if (!resolved) {
     PyObject* resolve =
@@ -858,10 +883,12 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
   // Path selection (flags frozen at load_middleware):
   //   lean_view_only     → exact routes + view only (empty MIDDLEWARE)
   //   native_stock_chain → C++ stock chain around lean view (Security/XFrame/…)
-  //   else (hybrid)      → Python get_response (full middleware onion)
+  //   hybrid_flattened   → hybrid_chain_call in C++ (no Python get_response)
+  //   else               → Python get_response (full middleware onion)
   nb::object response;
   bool lean_view = false;
   bool stock_chain = false;
+  bool hybrid_flat = false;
   nb::object stock_specs;
   {
     PyObject* flag =
@@ -891,6 +918,16 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
         stock_chain = false;
       }
     }
+    if (!lean_view && !stock_chain) {
+      PyObject* hf =
+          PyObject_GetAttrString(handler.ptr(), "_hybrid_flattened");
+      if (hf) {
+        hybrid_flat = truthy(hf);
+        Py_DECREF(hf);
+      } else {
+        PyErr_Clear();
+      }
+    }
   }
   try {
     if (lean_view) {
@@ -916,8 +953,30 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
         nb::steal<nb::object>(
             PyObject_Call(log_response.ptr(), log_args.ptr(), kw.ptr()));
       }
+    } else if (hybrid_flat) {
+      // Flattened hybrid: hybrid_chain_call + closers in C++ (skip Python
+      // get_response / convert_exception_to_response on the hot path).
+      nb::dict cfg = nb::cast<nb::dict>(handler.attr("_hybrid_cfg"));
+      nb::dict bits = nb::cast<nb::dict>(handler.attr("_hybrid_bits"));
+      nb::object inner_gr = handler.attr("_hybrid_get_response");
+      response = hybrid_chain_call(cfg, bits, request, inner_gr);
+      // request.close on empty cold path is still required for WSGI cleanup.
+      response.attr("_resource_closers")
+          .attr("append")(request.attr("close"));
+      if (nb::cast<int>(response.attr("status_code")) >= 400) {
+        nb::object log_response =
+            nb::module_::import_("django.utils.log").attr("log_response");
+        nb::dict kw;
+        kw["response"] = response;
+        kw["request"] = request;
+        nb::tuple log_args = nb::make_tuple(
+            nb::str("%s: %s"), response.attr("reason_phrase"),
+            request.attr("path"));
+        nb::steal<nb::object>(
+            PyObject_Call(log_response.ptr(), log_args.ptr(), kw.ptr()));
+      }
     } else {
-      // Hybrid: full Python middleware onion.
+      // Generic: full Python get_response (middleware onion).
       PyObject* gr =
           PyObject_GetAttrString(handler.ptr(), "get_response");
       if (!gr) {
@@ -942,24 +1001,30 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
   set_attr(response.ptr(), g_lean.name__handler_class, handler_type);
   Py_DECREF(handler_type);
 
-  // Status line: hardcode 200 OK when possible
+  return wsgi_pack_start_response(response, start_response, environ);
+}
+
+nb::object wsgi_pack_start_response(nb::handle response,
+                                    nb::handle start_response,
+                                    nb::handle environ) {
+  lean_cache_init();
+  PyObject* resp = response.ptr();
+
+  // --- status line ---------------------------------------------------------
   PyObject* status = nullptr;
-  PyObject* sc =
-      PyObject_GetAttr(response.ptr(), g_lean.name_status_code);
+  PyObject* sc = PyObject_GetAttr(resp, g_lean.name_status_code);
   long code = sc ? PyLong_AsLong(sc) : -1;
   Py_XDECREF(sc);
   if (code == 200) {
-    // Check custom reason — if _reason_phrase is None, use cache.
     PyObject* reason =
-        PyObject_GetAttrString(response.ptr(), "_reason_phrase");
+        PyObject_GetAttr(resp, g_lean.name__reason_phrase);
     if (reason == Py_None || reason == nullptr) {
       Py_XDECREF(reason);
       status = g_lean.str_200_ok;
       Py_INCREF(status);
     } else {
       Py_XDECREF(reason);
-      PyObject* m =
-          PyObject_GetAttr(response.ptr(), g_lean.name_wsgi_status_line);
+      PyObject* m = PyObject_GetAttr(resp, g_lean.name_wsgi_status_line);
       if (!m) {
         throw nb::python_error();
       }
@@ -970,8 +1035,7 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
       }
     }
   } else {
-    PyObject* m =
-        PyObject_GetAttr(response.ptr(), g_lean.name_wsgi_status_line);
+    PyObject* m = PyObject_GetAttr(resp, g_lean.name_wsgi_status_line);
     if (!m) {
       throw nb::python_error();
     }
@@ -982,39 +1046,67 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
     }
   }
 
-  // headers
+  // --- headers from ResponseHeaders._store (dict of lower→(key, value)) ----
+  // Avoid response.items() generator / Python Mapping ABC.
   nb::list response_headers;
-  PyObject* items_m =
-      PyObject_GetAttr(response.ptr(), g_lean.name_items);
-  if (!items_m) {
+  PyObject* headers_obj = PyObject_GetAttr(resp, g_lean.name_headers);
+  if (!headers_obj) {
     Py_DECREF(status);
     throw nb::python_error();
   }
-  PyObject* items = call_noargs(items_m);
-  Py_DECREF(items_m);
-  if (!items) {
-    Py_DECREF(status);
-    throw nb::python_error();
+  PyObject* store = PyObject_GetAttr(headers_obj, g_lean.name__store);
+  Py_DECREF(headers_obj);
+  if (store && PyDict_Check(store)) {
+    PyObject* values = PyDict_Values(store);
+    if (!values) {
+      Py_DECREF(store);
+      Py_DECREF(status);
+      throw nb::python_error();
+    }
+    const Py_ssize_t n = PyList_GET_SIZE(values);
+    for (Py_ssize_t i = 0; i < n; ++i) {
+      PyObject* pair = PyList_GET_ITEM(values, i);  // borrowed (key, value)
+      if (pair && PyTuple_Check(pair) && PyTuple_GET_SIZE(pair) >= 2) {
+        // _store values are (original_key, value) tuples — WSGI wants that.
+        response_headers.append(nb::borrow(pair));
+      }
+    }
+    Py_DECREF(values);
+  } else {
+    Py_XDECREF(store);
+    PyErr_Clear();
+    // Fallback: response.items()
+    PyObject* items_m = PyObject_GetAttr(resp, g_lean.name_items);
+    if (!items_m) {
+      Py_DECREF(status);
+      throw nb::python_error();
+    }
+    PyObject* items = call_noargs(items_m);
+    Py_DECREF(items_m);
+    if (!items) {
+      Py_DECREF(status);
+      throw nb::python_error();
+    }
+    PyObject* it = PyObject_GetIter(items);
+    Py_DECREF(items);
+    if (!it) {
+      Py_DECREF(status);
+      throw nb::python_error();
+    }
+    PyObject* item;
+    while ((item = PyIter_Next(it)) != nullptr) {
+      response_headers.append(nb::steal<nb::object>(item));
+    }
+    Py_DECREF(it);
+    if (PyErr_Occurred()) {
+      Py_DECREF(status);
+      throw nb::python_error();
+    }
   }
-  PyObject* it = PyObject_GetIter(items);
-  Py_DECREF(items);
-  if (!it) {
-    Py_DECREF(status);
-    throw nb::python_error();
-  }
-  PyObject* item;
-  while ((item = PyIter_Next(it)) != nullptr) {
-    response_headers.append(nb::steal<nb::object>(item));
-  }
-  Py_DECREF(it);
-  if (PyErr_Occurred()) {
-    Py_DECREF(status);
-    throw nb::python_error();
-  }
+  Py_XDECREF(store);
 
-  // cookies — skip if empty
-  PyObject* cookies =
-      PyObject_GetAttr(response.ptr(), g_lean.name_cookies);
+  // cookies — skip when empty (common floor path)
+  PyObject* cookies = PyObject_GetAttr(resp, g_lean.name_cookies);
   if (cookies) {
     Py_ssize_t n = PyObject_Size(cookies);
     if (n > 0) {
@@ -1033,9 +1125,9 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
               Py_DECREF(status);
               throw nb::python_error();
             }
-            response_headers.append(
-                nb::make_tuple(nb::handle(g_lean.str_set_cookie),
-                               nb::steal<nb::object>(out)));
+            response_headers.append(nb::make_tuple(
+                nb::handle(g_lean.str_set_cookie),
+                nb::steal<nb::object>(out)));
           }
           Py_DECREF(vit);
         }
@@ -1052,8 +1144,7 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
   }
 
   {
-    PyObject* args =
-        PyTuple_Pack(2, status, response_headers.ptr());
+    PyObject* args = PyTuple_Pack(2, status, response_headers.ptr());
     Py_DECREF(status);
     if (!args) {
       throw nb::python_error();
@@ -1068,15 +1159,17 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
 
   // file_wrapper rare path
   {
-    PyObject* fts =
-        PyObject_GetAttr(response.ptr(), g_lean.name_file_to_stream);
+    PyObject* fts = PyObject_GetAttr(resp, g_lean.name_file_to_stream);
     if (!fts) {
       PyErr_Clear();
     } else if (fts != Py_None) {
-      PyObject* wrapper = PyDict_GetItem(env, g_lean.str_wsgi_file_wrapper);
+      PyObject* env = environ.ptr();
+      PyObject* wrapper =
+          PyDict_Check(env)
+              ? PyDict_GetItem(env, g_lean.str_wsgi_file_wrapper)
+              : nullptr;
       if (wrapper && wrapper != Py_None) {
-        PyObject* close_m =
-            PyObject_GetAttr(response.ptr(), g_lean.name_close);
+        PyObject* close_m = PyObject_GetAttr(resp, g_lean.name_close);
         if (close_m) {
           if (PyObject_SetAttrString(fts, "close", close_m) < 0) {
             Py_DECREF(close_m);
@@ -1085,8 +1178,7 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
           }
           Py_DECREF(close_m);
         }
-        PyObject* bs =
-            PyObject_GetAttr(response.ptr(), g_lean.name_block_size);
+        PyObject* bs = PyObject_GetAttr(resp, g_lean.name_block_size);
         PyObject* wrapped =
             PyObject_CallFunctionObjArgs(wrapper, fts, bs, nullptr);
         Py_XDECREF(bs);
@@ -1102,7 +1194,7 @@ nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
     }
   }
 
-  return response;
+  return nb::borrow(response);
 }
 
 }  // namespace django::native

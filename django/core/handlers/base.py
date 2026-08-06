@@ -33,6 +33,8 @@ class BaseHandler:
     # path_info → (callback, args, kwargs, url_name, route) for lean C++ resolve.
     # Built once in load_middleware (empty / pure-stock / all-native hybrid).
     _exact_routes = None
+    # path_info → callback for converter-free routes with empty args/kwargs.
+    _exact_callbacks = None
     # True only when MIDDLEWARE is empty: C++ may skip the middleware chain.
     _lean_view_only = False
     # C++ owns WSGI outer loop (script prefix, request, start_response pack).
@@ -65,6 +67,7 @@ class BaseHandler:
         self._native_stock_specs = None
         self._middleware_native_at_load = None
         self._exact_routes = None
+        self._exact_callbacks = None
         self._lean_view_only = False
         self._use_native_wsgi_outer = False
 
@@ -86,6 +89,7 @@ class BaseHandler:
             self._lean_view_only = False
             self._use_native_wsgi_outer = bool(_native.AVAILABLE) and not is_async
             self._exact_routes = self._build_exact_route_table()
+            self._exact_callbacks = self._build_exact_callbacks(self._exact_routes)
             self._pin_lean_urlconf()
             if self._use_native_wsgi_outer:
                 from functools import partial
@@ -109,7 +113,12 @@ class BaseHandler:
             )
             self._lean_view_only = False
             self._use_native_wsgi_outer = True
-            self._exact_routes = self._build_exact_route_table()
+            if self._exact_routes is None:
+                self._exact_routes = self._build_exact_route_table()
+            if self._exact_callbacks is None:
+                self._exact_callbacks = self._build_exact_callbacks(
+                    self._exact_routes
+                )
             self._pin_lean_urlconf()
             return
 
@@ -212,6 +221,7 @@ class BaseHandler:
         # Exact routes + urlconf pin for empty, hooks-empty, and all-native hybrid.
         if self._use_native_wsgi_outer:
             self._exact_routes = self._build_exact_route_table()
+            self._exact_callbacks = self._build_exact_callbacks(self._exact_routes)
             self._pin_lean_urlconf()
 
     def _pin_lean_urlconf(self):
@@ -276,6 +286,21 @@ class BaseHandler:
         except Exception:
             return {}
         return table
+
+    def _build_exact_callbacks(self, exact_routes):
+        """path_info → callback for routes with empty args/kwargs (C++ Call)."""
+        if not exact_routes:
+            return {}
+        out = {}
+        for path_info, entry in exact_routes.items():
+            try:
+                callback, args, kwargs = entry[0], entry[1], entry[2]
+            except (TypeError, IndexError, ValueError):
+                continue
+            if args or kwargs:
+                continue
+            out[path_info] = callback
+        return out
 
     def _classify_middleware_at_load(self, paths, _native):
         """
@@ -558,8 +583,9 @@ class BaseHandler:
         def cold_session_factory(_cls=session_store_cls):
             return ColdSession(lambda: _cls(None))
 
-        # Exact routes for C++ view dispatch (built before return below too).
+        # Exact routes + pre-bound callbacks for C++ view dispatch.
         exact_routes = self._build_exact_route_table()
+        exact_callbacks = self._build_exact_callbacks(exact_routes)
 
         bits = {
             "session_store": session_store_cls,
@@ -586,6 +612,7 @@ class BaseHandler:
             ),
             "save_every_request": bool(settings.SESSION_SAVE_EVERY_REQUEST),
             "exact_routes": exact_routes,
+            "exact_callbacks": exact_callbacks,
             "set_resolver_match": False,  # hot path: skip ResolverMatch alloc
             "check_response": self.check_response,
         }
@@ -603,7 +630,11 @@ class BaseHandler:
             return _n.hybrid_chain_call(_cfg, _bits, request, _get_response)
 
         self._hybrid_flattened = True
+        self._hybrid_cfg = cfg
+        self._hybrid_bits = bits
+        self._hybrid_get_response = get_response
         self._exact_routes = exact_routes
+        self._exact_callbacks = exact_callbacks
         return convert_exception_to_response(hybrid_chain)
 
     def _any_atomic_requests(self):
