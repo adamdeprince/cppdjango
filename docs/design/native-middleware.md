@@ -87,13 +87,14 @@ includes Session, CSRF, or Auth (cannot be pure C++ stock chain),
 ```text
 hybrid_chain_call (one C++ crossing)
   hybrid_process_request          # Security SSL + Common PREPEND_WWW
-  session attach                  # Cookie header scan only (no COOKIES parse)
+  session: ColdSession stub if no cookie; else SessionStore(key)
   CSRF cookie → META              # Cookie header scan; invalid → Python new cookie
-  Auth SimpleLazyObject(user)     # still Python objects; constructed from C++
+  auth: AnonymousUser if cold session; else SimpleLazyObject(get_user)
   safe method → csrf_processing_done + _skip_view_middleware
-  get_response                    # resolve + view (skips process_view list)
+  exact_routes[path] → view(...)  # C++ dispatch; no get_response / check_response
+    (fallback get_response if route miss or unsafe method)
   CSRF process_response           # only if CSRF_COOKIE_NEEDS_UPDATE
-  Session process_response        # no-op if never accessed
+  Session process_response        # no-op if ColdSession never upgraded
   hybrid_process_response         # XFrame + Content-Length + Security headers
 ```
 

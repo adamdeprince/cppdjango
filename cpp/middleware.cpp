@@ -757,6 +757,77 @@ bool session_response_needs_work(bool accessed, bool modified,
   return accessed || modified || save_every_request;
 }
 
+namespace {
+
+// Call view(request, *args, **kwargs) — empty args/kwargs is the hot path.
+nb::object hybrid_call_view(nb::handle callback, nb::handle request,
+                            nb::handle args, nb::handle kwargs) {
+  nb::list pos;
+  pos.append(request);
+  if (!args.is_none()) {
+    for (nb::handle a : args) {
+      pos.append(a);
+    }
+  }
+  nb::tuple call_args = nb::tuple(pos);
+  PyObject* kw_ptr = nullptr;
+  nb::dict empty_kw;
+  if (!kwargs.is_none() && PyDict_Check(kwargs.ptr()) &&
+      PyDict_GET_SIZE(kwargs.ptr()) > 0) {
+    kw_ptr = kwargs.ptr();
+  } else {
+    kw_ptr = empty_kw.ptr();
+  }
+  PyObject* result =
+      PyObject_Call(callback.ptr(), call_args.ptr(), kw_ptr);
+  if (!result) {
+    throw nb::python_error();
+  }
+  return nb::steal<nb::object>(result);
+}
+
+// Exact-route table lookup → call view. Returns nullopt if miss.
+std::optional<nb::object> hybrid_exact_route_view(nb::dict bits,
+                                                  nb::handle request) {
+  if (!bits.contains("exact_routes") || bits["exact_routes"].is_none()) {
+    return std::nullopt;
+  }
+  nb::dict table = nb::cast<nb::dict>(bits["exact_routes"]);
+  nb::object path_info = request.attr("path_info");
+  if (!table.contains(path_info)) {
+    return std::nullopt;
+  }
+  nb::tuple entry = nb::cast<nb::tuple>(table[path_info]);
+  nb::object callback = nb::borrow(nb::object(entry[0]));
+  nb::object args =
+      nb::len(entry) > 1 ? nb::borrow(nb::object(entry[1])) : nb::tuple();
+  nb::object kwargs =
+      nb::len(entry) > 2 ? nb::borrow(nb::object(entry[2])) : nb::dict();
+  // Optional ResolverMatch for debug/reverse (skip on hot path unless bits say).
+  if (bits.contains("set_resolver_match") &&
+      nb::cast<bool>(bits["set_resolver_match"])) {
+    nb::object url_name =
+        nb::len(entry) > 3 ? nb::borrow(nb::object(entry[3])) : nb::none();
+    nb::object route =
+        nb::len(entry) > 4 ? nb::borrow(nb::object(entry[4])) : nb::none();
+    nb::object RM =
+        nb::module_::import_("django.urls.resolvers").attr("ResolverMatch");
+    request.attr("resolver_match") =
+        RM(callback, args, kwargs, url_name, nb::none(), nb::none(), route);
+  } else {
+    request.attr("resolver_match") = nb::none();
+  }
+  nb::object response = hybrid_call_view(callback, request, args, kwargs);
+  // Skip check_response when non-None (stock TE views always return HttpResponse).
+  if (response.is_none() && bits.contains("check_response") &&
+      !bits["check_response"].is_none()) {
+    bits["check_response"](response, callback);
+  }
+  return response;
+}
+
+}  // namespace
+
 nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
                              nb::handle get_response) {
   // --- Security / Common process_request ---------------------------------
@@ -780,25 +851,45 @@ nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
     http_cookie.clear();
   }
 
-  // --- Session attach (no COOKIES parse when header empty) -----------------
+  // --- Session attach ------------------------------------------------------
+  // Cold path (no Cookie header): ColdSession stub — no SessionStore.
+  // Warm path: real SessionStore with validated key.
+  bool cold_session = false;
   if (!bits["session_store"].is_none()) {
     nb::object store_cls = bits["session_store"];
     std::string sess_name =
         nb::cast<std::string>(nb::str(bits["session_cookie_name"]));
-    nb::object session_key = nb::none();
-    if (!http_cookie.empty()) {
+    if (http_cookie.empty()) {
+      cold_session = true;
+      if (bits.contains("cold_session_factory") &&
+          !bits["cold_session_factory"].is_none()) {
+        request.attr("session") = bits["cold_session_factory"]();
+      } else {
+        request.attr("session") = store_cls(nb::none());
+      }
+    } else {
+      nb::object session_key = nb::none();
       auto key = cookie_header_get(http_cookie, sess_name);
       if (key) {
         auto valid = session_load_key(*key, 8);
         if (valid) {
           session_key = nb::str(valid->c_str(), valid->size());
+          cold_session = false;
         }
       }
+      if (session_key.is_none() &&
+          bits.contains("cold_session_factory") &&
+          !bits["cold_session_factory"].is_none()) {
+        // Cookie present but no/invalid session key — still cold-ish.
+        cold_session = true;
+        request.attr("session") = bits["cold_session_factory"]();
+      } else {
+        request.attr("session") = store_cls(session_key);
+      }
     }
-    request.attr("session") = store_cls(session_key);
   }
 
-  // --- CSRF process_request (cookie header only; no full COOKIES) ----------
+  // --- CSRF process_request (cookie header only) ---------------------------
   bool has_csrf = nb::cast<bool>(bits["has_csrf"]);
   if (has_csrf) {
     std::string csrf_name =
@@ -806,7 +897,6 @@ nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
     if (!http_cookie.empty()) {
       auto secret = cookie_header_get(http_cookie, csrf_name);
       if (secret && !secret->empty()) {
-        // length_ok returns 0 if valid length, non-zero if bad.
         const int secret_len = 32;
         const int token_len = 64;
         const int n = static_cast<int>(secret->size());
@@ -828,47 +918,86 @@ nb::object hybrid_chain_call(nb::dict cfg, nb::dict bits, nb::handle request,
     }
   }
 
-  // --- Auth attach (SimpleLazyObject via partial) --------------------------
+  // --- Auth attach ---------------------------------------------------------
+  // Cold session → eager AnonymousUser (no SimpleLazyObject / get_user).
+  // Warm session → SimpleLazyObject(partial(get_user, request)).
   if (nb::cast<bool>(bits["has_auth"])) {
-    nb::object SLO =
-        nb::module_::import_("django.utils.functional").attr("SimpleLazyObject");
     nb::object partial = nb::module_::import_("functools").attr("partial");
-    nb::object get_user = bits["get_user"];
     nb::object auser = bits["auser"];
-    request.attr("user") = SLO(partial(get_user, request));
+    if (cold_session && bits.contains("anonymous_user") &&
+        !bits["anonymous_user"].is_none()) {
+      request.attr("user") = bits["anonymous_user"]();
+    } else {
+      nb::object SLO = nb::module_::import_("django.utils.functional")
+                           .attr("SimpleLazyObject");
+      nb::object get_user = bits["get_user"];
+      request.attr("user") = SLO(partial(get_user, request));
+    }
     request.attr("auser") = partial(auser, request);
   }
 
-  // --- Safe-method CSRF accept: skip view middleware -----------------------
+  // --- Safe-method CSRF accept + skip view middleware ----------------------
   std::string method = nb::cast<std::string>(nb::str(request.attr("method")));
   bool dont_enforce = false;
   if (nb::hasattr(request, "_dont_enforce_csrf_checks")) {
     dont_enforce = nb::cast<bool>(request.attr("_dont_enforce_csrf_checks"));
   }
-  if (has_csrf &&
-      (csrf_is_safe_method(method) || dont_enforce)) {
+  bool safe_csrf = has_csrf && (csrf_is_safe_method(method) || dont_enforce);
+  if (safe_csrf) {
     request.attr("csrf_processing_done") = true;
     request.attr("_skip_view_middleware") = true;
   }
 
-  // --- View layer ----------------------------------------------------------
-  nb::object response = get_response(request);
+  // --- View layer: exact-route call from C++ when possible -----------------
+  nb::object response;
+  bool used_exact = false;
+  if (safe_csrf || !has_csrf) {
+    auto exact = hybrid_exact_route_view(bits, request);
+    if (exact) {
+      response = *exact;
+      used_exact = true;
+    }
+  }
+  if (!used_exact) {
+    response = get_response(request);
+  }
 
   // --- CSRF process_response only when cookie must be written --------------
   if (has_csrf && bits.contains("csrf_process_response") &&
       !bits["csrf_process_response"].is_none()) {
-    nb::dict m = nb::cast<nb::dict>(request.attr("META"));
-    if (m.contains("CSRF_COOKIE_NEEDS_UPDATE") &&
-        nb::cast<bool>(m["CSRF_COOKIE_NEEDS_UPDATE"])) {
+    bool needs = false;
+    try {
+      nb::object flag = meta.attr("get")("CSRF_COOKIE_NEEDS_UPDATE", false);
+      needs = nb::cast<bool>(flag);
+    } catch (...) {
+      needs = false;
+    }
+    if (needs) {
       response = bits["csrf_process_response"](request, response);
     }
   }
 
-  // --- Session process_response (Python method with no-op fast path) -------
-  if (!bits["session_store"].is_none() &&
-      bits.contains("session_process_response") &&
-      !bits["session_process_response"].is_none()) {
-    response = bits["session_process_response"](request, response);
+  // --- Session process_response --------------------------------------------
+  // ColdSession with accessed=False → pure no-op without calling Python mw.
+  if (!bits["session_store"].is_none()) {
+    bool save_every = false;
+    if (bits.contains("save_every_request")) {
+      save_every = nb::cast<bool>(bits["save_every_request"]);
+    }
+    bool accessed = false;
+    bool modified = false;
+    try {
+      accessed = nb::cast<bool>(request.attr("session").attr("accessed"));
+      modified = nb::cast<bool>(request.attr("session").attr("modified"));
+    } catch (...) {
+      accessed = true;  // force Python path on error
+    }
+    if (session_response_needs_work(accessed, modified, save_every)) {
+      if (bits.contains("session_process_response") &&
+          !bits["session_process_response"].is_none()) {
+        response = bits["session_process_response"](request, response);
+      }
+    }
   }
 
   // --- Header middleware batch ---------------------------------------------

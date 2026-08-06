@@ -547,18 +547,32 @@ class BaseHandler:
             del cfg["xframe"]
 
         from django.contrib.auth.middleware import auser, get_user
+        from django.contrib.auth.models import AnonymousUser
         from django.middleware.csrf import _add_new_csrf_cookie
+        from django.native.hybrid_stubs import ColdSession
+
+        session_store_cls = (
+            session_mw.SessionStore if session_mw is not None else None
+        )
+
+        def cold_session_factory(_cls=session_store_cls):
+            return ColdSession(lambda: _cls(None))
+
+        # Exact routes for C++ view dispatch (built before return below too).
+        exact_routes = self._build_exact_route_table()
 
         bits = {
-            "session_store": (
-                session_mw.SessionStore if session_mw is not None else None
-            ),
+            "session_store": session_store_cls,
             "session_cookie_name": settings.SESSION_COOKIE_NAME,
             "csrf_cookie_name": settings.CSRF_COOKIE_NAME,
             "has_csrf": csrf_mw is not None,
             "has_auth": auth_mw is not None,
             "get_user": get_user,
             "auser": auser,
+            "anonymous_user": AnonymousUser,
+            "cold_session_factory": (
+                cold_session_factory if session_store_cls is not None else None
+            ),
             "csrf_process_response": (
                 csrf_mw.process_response if csrf_mw is not None else None
             ),
@@ -571,6 +585,9 @@ class BaseHandler:
                 else None
             ),
             "save_every_request": bool(settings.SESSION_SAVE_EVERY_REQUEST),
+            "exact_routes": exact_routes,
+            "set_resolver_match": False,  # hot path: skip ResolverMatch alloc
+            "check_response": self.check_response,
         }
 
         def hybrid_chain(
@@ -581,12 +598,12 @@ class BaseHandler:
             _get_response=get_response,
             _n=_native,
         ):
-            # One C++ crossing: security/common, session/csrf/auth attach,
-            # safe-method CSRF accept + skip view mw, view, csrf/session
-            # response, header batch.
+            # One C++ crossing: security/common, cold session/anon stubs,
+            # CSRF accept, exact-route view, session/csrf response, headers.
             return _n.hybrid_chain_call(_cfg, _bits, request, _get_response)
 
         self._hybrid_flattened = True
+        self._exact_routes = exact_routes
         return convert_exception_to_response(hybrid_chain)
 
     def _any_atomic_requests(self):
