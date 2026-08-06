@@ -73,6 +73,43 @@ nb::tuple compile_to_tuple(const django::orm::QuerySet& self) {
   return nb::make_tuple(nb::str(compiled.sql.c_str(), compiled.sql.size()), params);
 }
 
+// Python tree dict:
+//   {"kind": "and"|"or"|"not"|"atom", "children": [...], "key": str, "values": list}
+django::orm::QNode q_node_from_python(nb::handle h) {
+  django::orm::QNode node;
+  nb::dict d = nb::cast<nb::dict>(h);
+  std::string kind = nb::cast<std::string>(d["kind"]);
+  if (kind == "and") {
+    node.kind = 0;
+  } else if (kind == "or") {
+    node.kind = 1;
+  } else if (kind == "not") {
+    node.kind = 2;
+  } else if (kind == "atom") {
+    node.kind = 3;
+    node.key = nb::cast<std::string>(d["key"]);
+    if (d.contains("values")) {
+      nb::object vals = d["values"];
+      if (nb::isinstance<nb::list>(vals) || nb::isinstance<nb::tuple>(vals)) {
+        for (nb::handle x : nb::borrow(vals)) {
+          node.values.push_back(param_from_python(x));
+        }
+      } else {
+        node.values.push_back(param_from_python(vals));
+      }
+    }
+    return node;
+  } else {
+    throw std::runtime_error("unknown Q node kind: " + kind);
+  }
+  if (d.contains("children")) {
+    for (nb::handle c : nb::borrow(d["children"])) {
+      node.children.push_back(q_node_from_python(c));
+    }
+  }
+  return node;
+}
+
 }  // namespace
 
 void register_orm_engine(nb::module_& parent) {
@@ -203,6 +240,13 @@ void register_orm_engine(nb::module_& parent) {
             return self.filter_kwargs(items, disjunctive);
           },
           nb::arg("kwargs"), nb::arg("disjunctive") = false)
+      .def(
+          "apply_q",
+          [](django::orm::QuerySet& self, nb::dict tree) {
+            return self.apply_q(q_node_from_python(tree));
+          },
+          nb::arg("tree"),
+          "Apply a full Q-tree dict (and/or/not/atom) in C++.")
       .def(
           "values_list",
           [](django::orm::QuerySet& self, nb::sequence names, bool flat) {

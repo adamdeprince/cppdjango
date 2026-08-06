@@ -2,7 +2,7 @@
 Python facade for the native ORM data plane.
 
 Query build + SQL compile live in C++. This module exports schema from Meta,
-bridges kwargs, and runs execute/materialize in few crossings.
+bridges kwargs / Q trees, and runs execute/materialize in few crossings.
 """
 
 from __future__ import annotations
@@ -13,6 +13,7 @@ from django.native._loader import AVAILABLE, get_native_module
 
 __all__ = [
     "AVAILABLE",
+    "apply_q",
     "build_queryset",
     "clear_schema",
     "compile_delete",
@@ -20,8 +21,10 @@ __all__ = [
     "compile_update",
     "compile_values_list_get",
     "execute_fetchall",
+    "execute_fetchone_pair",
     "export_model",
     "model_id",
+    "q_to_tree",
     "register_model_from_meta",
 ]
 
@@ -46,13 +49,23 @@ def model_id(label: str) -> int | None:
     return orm.model_id(label)
 
 
-def register_model_from_meta(model) -> int | None:
-    """Snapshot model._meta into the C++ SchemaRegistry (incl. simple FKs)."""
+def register_model_from_meta(model, _seen: set | None = None) -> int | None:
+    """
+    Snapshot model._meta into the C++ SchemaRegistry.
+
+    Recursively exports related models so multi-hop joins can resolve columns.
+    """
     orm = _orm()
     if orm is None:
         return None
+    if _seen is None:
+        _seen = set()
     opts = model._meta
     label = f"{opts.app_label}.{opts.object_name}"
+    if label in _seen:
+        return model_id(label)
+    _seen.add(label)
+
     fields = []
     for f in opts.concrete_fields:
         if not f.column:
@@ -62,7 +75,10 @@ def register_model_from_meta(model) -> int | None:
         remote_label = ""
         if f.is_relation and (f.many_to_one or f.one_to_one):
             try:
-                remote = f.remote_field.model._meta
+                remote_model = f.remote_field.model
+                # Ensure remote schema exists for multi-hop.
+                register_model_from_meta(remote_model, _seen)
+                remote = remote_model._meta
                 remote_table = remote.db_table
                 remote_pk = remote.pk.column
                 remote_label = f"{remote.app_label}.{remote.object_name}"
@@ -95,9 +111,78 @@ def dialect_for_connection(connection) -> int | None:
     return int(orm.dialect_from_vendor(connection.vendor))
 
 
-def build_queryset(model, connection, *, kwargs=None, disjunctive=False):
+def q_to_tree(node) -> dict | None:
     """
-    Create a C++ QuerySet for model, optionally applying filter kwargs in one hop.
+    Lower a Django Q (or (key, value) child) to a JSON-like tree for C++ apply_q.
+
+    Returns None if the tree contains unsupported nodes (expressions, XOR, …).
+    """
+    from django.db.models import Q
+    from django.db.models.lookups import Lookup
+
+    if isinstance(node, Q):
+        if node.connector == Q.XOR:
+            return None  # not yet
+        if node.negated:
+            # NOT (children combined with connector)
+            inner_connector = node.connector or Q.AND
+            kind = "or" if inner_connector == Q.OR else "and"
+            children = []
+            for c in node.children:
+                lc = q_to_tree(c)
+                if lc is None:
+                    return None
+                children.append(lc)
+            body = {"kind": kind, "children": children}
+            return {"kind": "not", "children": [body]}
+        kind = "or" if node.connector == Q.OR else "and"
+        children = []
+        for c in node.children:
+            lc = q_to_tree(c)
+            if lc is None:
+                return None
+            children.append(lc)
+        return {"kind": kind, "children": children}
+
+    # (lookup, value) pair from Q kwargs / children
+    if isinstance(node, tuple) and len(node) == 2 and isinstance(node[0], str):
+        key, val = node
+        simple = (str, int, float, bool, type(None), bytes)
+        if isinstance(val, (list, tuple)):
+            for item in val:
+                if not isinstance(item, simple):
+                    return None
+            values = list(val)
+        elif isinstance(val, simple):
+            values = [val]
+        else:
+            # F(), expressions, model instances without prep — miss
+            return None
+        return {"kind": "atom", "key": key, "values": values}
+
+    if isinstance(node, Lookup):
+        return None
+    return None
+
+
+def apply_q(qs, q_obj) -> bool:
+    """Apply a Django Q to a native QuerySet handle. Returns False on miss."""
+    tree = q_to_tree(q_obj)
+    if tree is None:
+        return False
+    return bool(qs.apply_q(tree))
+
+
+def build_queryset(
+    model,
+    connection,
+    *,
+    kwargs=None,
+    disjunctive=False,
+    q=None,
+):
+    """
+    Create a C++ QuerySet for model, optionally applying kwargs and/or a Q tree.
     Returns native QuerySet handle or None.
     """
     orm = _orm()
@@ -110,8 +195,10 @@ def build_queryset(model, connection, *, kwargs=None, disjunctive=False):
     if dialect is None:
         return None
     qs = orm.QuerySet.create(int(mid), int(dialect))
+    if q is not None:
+        if not apply_q(qs, q):
+            return None
     if kwargs:
-        # Normalize IN lists; leave scalars as-is for C++.
         payload = {}
         for k, v in kwargs.items():
             if not isinstance(k, str):
@@ -149,10 +236,11 @@ def compile_select(
     *,
     field_names: list[str] | None = None,
     kwargs: dict | None = None,
+    q=None,
     limit: int | None = None,
     flat: bool = False,
 ) -> tuple[str, list] | None:
-    qs = build_queryset(model, connection, kwargs=kwargs or {})
+    qs = build_queryset(model, connection, kwargs=kwargs or None, q=q)
     if qs is None:
         return None
     if field_names:
@@ -170,10 +258,13 @@ def compile_update(
     model,
     connection,
     *,
-    filter_kwargs: dict,
+    filter_kwargs: dict | None = None,
     update_kwargs: dict,
+    q=None,
 ) -> tuple[str, list] | None:
-    qs = build_queryset(model, connection, kwargs=filter_kwargs)
+    qs = build_queryset(
+        model, connection, kwargs=filter_kwargs or None, q=q
+    )
     if qs is None or not update_kwargs:
         return None
     for name, value in update_kwargs.items():
@@ -186,9 +277,15 @@ def compile_update(
 
 
 def compile_delete(
-    model, connection, *, filter_kwargs: dict
+    model,
+    connection,
+    *,
+    filter_kwargs: dict | None = None,
+    q=None,
 ) -> tuple[str, list] | None:
-    qs = build_queryset(model, connection, kwargs=filter_kwargs)
+    qs = build_queryset(
+        model, connection, kwargs=filter_kwargs or None, q=q
+    )
     if qs is None:
         return None
     qs.set_delete()
@@ -199,17 +296,12 @@ def compile_delete(
 
 
 def execute_fetchall(connection, sql: str, params=None) -> list:
-    """
-    Single execute + fetchall (materialize all rows in one DB round-trip).
-    Result arena at the Python/DBAPI boundary: one list of tuples out.
-    """
     with connection.cursor() as cursor:
         cursor.execute(sql, params or ())
         return cursor.fetchall()
 
 
 def execute_fetchone_pair(connection, sql: str, params=None):
-    """Fetch up to 2 rows to detect MultipleObjectsReturned for get()."""
     with connection.cursor() as cursor:
         cursor.execute(sql, params or ())
         row = cursor.fetchone()

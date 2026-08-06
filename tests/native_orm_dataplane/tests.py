@@ -92,6 +92,14 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
         from django import _native
 
         orm = _native.orm
+        orm.register_model(
+            "test.Author",
+            "author",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                ("name", "name", "name", "CharField", False, False, "", "", ""),
+            ],
+        )
         mid = orm.register_model(
             "test.Book",
             "book",
@@ -116,6 +124,118 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
         self.assertIn("INNER JOIN", sql)
         self.assertIn('"author"', sql)
         self.assertEqual(list(params), ["Ada"])
+
+    def test_multi_hop_joins(self):
+        from django import _native
+
+        orm = _native.orm
+        orm.register_model(
+            "test.Country",
+            "country",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                ("code", "code", "code", "CharField", False, False, "", "", ""),
+            ],
+        )
+        orm.register_model(
+            "test.Author",
+            "author",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                (
+                    "country",
+                    "country_id",
+                    "country_id",
+                    "ForeignKey",
+                    False,
+                    False,
+                    "country",
+                    "id",
+                    "test.Country",
+                ),
+            ],
+        )
+        mid = orm.register_model(
+            "test.Book",
+            "book",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                (
+                    "author",
+                    "author_id",
+                    "author_id",
+                    "ForeignKey",
+                    False,
+                    False,
+                    "author",
+                    "id",
+                    "test.Author",
+                ),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.filter_kwargs({"author__country__code": "US"}, False))
+        sql, params = qs.compile_sql()
+        # Two joins
+        self.assertEqual(sql.count("INNER JOIN"), 2)
+        self.assertIn('"country"', sql)
+        self.assertIn('"code"', sql)
+        self.assertEqual(list(params), ["US"])
+
+    def test_apply_q_tree(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "test.Item",
+            "item",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                ("score", "score", "score", "IntegerField", False, False, "", "", ""),
+                ("name", "name", "name", "CharField", False, False, "", "", ""),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        tree = {
+            "kind": "or",
+            "children": [
+                {"kind": "atom", "key": "score__gte", "values": [10]},
+                {
+                    "kind": "and",
+                    "children": [
+                        {"kind": "atom", "key": "name", "values": ["x"]},
+                        {"kind": "atom", "key": "id__in", "values": [1, 2]},
+                    ],
+                },
+            ],
+        }
+        self.assertTrue(qs.apply_q(tree))
+        sql, params = qs.compile_sql()
+        self.assertIn(" OR ", sql)
+        self.assertIn(" AND ", sql)
+        self.assertEqual(list(params), [10, "x", 1, 2])
+
+    def test_apply_q_not(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "test.N2",
+            "n2",
+            [
+                ("id", "id", "id", "AutoField", True, False, "", "", ""),
+                ("name", "name", "name", "CharField", False, False, "", "", ""),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_SQLITE)
+        tree = {
+            "kind": "not",
+            "children": [{"kind": "atom", "key": "name", "values": ["nope"]}],
+        }
+        self.assertTrue(qs.apply_q(tree))
+        sql, params = qs.compile_sql()
+        self.assertIn("NOT (", sql)
+        self.assertEqual(list(params), ["nope"])
 
     def test_update_and_delete_compile(self):
         from django import _native
@@ -197,3 +317,48 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         self.assertIsNotNone(compiled2)
         self.assertTrue(compiled2[0].startswith("UPDATE"))
         self.assertEqual(compiled2[1], [5, 2])
+
+    def test_q_to_tree_and_compile_select(self):
+        from django.db.models import Q
+        from django.native import orm
+
+        class Country(models.Model):
+            code = models.CharField(max_length=2)
+
+            class Meta:
+                app_label = "native_orm_dataplane"
+
+        class Author(models.Model):
+            country = models.ForeignKey(Country, on_delete=models.CASCADE)
+            name = models.CharField(max_length=40)
+
+            class Meta:
+                app_label = "native_orm_dataplane"
+
+        class Book(models.Model):
+            author = models.ForeignKey(Author, on_delete=models.CASCADE)
+            title = models.CharField(max_length=40)
+
+            class Meta:
+                app_label = "native_orm_dataplane"
+
+        class _Conn:
+            vendor = "postgresql"
+
+        q = Q(title="X") | Q(author__country__code="US", author__name="Ada")
+        tree = orm.q_to_tree(q)
+        self.assertIsNotNone(tree)
+        self.assertEqual(tree["kind"], "or")
+
+        compiled = orm.compile_select(
+            Book,
+            _Conn(),
+            field_names=["id", "title"],
+            q=q,
+        )
+        self.assertIsNotNone(compiled)
+        sql, params = compiled
+        self.assertEqual(sql.count("INNER JOIN"), 2)
+        self.assertIn(" OR ", sql)
+        self.assertIn("Ada", params)
+        self.assertIn("US", params)

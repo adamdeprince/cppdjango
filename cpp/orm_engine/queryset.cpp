@@ -3,6 +3,25 @@
 #include <sstream>
 
 namespace django::orm {
+namespace {
+
+std::vector<std::string> split_lookup_sep(std::string_view key) {
+  std::vector<std::string> parts;
+  std::string s(key);
+  std::size_t start = 0;
+  while (start <= s.size()) {
+    auto pos = s.find("__", start);
+    if (pos == std::string::npos) {
+      parts.push_back(s.substr(start));
+      break;
+    }
+    parts.push_back(s.substr(start, pos - start));
+    start = pos + 2;
+  }
+  return parts;
+}
+
+}  // namespace
 
 QuerySet::QuerySet(ModelId model, DialectId dialect) {
   query_.model = model;
@@ -42,7 +61,6 @@ bool QuerySet::filter_eq(std::string_view field_name, ParamValue value) {
 
 bool QuerySet::filter_cmp(std::string_view field_name, CmpOp op, ParamValue value) {
   ColumnRef col;
-  // Prefer plain field + explicit op (do not let lookup parser force exact).
   if (auto fid = resolve_field(field_name)) {
     col.field = *fid;
   } else {
@@ -122,108 +140,167 @@ bool QuerySet::filter_in(std::string_view field_name,
   return append_pred(std::move(p));
 }
 
+std::string QuerySet::ensure_join(const ModelSchema& local_model,
+                                  std::string_view local_alias,
+                                  std::string_view fk_name,
+                                  std::string_view path_prefix) {
+  auto fit = local_model.field_by_name.find(std::string(fk_name));
+  if (fit == local_model.field_by_name.end()) {
+    return {};
+  }
+  const FieldSchema& fk = local_model.fields[fit->second];
+  if (!fk.is_relation || fk.remote_table.empty()) {
+    return {};
+  }
+  std::string prefix(path_prefix);
+  if (auto jt = join_aliases_.find(prefix); jt != join_aliases_.end()) {
+    return jt->second;
+  }
+  std::string alias = "J" + std::to_string(++join_counter_);
+  JoinEdge edge;
+  edge.type = JoinType::Inner;
+  edge.alias = alias;
+  edge.table = fk.remote_table;
+  edge.local_alias = std::string(local_alias);
+  edge.local_column = fk.column;
+  edge.remote_column =
+      fk.remote_pk_column.empty() ? std::string("id") : fk.remote_pk_column;
+  query_.joins.push_back(std::move(edge));
+  join_aliases_[prefix] = alias;
+  return alias;
+}
+
 bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& op,
                                   bool& is_isnull_lookup) {
-  // Split on __
-  std::vector<std::string> parts;
-  std::string cur;
-  for (char c : key) {
-    if (c == '_' && !cur.empty() && cur.back() == '_') {
-      // shouldn't happen single pass — handle "__"
-    }
-  }
-  // Manual split on "__"
-  std::string s(key);
-  std::size_t start = 0;
-  while (start <= s.size()) {
-    auto pos = s.find("__", start);
-    if (pos == std::string::npos) {
-      parts.push_back(s.substr(start));
-      break;
-    }
-    parts.push_back(s.substr(start, pos - start));
-    start = pos + 2;
-  }
+  auto parts = split_lookup_sep(key);
   if (parts.empty() || parts[0].empty()) {
     return false;
   }
 
   is_isnull_lookup = false;
   op = CmpOp::Eq;
-  // Last part may be lookup
-  std::string lookup = "exact";
   std::vector<std::string> path = parts;
   if (path.size() >= 2) {
     auto maybe = cmp_op_from_lookup(path.back());
     if (maybe) {
-      lookup = path.back();
       op = *maybe;
-      path.pop_back();
-      if (lookup == "isnull") {
+      if (path.back() == "isnull") {
         is_isnull_lookup = true;
       }
+      path.pop_back();
     }
   }
   if (path.empty()) {
     return false;
   }
 
-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
-  if (!m) {
+  const SchemaRegistry& reg = SchemaRegistry::instance();
+  const ModelSchema* current = reg.get(query_.model);
+  if (!current) {
     return false;
   }
+  std::string current_alias =
+      query_.base_alias.empty() ? current->db_table : query_.base_alias;
+  std::string path_prefix;
 
-  // Single segment field on base model
-  if (path.size() == 1) {
-    auto it = m->field_by_name.find(path[0]);
-    if (it == m->field_by_name.end()) {
+  // Walk relation hops: path[0]..path[n-2]
+  for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+    if (!path_prefix.empty()) {
+      path_prefix += "__";
+    }
+    path_prefix += path[i];
+    std::string alias =
+        ensure_join(*current, current_alias, path[i], path_prefix);
+    if (alias.empty()) {
       return false;
     }
-    col.field = it->second;
+    // Advance to remote model schema when registered.
+    auto fit = current->field_by_name.find(path[i]);
+    if (fit == current->field_by_name.end()) {
+      return false;
+    }
+    const FieldSchema& fk = current->fields[fit->second];
+    const ModelSchema* remote = nullptr;
+    if (!fk.remote_model_label.empty()) {
+      remote = reg.get_by_label(fk.remote_model_label);
+    }
+    if (!remote) {
+      // Last hop only: allow column_override without full remote schema.
+      if (i + 2 != path.size()) {
+        return false;  // need intermediate schema for multi-hop
+      }
+      col.field = 0;
+      col.table_alias = alias;
+      col.column_override = path.back();
+      return true;
+    }
+    current = remote;
+    current_alias = alias;
+  }
+
+  // Target field on `current` model at `current_alias`
+  const std::string& target = path.back();
+  auto tit = current->field_by_name.find(target);
+  if (tit == current->field_by_name.end()) {
+    // Fall back to treating target as raw column name on current alias.
+    col.field = 0;
+    col.table_alias = current_alias;
+    col.column_override = target;
+    // Only valid if we joined at least once (not base unresolved field).
+    if (path.size() == 1) {
+      return false;
+    }
+    return true;
+  }
+  const FieldSchema& tf = current->fields[tit->second];
+  if (path.size() == 1) {
+    // Base model field — use field id so compile uses schema column.
+    col.field = tf.id;
     col.table_alias.clear();
     col.column_override.clear();
     return true;
   }
-
-  // FK path: one hop only in v1 (fk__field)
-  if (path.size() != 2) {
-    return false;  // deeper joins later
-  }
-  auto fit = m->field_by_name.find(path[0]);
-  if (fit == m->field_by_name.end()) {
-    return false;
-  }
-  const FieldSchema& fk = m->fields[fit->second];
-  if (!fk.is_relation || fk.remote_table.empty()) {
-    return false;
-  }
-
-  // Ensure join
-  std::string path_key = path[0];
-  std::string alias;
-  if (auto jt = join_aliases_.find(path_key); jt != join_aliases_.end()) {
-    alias = jt->second;
-  } else {
-    alias = "J" + std::to_string(++join_counter_);
-    JoinEdge edge;
-    edge.type = JoinType::Inner;
-    edge.alias = alias;
-    edge.table = fk.remote_table;
-    edge.local_alias = query_.base_alias.empty() ? m->db_table : query_.base_alias;
-    edge.local_column = fk.column;
-    edge.remote_column =
-        fk.remote_pk_column.empty() ? std::string("id") : fk.remote_pk_column;
-    query_.joins.push_back(edge);
-    join_aliases_[path_key] = alias;
-  }
-
-  // Target column on remote: use column_override = path[1] as name (assume
-  // same as column for simple schemas). For attname mapping we'd need remote
-  // schema; use path[1] as column name.
   col.field = 0;
-  col.table_alias = alias;
-  col.column_override = path[1];
+  col.table_alias = current_alias;
+  col.column_override = tf.column.empty() ? target : tf.column;
   return true;
+}
+
+std::optional<Pred> QuerySet::pred_from_key_values(
+    std::string_view key, const std::vector<ParamValue>& values) {
+  ColumnRef col;
+  CmpOp op = CmpOp::Eq;
+  bool isnull = false;
+  if (!resolve_lookup_key(key, col, op, isnull)) {
+    return std::nullopt;
+  }
+  Pred p;
+  p.lhs = col;
+  if (isnull || op == CmpOp::IsNull) {
+    p.op = CmpOp::IsNull;
+    bool is_null = true;
+    if (!values.empty() && values[0].kind == ParamValue::Kind::Bool) {
+      is_null = values[0].b;
+    }
+    p.is_null_negated = !is_null;
+    return p;
+  }
+  if (op == CmpOp::In) {
+    if (values.empty()) {
+      return std::nullopt;
+    }
+    p.op = CmpOp::In;
+    for (const auto& v : values) {
+      p.param_idxs.push_back(query_.add_param(v));
+    }
+    return p;
+  }
+  if (values.size() != 1) {
+    return std::nullopt;
+  }
+  p.op = op;
+  p.param_idxs.push_back(query_.add_param(values[0]));
+  return p;
 }
 
 bool QuerySet::filter_kwargs(
@@ -234,39 +311,12 @@ bool QuerySet::filter_kwargs(
   }
   std::vector<BoolExpr> atoms;
   for (const auto& [key, values] : items) {
-    ColumnRef col;
-    CmpOp op = CmpOp::Eq;
-    bool isnull = false;
-    if (!resolve_lookup_key(key, col, op, isnull)) {
+    auto pred = pred_from_key_values(key, values);
+    if (!pred) {
       return false;
     }
-    Pred p;
-    p.lhs = col;
-    if (isnull || op == CmpOp::IsNull) {
-      p.op = CmpOp::IsNull;
-      bool is_null = true;
-      if (!values.empty() && values[0].kind == ParamValue::Kind::Bool) {
-        is_null = values[0].b;
-      }
-      p.is_null_negated = !is_null;
-    } else if (op == CmpOp::In) {
-      if (values.empty()) {
-        return false;
-      }
-      p.op = CmpOp::In;
-      for (const auto& v : values) {
-        p.param_idxs.push_back(query_.add_param(v));
-      }
-    } else {
-      if (values.size() != 1) {
-        return false;
-      }
-      p.op = op;
-      p.param_idxs.push_back(query_.add_param(values[0]));
-    }
-    atoms.push_back(bool_atom(std::move(p)));
+    atoms.push_back(bool_atom(std::move(*pred)));
   }
-
   BoolExpr combined =
       disjunctive ? bool_or(std::move(atoms)) : bool_and(std::move(atoms));
   if (!query_.has_where) {
@@ -276,6 +326,68 @@ bool QuerySet::filter_kwargs(
     bool_or_append(query_.where, std::move(combined));
   } else {
     bool_and_append(query_.where, std::move(combined));
+  }
+  return true;
+}
+
+std::optional<BoolExpr> QuerySet::lower_q_node(const QNode& node) {
+  // 0=And, 1=Or, 2=Not, 3=Atom
+  if (node.kind == 3) {
+    auto pred = pred_from_key_values(node.key, node.values);
+    if (!pred) {
+      return std::nullopt;
+    }
+    return bool_atom(std::move(*pred));
+  }
+  if (node.kind == 2) {
+    if (node.children.size() != 1) {
+      return std::nullopt;
+    }
+    auto child = lower_q_node(node.children[0]);
+    if (!child) {
+      return std::nullopt;
+    }
+    return bool_not(std::move(*child));
+  }
+  if (node.kind != 0 && node.kind != 1) {
+    return std::nullopt;
+  }
+  if (node.children.empty()) {
+    // Empty AND → true (no filter); empty OR → false — match Django roughly
+    // by emitting a no-op atom for AND and 0=1 style via empty Or children
+    // compile already maps empty And to 1=1 and empty Or to 0=1.
+    BoolExpr e;
+    e.kind = node.kind == 0 ? BoolExpr::Kind::And : BoolExpr::Kind::Or;
+    return e;
+  }
+  std::vector<BoolExpr> kids;
+  kids.reserve(node.children.size());
+  for (const auto& c : node.children) {
+    auto lc = lower_q_node(c);
+    if (!lc) {
+      return std::nullopt;
+    }
+    kids.push_back(std::move(*lc));
+  }
+  return node.kind == 0 ? bool_and(std::move(kids)) : bool_or(std::move(kids));
+}
+
+bool QuerySet::apply_q(const QNode& node) {
+  auto expr = lower_q_node(node);
+  if (!expr) {
+    return false;
+  }
+  // Empty And with no children: no-op success
+  if (expr->kind == BoolExpr::Kind::And && expr->children.empty() &&
+      node.kind == 0) {
+    return true;
+  }
+  if (!query_.has_where) {
+    query_.where = std::move(*expr);
+    query_.has_where = true;
+  } else {
+    // Q from filter() ANDs with existing where
+    bool_and_append(query_.where, std::move(*expr));
   }
   return true;
 }
