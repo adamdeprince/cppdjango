@@ -35,7 +35,11 @@ gunicorn / uWSGI
 
 Flags set at `load_middleware` (not per request):
 
-- `_use_native_wsgi_outer` — enter C++ `wsgi_handler_call`
+- `_use_native_wsgi_outer` — enter C++ `wsgi_handler_call` only for empty stack,
+  pure stock chain, hybrid-flattened install, or **all** MIDDLEWARE entries
+  dual-path native. **Not** enabled merely because view/template/exception
+  hooks are empty (that incorrectly pulled in custom stacks such as Messages
+  + app middleware).
 - `_lean_view_only` — skip middleware chain inside C++ (empty stack only)
 - `_exact_routes` — static path_info → view (used by lean C++ and Python `resolve_request`)
 

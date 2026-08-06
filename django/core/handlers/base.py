@@ -212,13 +212,17 @@ class BaseHandler:
 
         # Empty stack: C++ may run view-only lean get_response.
         self._lean_view_only = truly_empty and not is_async
-        # C++ WSGI outer loop for empty, pure-stock (handled above), or hybrid
-        # where every middleware is stock dual-path native.
+        # C++ WSGI outer only when the whole stack is known-native (or empty).
+        # Do NOT use _middleware_hooks_empty alone: that is true whenever there
+        # is no process_view/template/exception middleware, even if the stack
+        # still has non-native process_request/response links (e.g. Messages +
+        # custom apps). Those must keep the pure-Python WSGI outer.
+        # Pure-stock and hybrid-flattened paths return early above with outer set.
         self._use_native_wsgi_outer = bool(_native.AVAILABLE) and not is_async and (
-            truly_empty or all_native or self._middleware_hooks_empty
+            truly_empty or all_native
         )
 
-        # Exact routes + urlconf pin for empty, hooks-empty, and all-native hybrid.
+        # Exact routes + urlconf pin for empty / all-native stacks that use outer.
         if self._use_native_wsgi_outer:
             self._exact_routes = self._build_exact_route_table()
             self._exact_callbacks = self._build_exact_callbacks(self._exact_routes)

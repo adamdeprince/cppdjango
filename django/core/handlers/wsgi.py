@@ -128,10 +128,11 @@ class WSGIHandler(base.BaseHandler):
     Django's WSGI application.
 
     Dual-path: when the native extension is available and the handler is
-    marked ``_use_native_wsgi_outer`` (empty middleware, pure stock chain, or
-    all-native hybrid), the request loop runs in C++
-    (``django.native.wsgi_handler_call``). Views remain Python. Custom
-    middleware stacks use the pure-Python path (``_python_call``).
+    marked ``_use_native_wsgi_outer`` (empty middleware, pure stock chain,
+    hybrid-flattened stock stack, or every MIDDLEWARE entry dual-path
+    native), the request loop runs in C++ (``django.native.wsgi_handler_call``).
+    Views remain Python. Stacks with any non-native middleware keep the
+    pure-Python path (``_python_call``).
     """
 
     request_class = WSGIRequest
