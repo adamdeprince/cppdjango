@@ -2622,6 +2622,133 @@ def xframe_options_value(setting_value: str) -> str:
     return fallbacks.xframe_options_value(setting_value)
 
 
+# --- Fat middleware bodies (chain iteration stays Python) -------------------
+
+
+def security_process_request(
+    redirect_enabled,
+    is_secure,
+    path_lstrip,
+    full_path,
+    redirect_host,
+    request_host,
+    exempt_patterns,
+):
+    impl = _impl()
+    if impl is not None:
+        return impl.security_process_request(
+            bool(redirect_enabled),
+            bool(is_secure),
+            str(path_lstrip),
+            str(full_path),
+            str(redirect_host or ""),
+            str(request_host or ""),
+            list(exempt_patterns or ()),
+        )
+    raise RuntimeError("native security_process_request unavailable")
+
+
+def security_process_response(
+    is_secure,
+    has_sts_header,
+    sts_seconds,
+    sts_include_subdomains,
+    sts_preload,
+    content_type_nosniff,
+    has_content_type_options,
+    referrer_policy,
+    has_referrer_policy,
+    cross_origin_opener_policy,
+    has_coop,
+):
+    impl = _impl()
+    if impl is not None:
+        return impl.security_process_response(
+            bool(is_secure),
+            bool(has_sts_header),
+            int(sts_seconds),
+            bool(sts_include_subdomains),
+            bool(sts_preload),
+            bool(content_type_nosniff),
+            bool(has_content_type_options),
+            referrer_policy,
+            bool(has_referrer_policy),
+            cross_origin_opener_policy,
+            bool(has_coop),
+        )
+    raise RuntimeError("native security_process_response unavailable")
+
+
+def xframe_process_response(already_has_header, xframe_options_exempt, setting_value):
+    impl = _impl()
+    if impl is not None:
+        return impl.xframe_process_response(
+            bool(already_has_header),
+            bool(xframe_options_exempt),
+            str(setting_value or "DENY"),
+        )
+    raise RuntimeError("native xframe_process_response unavailable")
+
+
+def common_content_length_header(streaming, already_has_content_length, content_len):
+    impl = _impl()
+    if impl is not None:
+        return impl.common_content_length_header(
+            bool(streaming), bool(already_has_content_length), int(content_len)
+        )
+    raise RuntimeError("native common_content_length_header unavailable")
+
+
+def common_www_redirect_url(prepend_www, host, scheme, path):
+    impl = _impl()
+    if impl is not None:
+        return impl.common_www_redirect_url(
+            bool(prepend_www), str(host or ""), str(scheme or ""), str(path or "")
+        )
+    raise RuntimeError("native common_www_redirect_url unavailable")
+
+
+def gzip_process_response_plan(
+    streaming,
+    content_len,
+    min_len,
+    has_content_encoding,
+    accept_encoding,
+    etag="",
+):
+    impl = _impl()
+    if impl is not None:
+        return impl.gzip_process_response_plan(
+            bool(streaming),
+            int(content_len),
+            int(min_len),
+            bool(has_content_encoding),
+            str(accept_encoding or ""),
+            str(etag or ""),
+        )
+    raise RuntimeError("native gzip_process_response_plan unavailable")
+
+
+def conditional_needs_etag(cache_control: str) -> bool:
+    impl = _impl()
+    if impl is not None:
+        return bool(impl.conditional_needs_etag(cache_control or ""))
+    return fallbacks.conditional_needs_etag(cache_control)
+
+
+def session_cookie_expiry(expire_at_browser_close, expiry_age_seconds, now_unix):
+    impl = _impl()
+    if impl is not None:
+        return tuple(
+            impl.session_cookie_expiry(
+                bool(expire_at_browser_close),
+                int(expiry_age_seconds),
+                float(now_unix),
+            )
+        )
+    raise RuntimeError("native session_cookie_expiry unavailable")
+
+
 def message_tags_join(extra_tags: str, level_tag: str) -> str:
     impl = _impl()
     if impl is not None:

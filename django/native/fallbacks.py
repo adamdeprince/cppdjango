@@ -2752,6 +2752,11 @@ def www_redirect_url(scheme: str, host: str, path: str) -> str:
     return f"{scheme}://www.{host}{path}"
 
 
+def conditional_needs_etag(cache_control: str) -> bool:
+    parts = (cache_control or "").split(",")
+    return all(p.strip().lower() != "no-store" for p in parts)
+
+
 def xframe_options_value(setting_value: str) -> str:
     return (setting_value or "DENY").upper()
 

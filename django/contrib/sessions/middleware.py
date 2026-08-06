@@ -46,17 +46,23 @@ class SessionMiddleware(MiddlewareMixin):
             # whether it was modified or will be saved.
             need_vary_cookie = accessed
             if (modified or settings.SESSION_SAVE_EVERY_REQUEST) and not empty:
+                from django import native as _native
+
                 if request.session.get_expire_at_browser_close():
                     max_age = None
                     expires = None
+                elif _native.AVAILABLE:
+                    max_age, expires = _native.session_cookie_expiry(
+                        False,
+                        int(request.session.get_expiry_age()),
+                        time.time(),
+                    )
                 else:
                     max_age = request.session.get_expiry_age()
                     expires_time = time.time() + max_age
                     expires = http_date(expires_time)
                 # Save the session data and refresh the client cookie.
                 # Skip session save for 5xx responses.
-                from django import native as _native
-
                 if _native.AVAILABLE:
                     saveable = _native.http_status_session_saveable(
                         response.status_code

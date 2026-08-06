@@ -12,32 +12,42 @@ class GZipMiddleware(MiddlewareMixin):
     Compress content if the browser allows gzip compression.
     Set the Vary header accordingly, so that caches will base their storage
     on the Accept-Encoding header.
+
+    Dual-path: eligibility plan is one C++ call; compression stays Python
+    (zlib) until a native compressor is added.
     """
 
     max_random_bytes = 100
 
     def process_response(self, request, response):
-        # It's not worth attempting to compress really short responses.
-        if not response.streaming:
-            content_len = len(response.content)
-            if _native.AVAILABLE:
-                if _native.gzip_content_too_short(content_len, 200):
-                    return response
-            elif content_len < 200:
-                return response
-
-        # Avoid gzipping if we've already got a content-encoding.
-        if response.has_header("Content-Encoding"):
-            return response
-
-        patch_vary_headers(response, ("Accept-Encoding",))
-
         ae = request.META.get("HTTP_ACCEPT_ENCODING", "")
+        etag = response.get("ETag") or ""
+        content_len = 0 if response.streaming else len(response.content)
+
         if _native.AVAILABLE:
-            if not _native.accepts_gzip(ae):
+            plan = _native.gzip_process_response_plan(
+                response.streaming,
+                content_len,
+                200,
+                response.has_header("Content-Encoding"),
+                ae,
+                etag,
+            )
+            if plan.get("early_skip"):
                 return response
-        elif not re_accepts_gzip.search(ae):
-            return response
+            if plan.get("set_vary"):
+                patch_vary_headers(response, ("Accept-Encoding",))
+            if not plan.get("should_compress"):
+                return response
+        else:
+            if not response.streaming and content_len < 200:
+                return response
+            if response.has_header("Content-Encoding"):
+                return response
+            patch_vary_headers(response, ("Accept-Encoding",))
+            if not re_accepts_gzip.search(ae):
+                return response
+            plan = None
 
         if response.streaming:
             if response.is_async:
@@ -50,11 +60,8 @@ class GZipMiddleware(MiddlewareMixin):
                     response.streaming_content,
                     max_random_bytes=self.max_random_bytes,
                 )
-            # Delete the `Content-Length` header for streaming content, because
-            # we won't know the compressed size until we stream it.
             del response.headers["Content-Length"]
         else:
-            # Return the compressed content only if it's actually shorter.
             compressed_content = compress_string(
                 response.content,
                 max_random_bytes=self.max_random_bytes,
@@ -64,14 +71,13 @@ class GZipMiddleware(MiddlewareMixin):
             response.content = compressed_content
             response.headers["Content-Length"] = str(len(response.content))
 
-        # If there is a strong ETag, make it weak to fulfill the requirements
-        # of RFC 9110 Section 8.8.1 while also allowing conditional request
-        # matches on ETags.
-        etag = response.get("ETag")
-        if etag:
-            if _native.AVAILABLE:
-                response.headers["ETag"] = _native.weak_etag_if_strong(etag)
-            elif etag.startswith('"'):
+        if _native.AVAILABLE and plan is not None:
+            weak = plan.get("weak_etag")
+            if weak:
+                response.headers["ETag"] = weak
+        else:
+            etag = response.get("ETag")
+            if etag and etag.startswith('"'):
                 response.headers["ETag"] = "W/" + etag
         response.headers["Content-Encoding"] = "gzip"
 

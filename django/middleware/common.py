@@ -47,13 +47,7 @@ class CommonMiddleware(MiddlewareMixin):
 
         # Check for a redirect based on settings.PREPEND_WWW
         host = request.get_host()
-
-        needs_www = (
-            _native.host_needs_www_prefix(host)
-            if _native.AVAILABLE
-            else (host and not host.startswith("www."))
-        )
-        if settings.PREPEND_WWW and needs_www:
+        if settings.PREPEND_WWW:
             # Check if we also need to append a slash so we can do it all
             # with a single redirect. (This check may be somewhat expensive,
             # so we only do it if we already know we're sending a redirect,
@@ -62,12 +56,16 @@ class CommonMiddleware(MiddlewareMixin):
                 path = self.get_full_path_with_slash(request)
             else:
                 path = request.get_full_path()
-
             if _native.AVAILABLE:
-                url = _native.www_redirect_url(request.scheme, host, path)
-            else:
-                url = f"{request.scheme}://www.{host}{path}"
-            return self.response_redirect_class(url)
+                url = _native.common_www_redirect_url(
+                    True, host, request.scheme, path
+                )
+                if url is not None:
+                    return self.response_redirect_class(url)
+            elif host and not host.startswith("www."):
+                return self.response_redirect_class(
+                    f"{request.scheme}://www.{host}{path}"
+                )
 
     def should_redirect_with_slash(self, request):
         """
@@ -125,8 +123,16 @@ class CommonMiddleware(MiddlewareMixin):
             )
 
         # Add the Content-Length header to non-streaming responses if not
-        # already set.
-        if not response.streaming and not response.has_header("Content-Length"):
+        # already set (body decision in C++ when native is available).
+        if _native.AVAILABLE:
+            cl = _native.common_content_length_header(
+                response.streaming,
+                response.has_header("Content-Length"),
+                0 if response.streaming else len(response.content),
+            )
+            if cl is not None:
+                response.headers["Content-Length"] = cl
+        elif not response.streaming and not response.has_header("Content-Length"):
             response.headers["Content-Length"] = str(len(response.content))
 
         return response

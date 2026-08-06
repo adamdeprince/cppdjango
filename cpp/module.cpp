@@ -20,6 +20,7 @@
 #include "urls.hpp"
 #include "validators.hpp"
 #include "wsgi_handler.hpp"
+#include "middleware.hpp"
 
 #include <nanobind/nanobind.h>
 #include <nanobind/stl/optional.h>
@@ -3383,6 +3384,113 @@ NB_MODULE(_native, m) {
           return django::native::xframe_options_value(setting_value);
         },
         nb::arg("setting_value"));
+
+  // --- Fat middleware bodies (one crossing per process_*; chain stays Python)
+  m.def(
+      "security_process_request",
+      [](bool redirect_enabled, bool is_secure, const std::string& path_lstrip,
+         const std::string& full_path, const std::string& redirect_host,
+         const std::string& request_host, nb::sequence exempt_patterns) {
+        std::vector<std::string> pats;
+        for (nb::handle h : exempt_patterns) {
+          pats.push_back(nb::cast<std::string>(h));
+        }
+        auto url = django::native::security_process_request(
+            redirect_enabled, is_secure, path_lstrip, full_path, redirect_host,
+            request_host, pats);
+        if (!url) {
+          return nb::object(nb::none());
+        }
+        return nb::object(nb::str(url->c_str(), url->size()));
+      },
+      nb::arg("redirect_enabled"), nb::arg("is_secure"), nb::arg("path_lstrip"),
+      nb::arg("full_path"), nb::arg("redirect_host"), nb::arg("request_host"),
+      nb::arg("exempt_patterns"));
+  m.def(
+      "security_process_response",
+      [](bool is_secure, bool has_sts_header, int sts_seconds,
+         bool sts_include_subdomains, bool sts_preload,
+         bool content_type_nosniff, bool has_content_type_options,
+         nb::handle referrer_policy, bool has_referrer_policy,
+         nb::handle cross_origin_opener_policy, bool has_coop) {
+        return django::native::security_process_response(
+            is_secure, has_sts_header, sts_seconds, sts_include_subdomains,
+            sts_preload, content_type_nosniff, has_content_type_options,
+            referrer_policy, has_referrer_policy, cross_origin_opener_policy,
+            has_coop);
+      },
+      nb::arg("is_secure"), nb::arg("has_sts_header"), nb::arg("sts_seconds"),
+      nb::arg("sts_include_subdomains"), nb::arg("sts_preload"),
+      nb::arg("content_type_nosniff"), nb::arg("has_content_type_options"),
+      nb::arg("referrer_policy").none(), nb::arg("has_referrer_policy"),
+      nb::arg("cross_origin_opener_policy").none(), nb::arg("has_coop"));
+  m.def(
+      "xframe_process_response",
+      [](bool already_has_header, bool xframe_options_exempt,
+         const std::string& setting_value) -> nb::object {
+        auto v = django::native::xframe_process_response(
+            already_has_header, xframe_options_exempt, setting_value);
+        if (!v) {
+          return nb::none();
+        }
+        return nb::str(v->c_str(), v->size());
+      },
+      nb::arg("already_has_header"), nb::arg("xframe_options_exempt"),
+      nb::arg("setting_value"));
+  m.def(
+      "common_content_length_header",
+      [](bool streaming, bool already_has, std::size_t content_len) -> nb::object {
+        auto v = django::native::common_content_length_header(
+            streaming, already_has, content_len);
+        if (!v) {
+          return nb::none();
+        }
+        return nb::str(v->c_str(), v->size());
+      },
+      nb::arg("streaming"), nb::arg("already_has_content_length"),
+      nb::arg("content_len"));
+  m.def(
+      "common_www_redirect_url",
+      [](bool prepend_www, const std::string& host, const std::string& scheme,
+         const std::string& path) -> nb::object {
+        auto v = django::native::common_www_redirect_url(prepend_www, host,
+                                                         scheme, path);
+        if (!v) {
+          return nb::none();
+        }
+        return nb::str(v->c_str(), v->size());
+      },
+      nb::arg("prepend_www"), nb::arg("host"), nb::arg("scheme"),
+      nb::arg("path"));
+  m.def(
+      "gzip_process_response_plan",
+      [](bool streaming, int content_len, int min_len, bool has_content_encoding,
+         nb::handle accept_encoding, nb::handle etag) {
+        std::string ae =
+            accept_encoding.is_none() ? "" : nb::cast<std::string>(nb::str(accept_encoding));
+        std::string et =
+            etag.is_none() ? "" : nb::cast<std::string>(nb::str(etag));
+        return django::native::gzip_process_response_plan(
+            streaming, content_len, min_len, has_content_encoding, ae, et);
+      },
+      nb::arg("streaming"), nb::arg("content_len"), nb::arg("min_len") = 200,
+      nb::arg("has_content_encoding"), nb::arg("accept_encoding"),
+      nb::arg("etag") = "");
+  m.def(
+      "conditional_needs_etag",
+      [](const std::string& cache_control) {
+        return django::native::conditional_needs_etag(cache_control);
+      },
+      nb::arg("cache_control"));
+  m.def(
+      "session_cookie_expiry",
+      [](bool expire_at_browser_close, int expiry_age_seconds, double now_unix) {
+        return django::native::session_cookie_expiry(
+            expire_at_browser_close, expiry_age_seconds, now_unix);
+      },
+      nb::arg("expire_at_browser_close"), nb::arg("expiry_age_seconds"),
+      nb::arg("now_unix"));
+
   m.def("message_tags_join",
         [](const std::string& extra_tags, const std::string& level_tag) {
           return django::native::message_tags_join(extra_tags, level_tag);
