@@ -1,28 +1,26 @@
 # Native WSGI Handler
 
-**Status:** Implemented (dual-path lean loop)  
+**Status:** Implemented (dual-path lean loop: slim request + exact routes + lean get_response)  
 **Date:** 2026-08-06  
 
 ## Thesis
 
 The **WSGI request loop** belongs in C++. **Views stay Python** — that is the
 stable, public Django app API. Other planes (ORM data plane, templates, forms,
-auth) may also move to C++ independently; they are not required for the handler
-to own the per-request orchestration.
+auth) may also move to C++ independently.
 
 ```text
 gunicorn / uWSGI
     │  application(environ, start_response)
     ▼
-┌─────────────────────────────────────────────┐
-│  C++ WSGI handler (lean path)               │
-│  script prefix • signals • request build    │
-│  get_response → resolve + **Python view**   │
-│  start_response pack • return body          │
-└─────────────────────────────────────────────┘
-    │
-    ▼
-  HttpResponse (Python object; body may be bytes)
+┌──────────────────────────────────────────────────────────┐
+│  C++ WSGI handler (lean path)                            │
+│  script prefix • request_started                         │
+│  slim WSGIRequest (GET/HEAD empty body)                  │
+│  exact-route table OR resolve_request                    │
+│  Python view → HttpResponse                              │
+│  start_response pack • return body                       │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ## Dual-path
@@ -33,26 +31,68 @@ gunicorn / uWSGI
 | Middleware hooks non-empty or `ATOMIC_REQUESTS` | Pure Python `_python_call` |
 | Empty middleware, no atomic, native available | `django.native.wsgi_handler_call` (C++) |
 
+## Load-time vs request-time
+
+| When | What |
+|------|------|
+| `load_middleware` | `_exact_routes` table for converter-free root `path()` routes |
+| Per request (C++) | slim request init, table lookup / resolve, view call, pack |
+
+`settings.MIDDLEWARE` is **not** re-scanned per request for lean eligibility
+(hooks emptiness was fixed at load).
+
 ## API surface
 
-- `django.native.wsgi_handler_lean_eligible(handler) -> bool`
-- `django.native.wsgi_handler_call(handler, environ, start_response) -> response`
+- `wsgi_handler_lean_eligible(handler) -> bool`
+- `wsgi_handler_call(handler, environ, start_response) -> response`
+- `wsgi_request_try_lean_init(request, environ) -> bool`
+- `wsgi_lean_get_response(handler, request) -> response`
+- `wsgi_environ_is_lean_get(environ) -> bool`
 
-`get_wsgi_application()` still returns `WSGIHandler()`; behavior is inside
-`WSGIHandler.__call__`.
+## Slim request (1)
+
+For **GET/HEAD** with empty body (no `CONTENT_LENGTH` / zero, no transfer
+encoding), ASCII `SCRIPT_NAME`/`PATH_INFO`, no `FORCE_SCRIPT_NAME` / rewrite
+URLs:
+
+- Skip `parse_header_parameters` / charset
+- Use `BytesIO(b"")` instead of `LimitedStream(wsgi.input)`
+- Path join via existing `wsgi_request_path`
+
+Otherwise full Python `WSGIRequest.__init__`.
+
+## Exact-route table (2)
+
+At `load_middleware` when hooks empty, build:
+
+```text
+path_info → (callback, args, kwargs, url_name, route)
+```
+
+Only root-level `path()` routes **without converters**. Nested `include()` and
+dynamic routes fall through to `resolve_request`.
+
+## Lean get_response (3)
+
+C++ `wsgi_lean_get_response`:
+
+1. `_ensure_root_urlconf`
+2. `_exact_routes[path_info]` or `resolve_request`
+3. call view (Python)
+4. `check_response` / optional `render`
+5. append `request.close`
+6. log 4xx
+
+Exceptions → `response_for_exception` (same as `convert_exception_to_response`).
 
 ## Non-goals (this slice)
 
-- Porting middleware stack to C++
 - Replacing Python views
-- Full C++ `WSGIRequest` (still constructed via `request_class` in Python)
-- ORM / template / forms / auth ports (separate campaigns)
+- Full C++ `WSGIRequest` for POST/multipart
+- Middleware stack in this loop (hybrid stacks use Python walk)
 
 ## Future
 
-1. Slim C++ request for GET + empty body (skip unused WSGIRequest work).
-2. Exact-route table for static TE paths.
-3. Deeper get_response lean path in C++ (resolve + call view) with fewer
-   Python attribute hops.
-4. North-star: ORM/templates/forms/auth data planes in C++ while views remain
-   the Python composition layer.
+- Exact routes for one level of static `include()` prefixes
+- Fewer crossings on header pack / status line
+- North-star: ORM/templates/forms/auth data planes in C++

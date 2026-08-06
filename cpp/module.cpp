@@ -4337,9 +4337,29 @@ NB_MODULE(_native, m) {
                                                  start_response);
       },
       nb::arg("handler"), nb::arg("environ"), nb::arg("start_response"),
-      "Native WSGIHandler.__call__ body: script prefix, request, "
-      "get_response (Python views), start_response packing.");
-
+      "Native lean WSGI loop: slim request, exact routes, view, "
+      "start_response packing.");
+  m.def(
+      "wsgi_request_try_lean_init",
+      [](nb::handle request, nb::handle environ) {
+        return django::native::wsgi_request_try_lean_init(request, environ);
+      },
+      nb::arg("request"), nb::arg("environ"),
+      "Populate WSGIRequest for GET/HEAD empty body; True if applied.");
+  m.def(
+      "wsgi_lean_get_response",
+      [](nb::handle handler, nb::handle request) {
+        return django::native::wsgi_lean_get_response(handler, request);
+      },
+      nb::arg("handler"), nb::arg("request"),
+      "Lean get_response: exact-route table or resolve + Python view.");
+  m.def(
+      "wsgi_environ_is_lean_get",
+      [](nb::handle environ) {
+        return django::native::wsgi_environ_is_lean_get(environ);
+      },
+      nb::arg("environ"),
+      "True when environ is GET/HEAD with empty body.");
   m.def(
       "render_fortune_page",
       [](const std::vector<std::pair<std::int64_t, std::string>>& rows) {

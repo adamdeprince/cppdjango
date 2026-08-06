@@ -30,6 +30,9 @@ class BaseHandler:
     _native_stock_specs = None
     # Per-path native classification frozen at load_middleware (debug/metrics).
     _middleware_native_at_load = None
+    # path_info → (callback, args, kwargs, url_name, route) for lean C++ resolve.
+    # Built once in load_middleware when middleware hooks are empty.
+    _exact_routes = None
 
     # Middleware paths whose full request/response bodies can run in the pure
     # C++ stock chain (no Python process_request side effects required).
@@ -56,6 +59,7 @@ class BaseHandler:
         self._native_stock_chain = False
         self._native_stock_specs = None
         self._middleware_native_at_load = None
+        self._exact_routes = None
 
         get_response = self._get_response_async if is_async else self._get_response
         handler = convert_exception_to_response(get_response)
@@ -71,6 +75,8 @@ class BaseHandler:
         if stock_handler is not None:
             self._middleware_chain = stock_handler
             self._middleware_hooks_empty = True
+            # Still build exact routes for lean C++ get_response when applicable.
+            self._exact_routes = self._build_exact_route_table()
             return
 
         for middleware_path in reversed(settings.MIDDLEWARE):
@@ -148,6 +154,45 @@ class BaseHandler:
             or self._template_response_middleware
             or self._exception_middleware
         )
+        # Exact static routes for lean C++ resolve (TE floor / empty middleware).
+        if self._middleware_hooks_empty and not is_async:
+            self._exact_routes = self._build_exact_route_table()
+
+    def _build_exact_route_table(self):
+        """
+        Load-time map of path_info → view for converter-free root path() routes.
+
+        Used by the native lean get_response to skip URLResolver on static
+        endpoints (e.g. /plaintext, /json). Nested includes and dynamic
+        converters are omitted (resolved in Python as usual).
+        """
+        from django.urls import get_resolver
+        from django.urls.resolvers import RoutePattern, URLPattern
+
+        table = {}
+        try:
+            resolver = get_resolver()
+            for pattern in resolver.url_patterns:
+                if not isinstance(pattern, URLPattern):
+                    continue
+                route_pat = pattern.pattern
+                if not isinstance(route_pat, RoutePattern):
+                    continue
+                if route_pat.converters:
+                    continue
+                route = str(route_pat)
+                # Root URLResolver strips leading '/'; path_info is '/'+route.
+                path_info = route if route.startswith("/") else "/" + route
+                table[path_info] = (
+                    pattern.callback,
+                    (),
+                    dict(pattern.default_args or {}),
+                    pattern.name,
+                    route,
+                )
+        except Exception:
+            return {}
+        return table
 
     def _classify_middleware_at_load(self, paths, _native):
         """

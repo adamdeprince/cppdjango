@@ -57,6 +57,11 @@ class WSGIRequest(HttpRequest):
     def __init__(self, environ):
         from django import native as _native
 
+        # Lean path: GET/HEAD + empty body — C++ sets path/META/stream without
+        # Content-Type parse or LimitedStream over wsgi.input.
+        if _native.AVAILABLE and _native.wsgi_request_try_lean_init(self, environ):
+            return
+
         script_name = get_script_name(environ)
         # If PATH_INFO is empty (e.g. accessing the SCRIPT_NAME URL without a
         # trailing slash), operate as if '/' was requested.

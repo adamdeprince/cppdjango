@@ -1,13 +1,11 @@
 // Native WSGI request loop (dual-path).
 //
-// Architecture north star: the WSGI *handler* lives in C++. Views remain
-// Python (Django's public API contract). ORM / templates / forms / auth are
-// separate planes that may also move to C++ over time; this module only owns
-// the per-request WSGI orchestration:
+// Architecture: the lean WSGI *handler* lives in C++. Views remain Python.
+// Lean path (empty middleware, no ATOMIC_REQUESTS):
+//   environ → slim request (GET/HEAD empty body) → exact-route or resolve
+//   → Python view → start_response pack → body
 //
-//   environ → request → resolve → view (Python) → start_response → body
-//
-// Complex middleware stacks fall back to the pure-Python WSGIHandler.
+// Complex middleware stacks fall back to pure-Python WSGIHandler.
 #pragma once
 
 #include <nanobind/nanobind.h>
@@ -16,18 +14,27 @@ namespace nb = nanobind;
 
 namespace django::native {
 
-// Run one WSGI request on an initialized Django WSGIHandler instance.
-//
-// handler: Python WSGIHandler (or subclass) with load_middleware done
-// environ: WSGI environ dict
-// start_response: WSGI start_response callable
-//
+// True when the handler is eligible for the native lean loop (empty middleware
+// hooks and no ATOMIC_REQUESTS).
+[[nodiscard]] bool wsgi_handler_lean_eligible(nb::handle handler);
+
+// Run one lean WSGI request. Owns: script prefix, signals, slim request,
+// lean get_response (exact routes / resolve + view), start_response packing.
 // Returns the WSGI body iterable (typically the HttpResponse itself).
 [[nodiscard]] nb::object wsgi_handler_call(nb::handle handler, nb::handle environ,
                                            nb::handle start_response);
 
-// True when the handler is eligible for the native lean loop (empty middleware
-// hooks and no ATOMIC_REQUESTS). Python may also check this before calling.
-[[nodiscard]] bool wsgi_handler_lean_eligible(nb::handle handler);
+// Populate a WSGIRequest instance for GET/HEAD with empty body.
+// Returns true if lean init applied; false → caller must use full Python init.
+[[nodiscard]] bool wsgi_request_try_lean_init(nb::handle request,
+                                              nb::handle environ);
+
+// Lean get_response: urlconf pin, exact-route table or resolve_request, call
+// view, attach request.close. Raises into Python on errors (caller wraps).
+[[nodiscard]] nb::object wsgi_lean_get_response(nb::handle handler,
+                                                nb::handle request);
+
+// True when environ is GET/HEAD with no body (lean request eligible).
+[[nodiscard]] bool wsgi_environ_is_lean_get(nb::handle environ) noexcept;
 
 }  // namespace django::native

@@ -3300,16 +3300,38 @@ def wsgi_handler_lean_eligible(handler) -> bool:
 
 def wsgi_handler_call(handler, environ, start_response):
     """
-    Native WSGIHandler request loop.
+    Native lean WSGIHandler request loop.
 
-    Views remain Python (``handler.get_response``). Raises if the extension
-    is unavailable — callers should dual-path to pure Python.
+    Slim request + exact-route resolve + Python view + start_response pack.
+    Raises if the extension is unavailable — callers dual-path to pure Python.
     """
     impl = _impl()
     if impl is not None:
         return impl.wsgi_handler_call(handler, environ, start_response)
     raise RuntimeError("native wsgi_handler_call unavailable")
 
+
+def wsgi_request_try_lean_init(request, environ) -> bool:
+    """GET/HEAD empty-body WSGIRequest init in C++. True if applied."""
+    impl = _impl()
+    if impl is not None:
+        return bool(impl.wsgi_request_try_lean_init(request, environ))
+    return False
+
+
+def wsgi_lean_get_response(handler, request):
+    """Exact-route or resolve + call view (Python). Extension required."""
+    impl = _impl()
+    if impl is not None:
+        return impl.wsgi_lean_get_response(handler, request)
+    raise RuntimeError("native wsgi_lean_get_response unavailable")
+
+
+def wsgi_environ_is_lean_get(environ) -> bool:
+    impl = _impl()
+    if impl is not None:
+        return bool(impl.wsgi_environ_is_lean_get(environ))
+    return False
 
 def exception_status_code(kind: str) -> int:
     impl = _impl()
