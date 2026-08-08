@@ -124,6 +124,20 @@ class Apps:
                 app_config.ready()
 
             self.ready = True
+            # Native ORM schema export is a cold startup operation. Keeping it
+            # here avoids walking model._meta and rebuilding C++ schemas on
+            # every query. Unsupported/dynamic models still register lazily.
+            try:
+                from django.native._loader import AVAILABLE as native_available
+
+                if native_available:
+                    from django.native.orm import initialize_schema_registry
+
+                    initialize_schema_registry(self)
+            except Exception:
+                # Schema export is an optimization; never make app population
+                # fail when a third-party model exposes unusual metadata.
+                pass
             self.ready_event.set()
 
     def check_apps_ready(self):

@@ -1,0 +1,13 @@
+timestamp,repeat,variant,fork_mode,load_kind,endpoint,workers,concurrency,duration_s,requests,rps,p50,p99,errors
+2026-08-07T20:06:53Z,1,stock,lazy,equal_work,mixed,16,64,18.91,300032,15866.31,,,0
+2026-08-07T20:07:16Z,1,native,lazy,equal_work,mixed,16,64,13.67,300032,21948.21,,,0
+2026-08-07T20:07:40Z,1,stock,preload,equal_work,mixed,16,64,18.56,300032,16165.52,,,0
+2026-08-07T20:07:59Z,1,native,preload,equal_work,mixed,16,64,13.71,300032,21884.17,,,0
+2026-08-07T20:08:19Z,2,native,preload,equal_work,mixed,16,64,13.87,300032,21631.72,,,0
+2026-08-07T20:08:44Z,2,stock,preload,equal_work,mixed,16,64,18.86,300032,15908.38,,,0
+2026-08-07T20:09:06Z,2,native,lazy,equal_work,mixed,16,64,13.91,300032,21569.52,,,0
+2026-08-07T20:09:31Z,2,stock,lazy,equal_work,mixed,16,64,19.05,300032,15749.71,,,0
+2026-08-07T20:09:56Z,3,stock,lazy,equal_work,mixed,16,64,19.25,300032,15586.08,,,0
+2026-08-07T20:10:19Z,3,native,lazy,equal_work,mixed,16,64,13.91,300032,21569.52,,,0
+2026-08-07T20:10:44Z,3,stock,preload,equal_work,mixed,16,64,19.11,300032,15700.26,,,0
+2026-08-07T20:11:03Z,3,native,preload,equal_work,mixed,16,64,13.80,300032,21741.45,,,0

@@ -1,0 +1,322 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Public raw data and reproducibility artifacts supporting cppdjango's measured CPU-performance claims.">
+  <meta name="theme-color" content="#11130f">
+  <link rel="canonical" href="https://django.goblinreactor.com/artifacts/">
+  <link rel="icon" href="/goblin.png" type="image/png" sizes="1254x1254">
+  <title>cppdjango — public performance evidence</title>
+  <style>
+    :root {
+      --ink: #12140f;
+      --paper: #f7f6f1;
+      --white: #fffefa;
+      --muted: #62645c;
+      --line: #d8d8cf;
+      --acid: #a6e22e;
+      --acid-dark: #548a08;
+      --cyan: #0b8897;
+      --orange: #ed6b2f;
+      --dark: #11130f;
+      --mono: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --serif: Georgia, "Times New Roman", serif;
+      --max: 1120px;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--dark); }
+    body { margin: 0; color: var(--ink); background: var(--paper); font: 16px/1.58 var(--sans); }
+    ::selection { color: var(--ink); background: var(--acid); }
+    a { color: inherit; text-underline-offset: .2em; }
+    a:hover { color: var(--acid-dark); }
+    h1, h2, h3, p, li { overflow-wrap: anywhere; }
+    .header {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      width: min(calc(100% - 40px), var(--max));
+      min-height: 76px;
+      margin: 0 auto;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font: 800 .9rem var(--mono); text-decoration: none; }
+    .brand img { width: 40px; height: 40px; object-fit: cover; border: 1px solid var(--ink); border-radius: 50%; }
+    .back { padding: 8px 12px; color: var(--white); background: var(--ink); font-size: .78rem; font-weight: 750; text-decoration: none; }
+    .back:hover { color: var(--white); background: var(--orange); }
+    .hero { padding: 100px max(20px, calc((100vw - var(--max)) / 2)) 86px; }
+    .eyebrow { margin: 0 0 18px; color: var(--acid-dark); font: 750 .74rem var(--mono); text-transform: uppercase; }
+    .eyebrow::before { content: "// "; color: var(--orange); }
+    h1 { max-width: 930px; margin: 0; font: 900 clamp(3.5rem, 8vw, 7.5rem)/.86 var(--sans); letter-spacing: -.065em; }
+    .lede { max-width: 760px; margin: 28px 0 0; color: var(--muted); font: 1.2rem/1.65 var(--serif); }
+    .proof { color: var(--white); background: var(--dark); }
+    .proof-inner { display: grid; grid-template-columns: repeat(3, 1fr); width: min(100%, 1380px); margin: 0 auto; }
+    .proof div div { min-height: 132px; padding: 27px clamp(20px, 3vw, 46px); border-right: 1px solid #373a32; }
+    .proof div div:last-child { border-right: 0; }
+    .proof strong { display: block; color: var(--acid); font: 850 clamp(1.5rem, 3vw, 2.5rem)/1 var(--mono); }
+    .proof span { display: block; margin-top: 10px; color: #c5c8be; font-size: .82rem; }
+    .section { padding: 88px max(20px, calc((100vw - var(--max)) / 2)); }
+    .section.white { background: var(--white); border-block: 1px solid var(--line); }
+    h2 { margin: 0; font: 840 clamp(2.2rem, 5vw, 4.7rem)/.96 var(--sans); letter-spacing: -.045em; }
+    .intro { max-width: 760px; margin: 20px 0 0; color: var(--muted); font-family: var(--serif); font-size: 1.08rem; }
+    .file-grid { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); margin-top: 52px; border: 1px solid var(--ink); background: var(--ink); gap: 1px; }
+    .file { display: flex; min-width: 0; min-height: 220px; flex-direction: column; padding: 27px; background: var(--paper); }
+    .file small { color: var(--muted); font: .68rem var(--mono); text-transform: uppercase; }
+    .file h3 { margin: 30px 0 10px; font-size: 1.24rem; }
+    .file p { color: var(--muted); font-size: .88rem; }
+    .file a { margin-top: auto; padding-top: 24px; color: var(--cyan); font-weight: 800; }
+    .counter-groups { display: grid; grid-template-columns: 1fr 1fr; gap: 42px; margin-top: 52px; }
+    .counter-group { border-top: 1px solid var(--ink); }
+    .counter-group h3 { margin: 22px 0 14px; }
+    .counter-group ul { margin: 0; padding: 0; list-style: none; }
+    .counter-group li { display: flex; align-items: baseline; justify-content: space-between; gap: 20px; padding: 11px 0; border-top: 1px solid var(--line); }
+    .counter-group li a { color: var(--cyan); font: .72rem var(--mono); }
+    .method { color: var(--white); background: var(--dark); }
+    .method h2 { color: var(--white); }
+    .method .intro { color: #b7baaf; }
+    .method-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 1px; margin-top: 48px; border: 1px solid #45483f; background: #45483f; }
+    .method-card { padding: 28px; background: #1b1e17; }
+    .method-card small { color: var(--acid); font: .68rem var(--mono); text-transform: uppercase; }
+    .method-card p { margin-top: 16px; color: #b7baaf; }
+    .terminal { margin-top: 44px; overflow-x: auto; border: 1px solid #45483f; background: #1b1e17; }
+    pre { margin: 0; padding: 22px; color: #f5f6f1; font: .76rem/1.8 var(--mono); }
+    .prompt { color: var(--acid); }
+    footer { padding: 42px max(20px, calc((100vw - var(--max)) / 2)); color: #96998f; background: #090a08; font: .68rem/1.6 var(--mono); }
+    @media (max-width: 720px) {
+      .header { width: calc(100% - 28px); }
+      .hero { padding-top: 72px; }
+      h1 { font-size: clamp(3.2rem, 16vw, 5rem); }
+      .proof-inner,
+      .file-grid,
+      .counter-groups,
+      .method-grid { grid-template-columns: 1fr; }
+      .proof div div { border-right: 0; border-bottom: 1px solid #373a32; }
+      .proof div div:last-child { border-bottom: 0; }
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <a class="brand" href="/"><img src="/goblin.png" alt="" width="40" height="40">cppdjango 6.0.7.post1 / evidence</a>
+    <a class="back" href="/">← About cppdjango</a>
+  </header>
+
+  <main>
+    <section class="hero">
+      <p class="eyebrow">Public performance artifact ledger</p>
+      <h1>Every number behind cppdjango’s performance claims.</h1>
+      <p class="lede">This directory is the public evidence bundle for the native implementation released as cppdjango 6.0.7.post1. It contains the final worker and database CPU samples, construction timings, prefork COW validation, boundary audit, measurement drivers, and exact measured source patch.</p>
+    </section>
+
+    <section class="proof" aria-label="Artifact highlights">
+      <div class="proof-inner">
+        <div><strong>36</strong><span>final raw-cursor and ORM worker CPU samples</span></div>
+        <div><strong>18</strong><span>matched dedicated PostgreSQL task-CPU samples</span></div>
+        <div><strong>112</strong><span>raw QuerySet construction observations</span></div>
+      </div>
+    </section>
+
+    <section class="section white">
+      <p class="eyebrow">Start here</p>
+      <h2>Human-readable first. Raw counters one click away.</h2>
+      <p class="intro">The summary JSON contains the published values and calculation. The CSV files preserve the individual observations used to derive them.</p>
+      <div class="file-grid">
+        <article class="file">
+          <small>Published result / JSON</small>
+          <h3>CPU benchmark summary</h3>
+          <p>Headline calculation, per-operation CPU, PostgreSQL attribution, construction cost, correctness totals, and method.</p>
+          <a href="benchmark-summary.json">Open benchmark-summary.json →</a>
+        </article>
+        <article class="file">
+          <small>Process clock / CSV</small>
+          <h3>Worker CPU records</h3>
+          <p>All 36 final alternating raw-cursor and ORM runs with operation counts, wall time, user/system CPU, faults, and context switches.</p>
+          <a href="cpu-process.csv">Open cpu-process.csv →</a>
+        </article>
+        <article class="file">
+          <small>Dedicated backend / CSV</small>
+          <h3>PostgreSQL task CPU</h3>
+          <p>Eighteen final records sampling the dedicated PostgreSQL backend at the exact worker measurement boundaries.</p>
+          <a href="cpu-postgresql.csv">Open cpu-postgresql.csv →</a>
+        </article>
+        <article class="file">
+          <small>Construction / CSV</small>
+          <h3>QuerySet construction samples</h3>
+          <p>Two independent seven-sample runs for manager, projection, point-filter, and ordered-IN32 construction.</p>
+          <a href="construction.csv">Open construction.csv →</a>
+        </article>
+        <article class="file">
+          <small>Boundary proof / JSON</small>
+          <h3>Python/C++ entries</h3>
+          <p>The terminal boundary, zero Python metadata/preparation hooks, PostgreSQL integer OID handling, and fallback contract.</p>
+          <a href="boundary-audit.json">Open boundary-audit.json →</a>
+        </article>
+        <article class="file">
+          <small>Source identity / Patch</small>
+          <h3>Exact measured patch</h3>
+          <p>The source diff loaded by the final CPU and equal-work memory runs. Its SHA-256 is in the checksum ledger.</p>
+          <a href="measured-source.patch">Open measured-source.patch →</a>
+        </article>
+        <article class="file">
+          <small>Reproduction / Python</small>
+          <h3>CPU measurement driver</h3>
+          <p>The deterministic raw and ORM operations, warmup, process-clock boundaries, and machine-readable output.</p>
+          <a href="profile_postgresql_orm_cpu.py">Open profile_postgresql_orm_cpu.py →</a>
+        </article>
+        <article class="file">
+          <small>Integrity / SHA-256</small>
+          <h3>Checksum ledger</h3>
+          <p>SHA-256 digests for every downloadable artifact in this directory, excluding the ledger itself.</p>
+          <a href="SHA256SUMS">Open SHA256SUMS →</a>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <p class="eyebrow">Memory and prefork COW</p>
+      <h2>The final native binder keeps COW at parity.</h2>
+      <p class="intro">After exactly 300,032 successful requests on 16 preloaded workers per implementation, cppdjango dirtied 724 KiB fewer pages and recorded 165 fewer minor faults. Total USS was 2.25 MiB lower; total PSS was 2.71 MiB higher because the extension remains shared. The earlier three-repeat lazy/preload study remains below as deployment context.</p>
+      <div class="file-grid">
+        <article class="file">
+          <small>Final validation / JSON</small>
+          <h3>Current COW result</h3>
+          <p>The final schema-and-binder build, exact request count, aggregate memory deltas, fault deltas, and throughput context.</p>
+          <a href="memory-final-validation.json">Open memory-final-validation.json →</a>
+        </article>
+        <article class="file">
+          <small>Final snapshots / CSV</small>
+          <h3>Current aggregate samples</h3>
+          <p>Path- and PID-free master, worker, and whole-service snapshots before and after equal work.</p>
+          <a href="memory-final-snapshots.csv">Open memory-final-snapshots.csv →</a>
+        </article>
+        <article class="file">
+          <small>Final load / CSV</small>
+          <h3>Current equal-work records</h3>
+          <p>Both 16-worker legs completed 300,032 requests with zero errors.</p>
+          <a href="memory-final-load.csv">Open memory-final-load.csv →</a>
+        </article>
+        <article class="file">
+          <small>Three-repeat study / JSON</small>
+          <h3>Lazy versus preload study</h3>
+          <p>Paired medians, PSS and USS deltas, preload savings, COW proxies, definitions, and source identities.</p>
+          <a href="memory-summary.json">Open memory-summary.json →</a>
+        </article>
+        <article class="file">
+          <small>Aggregate samples / CSV</small>
+          <h3>Master and worker snapshots</h3>
+          <p>Every aggregate PSS, USS, shared-page, private-dirty, and fault snapshot across all repetitions.</p>
+          <a href="memory-snapshots.csv">Open memory-snapshots.csv →</a>
+        </article>
+        <article class="file">
+          <small>Per-process samples / CSV</small>
+          <h3>Anonymized process records</h3>
+          <p>All master and worker samples with stable indexes instead of operating-system process identifiers.</p>
+          <a href="memory-processes.csv">Open memory-processes.csv →</a>
+        </article>
+        <article class="file">
+          <small>Exact work / CSV</small>
+          <h3>Memory-run load records</h3>
+          <p>Twelve order-alternated legs, each completing exactly 300,032 requests with zero failures.</p>
+          <a href="memory-load.csv">Open memory-load.csv →</a>
+        </article>
+        <article class="file">
+          <small>Method / Markdown</small>
+          <h3>Memory methodology</h3>
+          <p>The result, fair-work correction, fork modes, counter definitions, interpretation, and limitations.</p>
+          <a href="memory-methodology.md">Open memory-methodology.md →</a>
+        </article>
+        <article class="file">
+          <small>Collection / Python</small>
+          <h3>PSS and COW collector</h3>
+          <p>The Linux smaps-rollup and process-fault collector used for every master and worker snapshot.</p>
+          <a href="profile_uwsgi_memory.py">Open profile_uwsgi_memory.py →</a>
+        </article>
+        <article class="file">
+          <small>Reproduction / Shell</small>
+          <h3>Exact measured harness</h3>
+          <p>The uWSGI lifecycle, alternating run order, fixed-work client, identity checks, and artifact capture.</p>
+          <a href="run_uwsgi_postgresql_memory.sh">Open run_uwsgi_postgresql_memory.sh →</a>
+        </article>
+        <article class="file">
+          <small>Reduction / Python</small>
+          <h3>Memory result summarizer</h3>
+          <p>The validator and reducer that produces the public summary and hostname-free aggregate tables.</p>
+          <a href="summarize_uwsgi_memory.py">Open summarize_uwsgi_memory.py →</a>
+        </article>
+        <article class="file">
+          <small>Source identity / Patch</small>
+          <h3>Memory-run source patch</h3>
+          <p>The exact cppdjango source diff loaded by the measured workers, including the current regression tests.</p>
+          <a href="memory-measured-source.patch">Open memory-measured-source.patch →</a>
+        </article>
+        <article class="file">
+          <small>Exact-work client / Config</small>
+          <h3>Siege connection profile</h3>
+          <p>HTTP/1.1 keep-alive, disabled parsing, and benchmark-mode settings for the exact-request run.</p>
+          <a href="siege_memory.conf">Open siege_memory.conf →</a>
+        </article>
+        <article class="file">
+          <small>Timed diagnostic / Lua</small>
+          <h3>Balanced request rotation</h3>
+          <p>The three-path rotation used to identify and correct the fixed-duration memory comparison bias.</p>
+          <a href="uwsgi_memory_mix.lua">Open uwsgi_memory_mix.lua →</a>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <p class="eyebrow">Earlier instruction-parity audit</p>
+      <h2>Archived hardware-counter captures.</h2>
+      <p class="intro">These captures predate the final schema-and-binder pass and are not inputs to the 436% headline. They remain useful evidence that identical SQL shapes retire nearly identical PostgreSQL instructions. The final database attribution above uses directly sampled task CPU.</p>
+      <div class="counter-groups">
+        <div class="counter-group">
+          <h3>Worker processes</h3>
+          <ul>
+            <li><span>Stock point select</span><a href="stock_orm_get.worker.perfstat">perfstat</a></li>
+            <li><span>Stock ordered IN32</span><a href="stock_orm_in32.worker.perfstat">perfstat</a></li>
+            <li><span>Stock point update</span><a href="stock_orm_update.worker.perfstat">perfstat</a></li>
+            <li><span>Native point select</span><a href="native_orm_get.worker.perfstat">perfstat</a></li>
+            <li><span>Native ordered IN32</span><a href="native_orm_in32.worker.perfstat">perfstat</a></li>
+            <li><span>Native point update</span><a href="native_orm_update.worker.perfstat">perfstat</a></li>
+          </ul>
+        </div>
+        <div class="counter-group">
+          <h3>PostgreSQL backends</h3>
+          <ul>
+            <li><span>Stock point select</span><a href="stock_orm_get.postgres.perfstat">perfstat</a></li>
+            <li><span>Stock ordered IN32</span><a href="stock_orm_in32.postgres.perfstat">perfstat</a></li>
+            <li><span>Stock point update</span><a href="stock_orm_update.postgres.perfstat">perfstat</a></li>
+            <li><span>Native point select</span><a href="native_orm_get.postgres.perfstat">perfstat</a></li>
+            <li><span>Native ordered IN32</span><a href="native_orm_in32.postgres.perfstat">perfstat</a></li>
+            <li><span>Native point update</span><a href="native_orm_update.postgres.perfstat">perfstat</a></li>
+          </ul>
+        </div>
+      </div>
+    </section>
+
+    <section class="section method">
+      <p class="eyebrow">Reading the evidence</p>
+      <h2>What each measurement includes.</h2>
+      <p class="intro">The separation matters: process CPU is not request latency, and PostgreSQL CPU is not included in the 436% framework-only headline.</p>
+      <div class="method-grid">
+        <article class="method-card"><small>Raw cursor floor</small><p>Django connection and cursor management, psycopg, protocol/TLS work charged to the client, and row decoding. No ORM query compiler.</p></article>
+        <article class="method-card"><small>ORM-only CPU</small><p>ORM worker CPU minus that implementation’s matched raw cursor CPU. The balanced headline sums one point select, one IN32, and one update.</p></article>
+        <article class="method-card"><small>PostgreSQL CPU</small><p>Dedicated backend task ticks read from procfs at the same start and end boundaries as worker CPU. Earlier hardware counters remain an independent SQL-work parity audit.</p></article>
+        <article class="method-card"><small>Combined CPU</small><p>Worker and backend task CPU added from separate matched runs. Useful as an approximate demand total, not an elapsed-time measurement.</p></article>
+      </div>
+      <div class="terminal"><pre><span class="prompt">$</span> curl -s https://django.goblinreactor.com/artifacts/benchmark-summary.json
+<span class="prompt">$</span> curl -O https://django.goblinreactor.com/artifacts/cpu-process.csv
+<span class="prompt">$</span> curl -O https://django.goblinreactor.com/artifacts/cpu-postgresql.csv
+<span class="prompt">$</span> curl -O https://django.goblinreactor.com/artifacts/construction.csv
+<span class="prompt">$</span> curl -s https://django.goblinreactor.com/artifacts/memory-final-validation.json
+<span class="prompt">$</span> curl -O https://django.goblinreactor.com/artifacts/measured-source.patch</pre></div>
+    </section>
+  </main>
+
+  <footer>
+    <p>Public evidence supporting cppdjango’s measured CPU-performance claims. No private machine names, user directories, process IDs, or private filesystem locations are included in this bundle.</p>
+  </footer>
+</body>
+</html>

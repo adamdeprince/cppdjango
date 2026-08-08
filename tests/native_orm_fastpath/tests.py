@@ -20,9 +20,7 @@ class SimpleSQLHelpersTests(SimpleTestCase):
         from django import native
 
         sql = native.simple_update_eq_sql('"world"', ['"randomnumber"'], '"id"')
-        self.assertEqual(
-            sql, 'UPDATE "world" SET "randomnumber" = %s WHERE "id" = %s'
-        )
+        self.assertEqual(sql, 'UPDATE "world" SET "randomnumber" = %s WHERE "id" = %s')
 
     def test_render_fortune_page_escapes_and_structure(self):
         from django import native
@@ -96,6 +94,28 @@ class OrmFastPathDBTests(TestCase):
         rows = list(FastFortune.objects.values_list("id", "message"))
         self.assertEqual(len(rows), 3)
 
+    def test_filtered_values_list_preserves_ordering(self):
+        rows = list(
+            FastWorld.objects.filter(id__in=[1, 3, 2])
+            .order_by("-id")
+            .values_list("id", flat=True)
+        )
+        self.assertEqual(rows, [3, 2, 1])
+
+    def test_exact_filtered_values_list(self):
+        rows = list(
+            FastWorld.objects.filter(id=8).values_list("id", "randomnumber")
+        )
+        self.assertEqual(rows, [(8, 80)])
+
+    def test_deferred_filter_then_second_filter_preserves_both_predicates(self):
+        rows = list(
+            FastWorld.objects.filter(id__in=[1, 2, 3])
+            .filter(randomnumber=20)
+            .values_list("id", "randomnumber")
+        )
+        self.assertEqual(rows, [(2, 20)])
+
     def test_in_bulk(self):
         d = FastWorld.objects.in_bulk([1, 2, 3])
         self.assertEqual(set(d), {1, 2, 3})
@@ -119,6 +139,40 @@ class OrmFastPathDBTests(TestCase):
         n = FastWorld.objects.filter(pk=1).update(randomnumber=11)
         self.assertEqual(n, 1)
         self.assertEqual(FastWorld.objects.get(pk=1).randomnumber, 11)
+
+    def test_native_primitive_terminals_skip_python_field_prep(self):
+        from django import native
+        from django.native import orm
+
+        if not native.AVAILABLE:
+            self.skipTest("native extension required")
+        # Export before installing spies so schema setup itself isn't part of
+        # the terminal assertion.
+        orm.register_model_from_meta(FastWorld)
+        id_field = FastWorld._meta.get_field("id")
+        value_field = FastWorld._meta.get_field("randomnumber")
+        with (
+            mock.patch.object(
+                id_field,
+                "get_db_prep_value",
+                side_effect=AssertionError("point lookup used Python prep"),
+            ) as lookup_prep,
+            mock.patch.object(
+                value_field,
+                "get_db_prep_save",
+                side_effect=AssertionError("update used Python prep"),
+            ) as update_prep,
+        ):
+            self.assertEqual(
+                FastWorld.objects.values_list("id", "randomnumber").get(id=2),
+                (2, 20),
+            )
+            self.assertEqual(
+                FastWorld.objects.filter(id=2).update(randomnumber=202), 1
+            )
+        lookup_prep.assert_not_called()
+        update_prep.assert_not_called()
+        self.assertEqual(FastWorld.objects.get(id=2).randomnumber, 202)
 
     def test_annotated_get_projects_attrs(self):
         from django.db.models import Value
@@ -169,4 +223,3 @@ class OrmFastPathNativeOffTests(TestCase):
                 self.assertEqual(n, 1)
                 obj = FastWorld.objects.get(pk=2)
                 self.assertEqual(obj.randomnumber, 99)
-

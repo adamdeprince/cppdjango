@@ -1,0 +1,46 @@
+{
+  "benchmark": "cppdjango final preloaded equal-work COW validation",
+  "definitions": {
+    "minor_faults": "Upper-bound COW proxy; also includes demand faults and first touch",
+    "private_dirty_growth": "Upper-bound COW proxy; also includes fresh private allocations",
+    "pss": "Proportional Set Size",
+    "uss": "Private_Clean plus Private_Dirty"
+  },
+  "native": {
+    "after_total_pss_kib": 1240884,
+    "after_total_uss_kib": 1209328,
+    "forked_total_pss_kib": 56613,
+    "forked_total_uss_kib": 19432,
+    "measured_minor_faults": 182571,
+    "measured_private_dirty_growth_kib": 730220,
+    "requests_per_second": 22457.49,
+    "warm_private_dirty_growth_kib": 447304
+  },
+  "native_minus_stock": {
+    "after_total_pss_kib": 2779,
+    "after_total_uss_kib": -2308,
+    "measured_minor_faults": -165,
+    "measured_private_dirty_growth_kib": -724
+  },
+  "scope": {
+    "concurrency": 64,
+    "request_errors": 0,
+    "request_mix": [
+      "point select",
+      "ordered IN32 select",
+      "point update"
+    ],
+    "requests_per_variant": 300032,
+    "workers": 16
+  },
+  "stock": {
+    "after_total_pss_kib": 1238105,
+    "after_total_uss_kib": 1211636,
+    "forked_total_pss_kib": 52180,
+    "forked_total_uss_kib": 18552,
+    "measured_minor_faults": 182736,
+    "measured_private_dirty_growth_kib": 730944,
+    "requests_per_second": 16182.96,
+    "warm_private_dirty_growth_kib": 448848
+  }
+}

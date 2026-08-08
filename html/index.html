@@ -1,0 +1,822 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="cppdjango is a C++ port of Django 6.0.7 that keeps the familiar framework API while moving performance-critical ORM paths into native code.">
+  <meta name="theme-color" content="#11130f">
+  <meta property="og:title" content="cppdjango — Django 6.0.7, powered by C++">
+  <meta property="og:description" content="The familiar Django framework with performance-critical paths rebuilt in C++, backed by reproducible CPU evidence.">
+  <meta property="og:url" content="https://django.goblinreactor.com/">
+  <meta property="og:image" content="https://django.goblinreactor.com/goblin.png">
+  <meta name="twitter:card" content="summary_large_image">
+  <link rel="canonical" href="https://django.goblinreactor.com/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&amp;family=IBM+Plex+Serif:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="icon" href="goblin.png" type="image/png" sizes="1254x1254">
+  <link rel="apple-touch-icon" href="goblin.png">
+  <title>cppdjango — A C++ port of Django 6.0.7</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #12140f;
+      --paper: #f7f6f1;
+      --white: #fffefa;
+      --muted: #62645c;
+      --line: #d8d8cf;
+      --acid: #a6e22e;
+      --acid-dark: #548a08;
+      --cyan: #0b8897;
+      --orange: #ed6b2f;
+      --dark: #11130f;
+      --dark-soft: #1b1e17;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --serif: "IBM Plex Serif", Georgia, "Times New Roman", serif;
+      --max: 1180px;
+    }
+
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; overflow-x: hidden; background: var(--dark); }
+    body {
+      margin: 0;
+      overflow-x: hidden;
+      color: var(--ink);
+      background: var(--paper);
+      font: 16px/1.58 var(--sans);
+    }
+    ::selection { color: var(--ink); background: var(--acid); }
+    a { color: inherit; text-decoration-thickness: 1px; text-underline-offset: .2em; }
+    a:hover { color: var(--acid-dark); }
+    img { display: block; max-width: 100%; }
+    code { font-family: var(--mono); font-size: .88em; }
+    :focus-visible { outline: 3px solid var(--orange); outline-offset: 3px; }
+    h1, h2, h3, p, li, dd { overflow-wrap: anywhere; }
+
+    .skip-link {
+      position: fixed;
+      top: 8px;
+      left: 8px;
+      z-index: 100;
+      padding: 8px 12px;
+      color: var(--ink);
+      background: var(--white);
+      border: 1px solid var(--ink);
+      transform: translateY(-160%);
+    }
+    .skip-link:focus { transform: none; }
+
+    .site-header {
+      position: absolute;
+      inset: 0 0 auto;
+      z-index: 20;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 28px;
+      width: min(calc(100% - 40px), var(--max));
+      min-height: 76px;
+      margin: 0 auto;
+      border-bottom: 1px solid rgba(18, 20, 15, .16);
+    }
+    .brand {
+      display: inline-flex;
+      align-items: center;
+      gap: 10px;
+      color: var(--ink);
+      font-weight: 850;
+      text-decoration: none;
+    }
+    .brand:hover { color: var(--ink); }
+    .brand-mark {
+      flex: 0 0 40px;
+      width: 40px;
+      height: 40px;
+      overflow: hidden;
+      border: 1px solid var(--ink);
+      border-radius: 50%;
+      background: var(--white);
+      object-fit: cover;
+      transform: scale(1.01);
+    }
+    .brand strong,
+    .brand small { display: block; }
+    .brand strong { font: 800 .98rem/1.15 var(--mono); }
+    .brand small { margin-top: 3px; color: var(--muted); font: .66rem/1.2 var(--mono); }
+    .nav { display: flex; align-items: center; justify-content: flex-end; gap: 8px 25px; }
+    .nav a { font-size: .82rem; font-weight: 750; text-decoration: none; }
+    .nav-cta { padding: 9px 13px; color: var(--white); background: var(--ink); border: 1px solid var(--ink); }
+    .nav-cta:hover { color: var(--white); background: var(--orange); border-color: var(--orange); }
+
+    .hero {
+      position: relative;
+      min-height: min(800px, 92vh);
+      overflow: hidden;
+      background: #faf9f5;
+      border-bottom: 1px solid var(--line);
+    }
+    .hero-goblin {
+      position: absolute;
+      z-index: 0;
+      top: 58px;
+      right: max(-100px, calc((100vw - var(--max)) / 2 - 125px));
+      width: min(64vw, 790px);
+      height: calc(100% - 58px);
+      object-fit: cover;
+      object-position: 50% 46%;
+      mix-blend-mode: multiply;
+      filter: contrast(1.02);
+    }
+    .hero::after {
+      content: "";
+      position: absolute;
+      inset: 0;
+      z-index: 1;
+      pointer-events: none;
+      background: linear-gradient(90deg, #faf9f5 0%, #faf9f5 40%, rgba(250, 249, 245, .86) 53%, rgba(250, 249, 245, 0) 75%);
+    }
+    .hero-inner {
+      position: relative;
+      z-index: 2;
+      display: flex;
+      min-height: min(800px, 92vh);
+      flex-direction: column;
+      align-items: flex-start;
+      justify-content: center;
+      width: min(calc(100% - 40px), var(--max));
+      padding: 145px 0 68px;
+      margin: 0 auto;
+    }
+    .eyebrow,
+    .section-label {
+      margin: 0 0 18px;
+      color: var(--acid-dark);
+      font: 750 .76rem/1.2 var(--mono);
+      letter-spacing: .015em;
+      text-transform: uppercase;
+    }
+    .eyebrow::before { content: "// "; color: var(--orange); }
+    .section-label::before { content: "/ "; color: var(--orange); }
+    .hero h1 {
+      max-width: 810px;
+      margin: 0;
+      font: 900 clamp(4.1rem, 9.2vw, 8.2rem)/.83 var(--sans);
+      letter-spacing: -.07em;
+    }
+    .hero h1 em { color: var(--acid-dark); font-style: normal; white-space: nowrap; }
+    .hero-subhead {
+      width: min(100%, 690px);
+      margin: 31px 0 0;
+      font: 400 clamp(1.12rem, 2vw, 1.5rem)/1.45 var(--serif);
+    }
+    .hero-subhead strong { font-family: var(--sans); font-size: .94em; }
+    .hero-actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 32px; }
+    .button {
+      display: inline-flex;
+      min-height: 46px;
+      align-items: center;
+      justify-content: center;
+      padding: 10px 17px;
+      border: 1px solid var(--ink);
+      font-size: .86rem;
+      font-weight: 780;
+      line-height: 1.25;
+      text-decoration: none;
+    }
+    .button.primary { color: var(--white); background: var(--ink); }
+    .button.primary:hover { color: var(--white); background: var(--acid-dark); border-color: var(--acid-dark); }
+    .button.secondary { background: rgba(255, 255, 255, .72); }
+    .button.secondary:hover { color: var(--cyan); background: var(--white); }
+    .hero-note {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 19px;
+      max-width: 700px;
+      margin: 25px 0 0;
+      color: var(--muted);
+      font: .72rem/1.5 var(--mono);
+    }
+    .hero-note span::before { content: "✓ "; color: var(--acid-dark); font-weight: 900; }
+
+    .proof-strip { color: var(--white); background: var(--dark); }
+    .metric-grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      width: min(100%, 1440px);
+      margin: 0 auto;
+    }
+    .metric { min-width: 0; min-height: 148px; padding: 28px clamp(20px, 3vw, 48px); border-right: 1px solid #373a32; }
+    .metric:last-child { border-right: 0; }
+    .metric strong { display: block; color: var(--acid); font: 850 clamp(1.75rem, 3vw, 2.7rem)/1 var(--mono); }
+    .metric:nth-child(2) strong { color: #41c4d1; }
+    .metric:nth-child(3) strong { color: #ff8a55; }
+    .metric span { display: block; margin-top: 10px; color: #c5c8be; font-size: .82rem; }
+
+    .section { padding: 108px max(20px, calc((100vw - var(--max)) / 2)); }
+    .section-inner { width: min(calc(100% - 40px), var(--max)); margin: 0 auto; }
+    .section-heading { max-width: 920px; margin-bottom: 54px; }
+    .section-title,
+    h2 { margin: 0; font: 830 clamp(2.35rem, 5vw, 4.8rem)/.98 var(--sans); letter-spacing: -.045em; }
+    h3 { margin: 0 0 12px; font: 800 1.25rem/1.2 var(--sans); letter-spacing: -.02em; }
+    p { margin: 0; }
+    .section-intro { max-width: 760px; margin: 22px 0 0; color: var(--muted); font: 1.08rem/1.65 var(--serif); }
+    .band { background: var(--white); border-block: 1px solid var(--line); }
+
+    .install-layout { display: grid; grid-template-columns: .85fr 1.15fr; gap: 80px; align-items: start; }
+    .install-copy > p:not(.section-label) { margin-top: 22px; font: 1.08rem/1.68 var(--serif); }
+    .install-terminal { overflow: hidden; color: var(--white); border: 1px solid var(--ink); background: var(--dark); }
+    .install-terminal pre { padding: 26px; }
+    .install-notice { padding: 19px 22px; color: var(--ink); background: #fff1d8; border: 1px solid #d49b50; border-top: 0; font-size: .84rem; }
+    .install-links { display: flex; flex-wrap: wrap; gap: 10px 22px; margin-top: 22px; }
+    .install-links a { color: var(--cyan); font-size: .84rem; font-weight: 780; }
+
+    .claim-layout { display: grid; grid-template-columns: .9fr 1.1fr; gap: 86px; align-items: start; }
+    .claim-copy > p:not(.section-label) { margin-top: 23px; font: 1.13rem/1.7 var(--serif); }
+    .claim-copy strong { font-family: var(--sans); font-size: .94em; }
+    .quote-card { position: relative; padding: 42px; color: var(--white); background: var(--dark); border: 1px solid var(--dark); }
+    .quote-card::before { content: "“"; position: absolute; top: 12px; right: 26px; color: #383c33; font: 8rem/1 var(--serif); }
+    blockquote { position: relative; margin: 0; font: 600 clamp(1.55rem, 3vw, 2.45rem)/1.2 var(--serif); }
+    blockquote strong { color: var(--acid); font-family: var(--sans); }
+    .quote-note { margin-top: 28px; padding-top: 20px; color: #b5b8ae; border-top: 1px solid #3a3d35; font: .72rem/1.65 var(--mono); }
+
+    .formula {
+      display: grid;
+      grid-template-columns: 1fr auto 1fr auto 1fr;
+      align-items: stretch;
+      margin-top: 62px;
+      border: 1px solid var(--ink);
+      background: var(--white);
+    }
+    .formula-cell { min-width: 0; padding: 30px; }
+    .formula-cell small { display: block; color: var(--muted); font: .68rem/1.4 var(--mono); text-transform: uppercase; }
+    .formula-cell strong { display: block; margin-top: 14px; color: var(--ink); font: 850 clamp(1.55rem, 3vw, 2.6rem)/1 var(--mono); }
+    .formula-cell.result strong { color: var(--acid-dark); }
+    .formula-op { display: grid; min-width: 58px; place-items: center; color: var(--orange); border-inline: 1px solid var(--ink); font: 700 1.6rem var(--mono); }
+    .formula-caption { margin: 15px 0 0; color: var(--muted); font: .72rem/1.55 var(--mono); }
+
+    .bars { margin-top: 58px; border-top: 1px solid var(--ink); }
+    .bar-group { display: grid; grid-template-columns: 190px 1fr; gap: 26px; padding: 28px 0; border-bottom: 1px solid var(--line); }
+    .bar-title strong { display: block; font-size: 1rem; }
+    .bar-title span { display: block; margin-top: 7px; color: var(--muted); font: .7rem/1.4 var(--mono); }
+    .bar-row { display: grid; grid-template-columns: 76px 1fr 110px; gap: 12px; align-items: center; }
+    .bar-row + .bar-row { margin-top: 10px; }
+    .bar-label { color: var(--muted); font: .69rem var(--mono); text-transform: uppercase; }
+    .bar-track { height: 29px; background: #e5e4dd; }
+    .bar-fill { height: 100%; transform-origin: left; animation: grow .8s ease-out both; }
+    .stock .bar-fill { width: var(--width); background: var(--ink); }
+    .native .bar-fill { width: var(--width); background: var(--acid-dark); }
+    .bar-value { text-align: right; font: 700 .76rem var(--mono); }
+    @keyframes grow { from { transform: scaleX(0); } }
+
+    .table-wrap { margin-top: 58px; overflow-x: auto; border-block: 1px solid var(--ink); }
+    table { width: 100%; min-width: 880px; border-collapse: collapse; }
+    caption { padding: 0 0 16px; color: var(--muted); font: .72rem/1.5 var(--mono); text-align: left; }
+    th,
+    td { padding: 17px 14px; border-bottom: 1px solid var(--line); text-align: right; font: .82rem var(--mono); }
+    th:first-child,
+    td:first-child { padding-left: 0; text-align: left; font-family: var(--sans); font-weight: 760; }
+    th { color: var(--muted); font-size: .66rem; text-transform: uppercase; }
+    td.winner { color: var(--acid-dark); font-weight: 900; }
+    tr:last-child td { border-bottom: 0; }
+    .table-note { margin: 18px 0 0; color: var(--muted); font: .72rem/1.6 var(--mono); }
+
+    .reality { color: var(--white); background: var(--dark); }
+    .reality .section-label { color: var(--acid); }
+    .reality .section-intro { color: #b7baaf; }
+    .reality-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); margin-top: 58px; border: 1px solid #45483f; }
+    .reality-card { min-width: 0; padding: 30px; }
+    .reality-card + .reality-card { border-left: 1px solid #45483f; }
+    .reality-card small { color: var(--acid); font: .7rem/1.4 var(--mono); text-transform: uppercase; }
+    .reality-card h3 { margin-top: 38px; color: var(--white); font-size: 1.35rem; }
+    .total-change { display: block; margin: 18px 0 8px; color: var(--acid); font: 850 2rem/1 var(--mono); }
+    .reality-card p { color: #b5b8ae; font-size: .88rem; }
+    .stack {
+      display: flex;
+      height: 34px;
+      margin-top: 26px;
+      overflow: hidden;
+      border: 1px solid #585c51;
+    }
+    .stack span:nth-child(1) { width: var(--orm); background: var(--acid-dark); }
+    .stack span:nth-child(2) { width: var(--driver); background: var(--cyan); }
+    .stack span:nth-child(3) { width: var(--postgres); background: var(--orange); }
+    .stack-legend { display: flex; flex-wrap: wrap; gap: 8px 13px; margin-top: 13px; color: #b5b8ae; font: .66rem/1.4 var(--mono); }
+    .stack-legend span::before { content: ""; display: inline-block; width: 8px; height: 8px; margin-right: 6px; }
+    .stack-legend .orm::before { background: var(--acid-dark); }
+    .stack-legend .driver::before { background: var(--cyan); }
+    .stack-legend .postgres::before { background: var(--orange); }
+    .reality-callout { display: grid; grid-template-columns: .78fr 1.22fr; gap: 70px; align-items: start; margin-top: 62px; padding-top: 34px; border-top: 1px solid #45483f; }
+    .reality-callout h3 { color: var(--white); font: 820 clamp(1.8rem, 3vw, 2.8rem)/1.05 var(--sans); }
+    .reality-callout p { color: #b7baaf; font: 1.05rem/1.7 var(--serif); }
+    .reality-callout strong { color: var(--white); font-family: var(--sans); font-size: .93em; }
+
+    .path-diagram {
+      display: grid;
+      grid-template-columns: 1fr 62px 1fr 62px 1fr 62px 1fr;
+      align-items: stretch;
+      margin-top: 58px;
+      border: 1px solid var(--ink);
+      background: var(--white);
+    }
+    .path-step { min-height: 205px; padding: 28px; }
+    .path-step small { color: var(--acid-dark); font: .7rem var(--mono); }
+    .path-step h3 { margin-top: 44px; }
+    .path-step p { color: var(--muted); font-size: .86rem; }
+    .path-arrow { display: grid; place-items: center; color: var(--orange); border-inline: 1px solid var(--ink); font: 1.7rem var(--mono); }
+
+    .method-grid { display: grid; grid-template-columns: .83fr 1.17fr; gap: 82px; align-items: start; }
+    .method-list { margin: 0; padding: 0; list-style: none; border-top: 1px solid var(--ink); }
+    .method-list li { display: grid; grid-template-columns: 155px 1fr; gap: 20px; padding: 15px 0; border-bottom: 1px solid var(--line); }
+    .method-list b { color: var(--muted); font: .68rem/1.5 var(--mono); text-transform: uppercase; }
+    .method-list span { font-size: .88rem; font-weight: 650; }
+    .honesty { margin-top: 52px; padding: 28px; background: #ecebe4; border-left: 4px solid var(--orange); }
+    .honesty strong { display: block; font: 800 .78rem var(--mono); text-transform: uppercase; }
+    .honesty p { margin-top: 12px; color: var(--muted); }
+
+    .artifacts { color: var(--white); background: var(--dark); }
+    .artifacts .section-label { color: var(--acid); }
+    .artifact-layout { display: grid; grid-template-columns: .85fr 1.15fr; gap: 80px; align-items: start; }
+    .artifact-layout h2 { color: var(--white); }
+    .artifact-layout .section-intro { color: #b7baaf; }
+    .terminal { overflow: hidden; border: 1px solid #45483f; background: var(--dark-soft); }
+    .terminal-head { padding: 10px 14px; color: #9da096; border-bottom: 1px solid #45483f; font: .68rem var(--mono); }
+    pre { margin: 0; padding: 23px; overflow-x: auto; color: #f5f6f1; font: .75rem/1.85 var(--mono); }
+    .prompt { color: var(--acid); }
+    .comment { color: #8f9388; }
+    .artifact-links { display: grid; grid-template-columns: 1fr 1fr; margin-top: 16px; border: 1px solid #45483f; }
+    .artifact-links a { padding: 16px; color: var(--acid); border-right: 1px solid #45483f; border-bottom: 1px solid #45483f; font-size: .78rem; font-weight: 760; text-decoration: none; }
+    .artifact-links a:nth-child(2n) { border-right: 0; }
+    .artifact-links a:nth-last-child(-n+2) { border-bottom: 0; }
+    .artifact-links a:hover { color: var(--ink); background: var(--acid); }
+
+    footer { padding: 58px max(20px, calc((100vw - var(--max)) / 2)) 28px; color: var(--white); background: #090a08; }
+    .footer-top { display: flex; align-items: flex-end; justify-content: space-between; gap: 60px; }
+    .footer-brand { max-width: 730px; }
+    .footer-brand h2 { color: var(--white); font-size: clamp(2.2rem, 5vw, 4.6rem); }
+    .footer-brand p { margin-top: 20px; color: #b5b8ae; font-family: var(--serif); }
+    .footer-mascot { width: 150px; height: 150px; border-radius: 50%; object-fit: cover; mix-blend-mode: screen; }
+    .footer-bottom { display: flex; justify-content: space-between; gap: 25px; margin-top: 64px; padding-top: 22px; color: #96998f; border-top: 1px solid #3a3d35; font: .68rem/1.55 var(--mono); }
+    .footer-bottom p { max-width: 840px; }
+
+    @media (max-width: 980px) {
+      .nav a:not(.nav-cta) { display: none; }
+      .hero { min-height: 760px; }
+      .hero-inner { min-height: 760px; justify-content: flex-start; padding-top: 132px; }
+      .hero-goblin { top: auto; right: -70px; bottom: -105px; width: 600px; height: 600px; opacity: .76; }
+      .hero::after { background: linear-gradient(180deg, #faf9f5 0%, #faf9f5 52%, rgba(250, 249, 245, .4) 74%, rgba(250, 249, 245, 0) 100%); }
+      .hero h1 { font-size: clamp(3.9rem, 13vw, 7.2rem); }
+      .claim-layout,
+      .install-layout,
+      .method-grid,
+      .artifact-layout,
+      .reality-callout { grid-template-columns: 1fr; gap: 48px; }
+      .reality-grid { grid-template-columns: 1fr; }
+      .reality-card + .reality-card { border-top: 1px solid #45483f; border-left: 0; }
+      .path-diagram { grid-template-columns: 1fr; }
+      .path-arrow { min-height: 52px; border-inline: 0; border-block: 1px solid var(--ink); transform: rotate(90deg); }
+      .path-step { min-height: 165px; }
+      .path-step h3 { margin-top: 28px; }
+    }
+
+    @media (max-width: 720px) {
+      .site-header { width: min(calc(100% - 28px), var(--max)); }
+      .brand small { display: none; }
+      .nav-cta { padding: 8px 10px; font-size: .72rem !important; }
+      .hero-inner { width: min(calc(100% - 28px), var(--max)); }
+      .hero h1 { max-width: 95%; font-size: clamp(3.45rem, 17vw, 5.5rem); line-height: .87; }
+      .hero h1 em { white-space: normal; }
+      .hero-subhead { font-size: 1.08rem; }
+      .hero-goblin { right: -80px; bottom: -68px; width: 470px; height: 470px; }
+      .metric-grid { grid-template-columns: 1fr 1fr; }
+      .metric { min-height: 132px; border-bottom: 1px solid #373a32; }
+      .metric:nth-child(2n) { border-right: 0; }
+      .metric:nth-last-child(-n+2) { border-bottom: 0; }
+      .section { padding-top: 82px; padding-bottom: 82px; }
+      .section-inner { width: min(calc(100% - 28px), var(--max)); }
+      .quote-card { padding: 30px 24px; }
+      .formula { grid-template-columns: 1fr; }
+      .formula-op { min-height: 48px; border: 0; border-block: 1px solid var(--ink); }
+      .bar-group { grid-template-columns: 1fr; gap: 18px; }
+      .bar-row { grid-template-columns: 66px 1fr 88px; }
+      .method-list li { grid-template-columns: 1fr; gap: 7px; }
+      .artifact-links { grid-template-columns: 1fr; }
+      .artifact-links a { border-right: 0; }
+      .artifact-links a:nth-last-child(2) { border-bottom: 1px solid #45483f; }
+      .footer-top { align-items: flex-start; flex-direction: column; }
+      .footer-mascot { width: 110px; height: 110px; }
+      .footer-bottom { flex-direction: column; }
+    }
+
+    @media (prefers-reduced-motion: reduce) {
+      html { scroll-behavior: auto; }
+      .bar-fill { animation: none; }
+    }
+
+    @media print {
+      .site-header,
+      .hero-goblin,
+      .hero-actions,
+      .footer-mascot { display: none; }
+      .hero,
+      .hero-inner { min-height: auto; }
+      .hero-inner { padding-top: 40px; }
+      .section { padding-block: 45px; }
+      .reality,
+      .artifacts,
+      footer { color: var(--ink); background: var(--white); }
+    }
+  </style>
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to cppdjango</a>
+
+  <header class="site-header" id="home">
+    <a class="brand" href="#home" aria-label="cppdjango home">
+      <img class="brand-mark" src="goblin.png" alt="" width="40" height="40">
+      <span>
+        <strong>cppdjango</strong>
+        <small>6.0.7.post1 / C++ port</small>
+      </span>
+    </a>
+    <nav class="nav" aria-label="Primary navigation">
+      <a href="#install">Install</a>
+      <a href="#claim">Why cppdjango</a>
+      <a href="#numbers">CPU numbers</a>
+      <a href="#reality">PostgreSQL floor</a>
+      <a class="nav-cta" href="https://pypi.org/project/cppdjango/">PyPI</a>
+    </nav>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <img class="hero-goblin" src="goblin.png" alt="A black and white silkie chicken, the cppdjango mascot" width="1254" height="1254">
+      <div class="hero-inner">
+        <p class="eyebrow">A C++ port of Django 6.0.7</p>
+        <h1>Django 6.0.7. <em>Ported to C++.</em></h1>
+        <p class="hero-subhead">
+          cppdjango is an open-source C++ port that keeps Django’s familiar API and behavior while moving
+          performance-critical ORM paths into native code. The evidence:
+          <strong>436% faster framework-side ORM work</strong> across a balanced
+          mix of measured PostgreSQL operations.
+        </p>
+        <div class="hero-actions">
+          <a class="button primary" href="#install">Install cppdjango →</a>
+          <a class="button secondary" href="#numbers">See the benchmark evidence</a>
+        </div>
+        <div class="hero-note" aria-label="Project and measurement details">
+          <span>PyPI release 6.0.7.post1</span>
+          <span>548 ORM correctness tests</span>
+          <span>Same SQL and data</span>
+        </div>
+      </div>
+    </section>
+
+    <section class="proof-strip" aria-label="Measured highlights">
+      <div class="metric-grid">
+        <div class="metric"><strong>436%</strong><span>faster ORM-only CPU performance across the balanced suite</span></div>
+        <div class="metric"><strong>81.4%</strong><span>less CPU spent inside framework ORM work</span></div>
+        <div class="metric"><strong>&lt;1.4%</strong><span>PostgreSQL task-CPU difference between implementations</span></div>
+        <div class="metric"><strong>0 hooks</strong><span>Python field-lookup or preparation calls in supported terminals</span></div>
+      </div>
+    </section>
+
+    <section class="section band" id="install">
+      <div class="install-layout">
+        <div class="install-copy">
+          <p class="section-label">Install cppdjango 6.0.7.post1</p>
+          <h2>Keep your Django imports.</h2>
+          <p>
+            Install the <code>cppdjango</code> distribution in a fresh virtual
+            environment. Applications continue to use <code>import django</code>
+            and the normal <code>django-admin</code> command.
+          </p>
+          <p>
+            The package includes native code. pip uses a compatible wheel when
+            available and otherwise needs CMake, a recent C++26 compiler,
+            OpenSSL, and zlib to build the extension.
+          </p>
+          <div class="install-links">
+            <a href="install/">Full installation guide →</a>
+            <a href="https://pypi.org/project/cppdjango/">cppdjango on PyPI →</a>
+            <a href="https://github.com/adamdeprince/cppdjango">Source on GitHub →</a>
+          </div>
+        </div>
+        <div>
+          <div class="install-terminal" aria-label="cppdjango installation commands">
+            <div class="terminal-head">Fresh virtual environment</div>
+            <pre><span class="prompt">$</span> python3 -m venv .venv
+<span class="prompt">$</span> . .venv/bin/activate
+<span class="prompt">$</span> python -m pip install --upgrade pip
+<span class="prompt">$</span> python -m pip install cppdjango==6.0.7.post1
+
+<span class="comment"># Verify the Python and native release identities</span>
+<span class="prompt">$</span> python -c "import django; from django import native; print(django.__version__, native.version(), native.compiler())"</pre>
+          </div>
+          <p class="install-notice">
+            <strong>Use one distribution:</strong> cppdjango replaces upstream
+            Django. Do not install <code>Django</code> and <code>cppdjango</code>
+            together because both own the <code>django</code> import namespace.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <section class="section band" id="claim">
+      <div class="claim-layout">
+        <div class="claim-copy">
+          <p class="section-label">Measured evidence</p>
+          <h2>The C++ port earns its place with one honest number.</h2>
+          <p>
+            “Faster” here means <strong>more ORM operations for the same worker
+            CPU</strong>. It does not mean PostgreSQL became faster, and it does not
+            claim that every Django API is four times faster. It measures the
+            framework work cppdjango actually replaces.
+          </p>
+          <p>
+            The aggregate gives one vote each to a point select, an ordered
+            32-row <code>IN</code> select, and a point update. Different production
+            mixes will produce different totals, so the operation-level results
+            remain visible below.
+          </p>
+        </div>
+        <div class="quote-card">
+          <blockquote>
+            Across a balanced mix of measured PostgreSQL operations,
+            cppdjango’s framework-side ORM work is <strong>436% faster</strong>
+            than stock Django 6.0.7.
+          </blockquote>
+          <p class="quote-note">
+            Equivalent statement: cppdjango uses 81.4% less ORM CPU. Shared
+            cursor/psycopg CPU and PostgreSQL CPU are excluded from this claim.
+          </p>
+        </div>
+      </div>
+
+      <div class="formula" aria-label="Headline calculation">
+        <div class="formula-cell">
+          <small>Stock ORM-only CPU</small>
+          <strong>429.48 µs</strong>
+        </div>
+        <div class="formula-op" aria-hidden="true">÷</div>
+        <div class="formula-cell">
+          <small>cppdjango ORM-only CPU</small>
+          <strong>80.06 µs</strong>
+        </div>
+        <div class="formula-op" aria-hidden="true">=</div>
+        <div class="formula-cell result">
+          <small>CPU performance</small>
+          <strong>5.36×</strong>
+        </div>
+      </div>
+      <p class="formula-caption">
+        The unrounded ratio gives 436.4%, conservatively shown as 436%. The totals are
+        one operation of each measured query shape.
+      </p>
+    </section>
+
+    <section class="section" id="numbers">
+      <div class="section-heading">
+        <p class="section-label">Framework CPU / lower is better</p>
+        <h2>The C++ path removes the expensive Python query machinery.</h2>
+        <p class="section-intro">
+          These bars show worker CPU after subtracting a matched raw cursor call.
+          That isolates query construction, ORM compilation, facade work, and
+          framework result handling—the portion cppdjango can change.
+        </p>
+      </div>
+
+      <div class="bars" role="img" aria-label="Stock and cppdjango ORM-only CPU per query. Point select: 140.98 versus 24.36 microseconds. IN32: 196.51 versus 32.68. Update: 91.99 versus 23.01.">
+        <div class="bar-group">
+          <div class="bar-title"><strong>Point select</strong><span>values_list().get()</span></div>
+          <div>
+            <div class="bar-row stock"><span class="bar-label">Stock</span><div class="bar-track"><div class="bar-fill" style="--width:71.74%"></div></div><span class="bar-value">140.98 µs</span></div>
+            <div class="bar-row native"><span class="bar-label">C++</span><div class="bar-track"><div class="bar-fill" style="--width:12.40%"></div></div><span class="bar-value">24.36 µs</span></div>
+          </div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-title"><strong>Ordered IN32</strong><span>filter → order → values</span></div>
+          <div>
+            <div class="bar-row stock"><span class="bar-label">Stock</span><div class="bar-track"><div class="bar-fill" style="--width:100%"></div></div><span class="bar-value">196.51 µs</span></div>
+            <div class="bar-row native"><span class="bar-label">C++</span><div class="bar-track"><div class="bar-fill" style="--width:16.63%"></div></div><span class="bar-value">32.68 µs</span></div>
+          </div>
+        </div>
+        <div class="bar-group">
+          <div class="bar-title"><strong>Point update</strong><span>filter().update()</span></div>
+          <div>
+            <div class="bar-row stock"><span class="bar-label">Stock</span><div class="bar-track"><div class="bar-fill" style="--width:46.81%"></div></div><span class="bar-value">91.99 µs</span></div>
+            <div class="bar-row native"><span class="bar-label">C++</span><div class="bar-track"><div class="bar-fill" style="--width:11.71%"></div></div><span class="bar-value">23.01 µs</span></div>
+          </div>
+        </div>
+      </div>
+
+      <div class="table-wrap">
+        <table>
+          <caption>Measured worker CPU per completed database operation, in microseconds.</caption>
+          <thead>
+            <tr>
+              <th scope="col">Query</th>
+              <th scope="col">Raw cursor floor<br>stock / C++</th>
+              <th scope="col">Total worker<br>stock / C++</th>
+              <th scope="col">ORM-only<br>stock</th>
+              <th scope="col">ORM-only<br>C++</th>
+              <th scope="col">ORM CPU<br>reduction</th>
+              <th scope="col">CPU performance</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Point select</td>
+              <td>65.44 / 65.59</td>
+              <td>206.42 / 89.95</td>
+              <td>140.98</td>
+              <td class="winner">24.36</td>
+              <td class="winner">82.7%</td>
+              <td class="winner">5.79×</td>
+            </tr>
+            <tr>
+              <td>Ordered IN32</td>
+              <td>80.36 / 80.40</td>
+              <td>276.87 / 113.08</td>
+              <td>196.51</td>
+              <td class="winner">32.68</td>
+              <td class="winner">83.4%</td>
+              <td class="winner">6.01×</td>
+            </tr>
+            <tr>
+              <td>Point update</td>
+              <td>65.31 / 65.08</td>
+              <td>157.30 / 88.10</td>
+              <td>91.99</td>
+              <td class="winner">23.01</td>
+              <td class="winner">75.0%</td>
+              <td class="winner">4.00×</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+      <p class="table-note">
+        ORM-only CPU = ORM worker CPU − the same build’s raw Django cursor/psycopg
+        CPU. Using a per-build floor avoids assigning small installation variance
+        to either framework.
+      </p>
+    </section>
+
+    <section class="section reality" id="reality">
+      <div class="section-heading">
+        <p class="section-label">Why the raw score is less heroic</p>
+        <h2>The C++ ORM cannot optimize PostgreSQL.</h2>
+        <p class="section-intro">
+          Once cppdjango removes most framework work, the database and the shared
+          cursor/driver path dominate. They account for 84–90% of current per-query
+          CPU in these shapes. That fixed bill puts a hard ceiling on end-to-end gains.
+        </p>
+      </div>
+
+      <div class="reality-grid">
+        <article class="reality-card">
+          <small>01 / Point select</small>
+          <h3>263.78 → 146.54 µs total CPU</h3>
+          <strong class="total-change">44.4% less</strong>
+          <p>PostgreSQL is 38.6% of current combined CPU; cursor/psycopg is another 44.8%.</p>
+          <div class="stack" style="--orm:16.63%; --driver:44.75%; --postgres:38.62%" aria-label="17 percent ORM, 45 percent cursor and psycopg, 39 percent PostgreSQL"><span></span><span></span><span></span></div>
+          <div class="stack-legend"><span class="orm">ORM 17%</span><span class="driver">cursor 45%</span><span class="postgres">PG 39%</span></div>
+        </article>
+        <article class="reality-card">
+          <small>02 / Ordered IN32</small>
+          <h3>367.58 → 204.03 µs total CPU</h3>
+          <strong class="total-change">44.5% less</strong>
+          <p>PostgreSQL is 44.6% of current combined CPU; cursor/psycopg is another 39.4%.</p>
+          <div class="stack" style="--orm:16.02%; --driver:39.41%; --postgres:44.57%" aria-label="16 percent ORM, 39 percent cursor and psycopg, 45 percent PostgreSQL"><span></span><span></span><span></span></div>
+          <div class="stack-legend"><span class="orm">ORM 16%</span><span class="driver">cursor 39%</span><span class="postgres">PG 45%</span></div>
+        </article>
+        <article class="reality-card">
+          <small>03 / Point update</small>
+          <h3>308.33 → 237.26 µs total CPU</h3>
+          <strong class="total-change">23.1% less</strong>
+          <p>PostgreSQL is 62.9% of current combined CPU; cursor/psycopg is another 27.4%.</p>
+          <div class="stack" style="--orm:9.70%; --driver:27.43%; --postgres:62.87%" aria-label="10 percent ORM, 27 percent cursor and psycopg, 63 percent PostgreSQL"><span></span><span></span><span></span></div>
+          <div class="stack-legend"><span class="orm">ORM 10%</span><span class="driver">cursor 27%</span><span class="postgres">PG 63%</span></div>
+        </article>
+      </div>
+
+      <div class="reality-callout">
+        <h3>Same SQL. Same PostgreSQL work.</h3>
+        <p>
+          Dedicated-backend task CPU was 57.36/56.59 µs for the point select,
+          90.71/90.94 µs for IN32, and 151.03/149.16 µs for the update. The
+          native/stock difference stayed below 1.4%. <strong>The database did not get cheaper;</strong>
+          cppdjango simply stopped spending so much Python CPU before and after it.
+          That is why the measured query wall-time ratios—1.83× point, 1.85×
+          IN32, and 1.24× update—are valuable but smaller than the 5.36×
+          framework-only result.
+        </p>
+      </div>
+    </section>
+
+    <section class="section band">
+      <div class="section-heading">
+        <p class="section-label">What changed in the fork</p>
+        <h2>One crossing, one compiled terminal.</h2>
+        <p class="section-intro">
+          The hot path keeps primitive predicates in an immutable C++ plan,
+          resolves registered field IDs there, and binds the complete terminal
+          without Python field hooks. Unsupported fields and values replay into
+          Django before execution.
+        </p>
+      </div>
+      <div class="path-diagram" aria-label="cppdjango ORM request path">
+        <div class="path-step"><small>01 / PYTHON</small><h3>QuerySet facade</h3><p>Preserve Django’s public API and select a conservative native candidate.</p></div>
+        <div class="path-arrow" aria-hidden="true">→</div>
+        <div class="path-step"><small>02 / C++</small><h3>Schema + binder</h3><p>Resolve field IDs, validate primitives, bind parameters, and compile the terminal.</p></div>
+        <div class="path-arrow" aria-hidden="true">→</div>
+        <div class="path-step"><small>03 / SHARED FLOOR</small><h3>psycopg cursor</h3><p>Execute and decode through the same driver used by stock Django.</p></div>
+        <div class="path-arrow" aria-hidden="true">→</div>
+        <div class="path-step"><small>04 / DATABASE</small><h3>PostgreSQL</h3><p>Run the same SQL plan against the same rows and connection settings.</p></div>
+      </div>
+    </section>
+
+    <section class="section" id="method">
+      <div class="method-grid">
+        <div>
+          <p class="section-label">Controlled methodology</p>
+          <h2>A CPU benchmark, not a stopwatch anecdote.</h2>
+          <p class="section-intro">
+            Worker CPU and PostgreSQL CPU were measured separately so blocked time
+            could not masquerade as framework cost.
+          </p>
+          <div class="honesty">
+            <strong>Scope boundary</strong>
+            <p>This result covers the measured PostgreSQL ORM fast paths. Cassandra, templates, middleware, unrelated QuerySet shapes, and application code are outside the claim.</p>
+          </div>
+        </div>
+        <ul class="method-list">
+          <li><b>Baseline</b><span>6.0.7 baseline</span></li>
+          <li><b>Native</b><span>Native implementation released as cppdjango 6.0.7.post1; measured with g++ 15.2.0</span></li>
+          <li><b>System</b><span>Dedicated benchmark machine with 128 logical CPUs</span></li>
+          <li><b>Runtime</b><span>CPython 3.14.4 and psycopg 3.3.4</span></li>
+          <li><b>Database</b><span>PostgreSQL 18.4, 10,000 deterministic World rows</span></li>
+          <li><b>Connection</b><span>One persistent TLS connection per run</span></li>
+          <li><b>Warmup</b><span>500 operations before counters begin</span></li>
+          <li><b>Worker counter</b><span>Process CPU clock and <code>RUSAGE_SELF</code>, five-second steady state</span></li>
+          <li><b>Database counter</b><span>Dedicated PostgreSQL backend task CPU from Linux <code>/proc</code>, sampled at worker boundaries</span></li>
+          <li><b>Correctness</b><span>548 ORM benchmark tests passed; same ordered SQL and PostgreSQL parameter OIDs verified</span></li>
+          <li><b>Stability</b><span>Three alternating CPU repetitions; equal-work COW validation completed with zero errors</span></li>
+        </ul>
+      </div>
+    </section>
+
+    <section class="section artifacts" id="artifacts">
+      <div class="artifact-layout">
+        <div>
+          <p class="section-label">Reproduce, don't trust</p>
+          <h2>The evidence ships with the claim.</h2>
+          <p class="section-intro">
+            The published comparison preserves the exact measured patch, worker
+            process records, PostgreSQL task-CPU records, construction samples,
+            COW validation, boundary audit, and methodology.
+          </p>
+        </div>
+        <div>
+          <div class="terminal" aria-label="Public benchmark artifact URLs">
+            <div class="terminal-head">https://django.goblinreactor.com/artifacts/</div>
+            <pre><span class="comment"># Published result and headline calculation</span>
+<span class="prompt">$</span> curl -s https://django.goblinreactor.com/artifacts/benchmark-summary.json
+
+<span class="comment"># Final worker, database, and construction samples</span>
+<span class="prompt">$</span> curl -O https://django.goblinreactor.com/artifacts/cpu-process.csv
+<span class="prompt">$</span> curl -O https://django.goblinreactor.com/artifacts/cpu-postgresql.csv
+<span class="prompt">$</span> curl -O https://django.goblinreactor.com/artifacts/construction.csv
+
+<span class="comment"># Exact measured patch SHA-256</span>
+9b3b89654bda36587ae782aac5cdbaa3d9f6b68257534c81b88053aade0c69da</pre>
+          </div>
+          <div class="artifact-links">
+            <a href="artifacts/">Public evidence ledger →</a>
+            <a href="artifacts/benchmark-summary.json">Summary JSON →</a>
+            <a href="artifacts/cpu-process.csv">Raw CPU CSV →</a>
+            <a href="artifacts/cpu-postgresql.csv">PostgreSQL task CPU →</a>
+            <a href="artifacts/construction.csv">Construction samples →</a>
+            <a href="artifacts/memory-final-validation.json">Final COW validation →</a>
+          </div>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    <div class="footer-top">
+      <div class="footer-brand">
+        <p class="section-label">cppdjango 6.0.7.post1 / Django 6.0.7 in C++</p>
+        <h2>Keep Django. Replace the overhead.</h2>
+        <p>The familiar framework API, backed by native execution where the measurements show it matters.</p>
+      </div>
+      <img class="footer-mascot" src="goblin.png" alt="The cppdjango silkie chicken mascot" width="150" height="150">
+    </div>
+    <div class="footer-bottom">
+      <p>“Django” is a trademark of the Django Software Foundation. cppdjango is an independent C++ port and is not endorsed by the DSF.</p>
+      <span>Django API ↔ C++ engine</span>
+    </div>
+  </footer>
+</body>
+</html>

@@ -1,0 +1,13 @@
+target,variant,workload,operations,task_us_per_operation,instructions_per_operation,cycles_per_operation
+postgres,stock,orm_get,22600,65.937,160049.8,273338.0
+postgres,stock,orm_in32,16500,97.630,468466.2,415545.6
+postgres,stock,orm_update,16300,175.388,378126.9,700381.5
+postgres,native,orm_get,39000,64.418,160438.2,266701.9
+postgres,native,orm_in32,28000,99.599,472480.6,423542.8
+postgres,native,orm_update,19400,173.548,377854.5,691048.4
+worker,stock,orm_get,22600,220.027,811605.9,964219.6
+worker,stock,orm_in32,15800,298.939,1464834.1,1319564.3
+worker,stock,orm_update,16700,168.167,549726.0,726746.9
+worker,native,orm_get,39300,106.937,327302.3,457733.3
+worker,native,orm_in32,27000,137.007,561958.4,590836.6
+worker,native,orm_update,20000,110.215,319945.2,470660.7

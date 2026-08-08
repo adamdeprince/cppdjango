@@ -2,7 +2,7 @@
 
 **Status:** Draft (aggressive / full-coverage)  
 **Date:** 2026-08-05  
-**Branch context:** cppdjango 6.0.7  
+**Branch context:** cppdjango 6.0.7.post1, based on Django 6.0.7
 **End-state goal:** **Every** statement Django’s ORM can produce is compiled by the **C++ SQL compiler**. The Python `SQLCompiler` is a migration scaffold, not a permanent dual engine.
 
 ---

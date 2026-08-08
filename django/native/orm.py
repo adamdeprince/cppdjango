@@ -8,6 +8,7 @@ runs execute/materialize in few crossings.
 
 from __future__ import annotations
 
+import threading
 from typing import Any
 
 from django.native._loader import AVAILABLE, get_native_module
@@ -18,29 +19,79 @@ __all__ = [
     "build_queryset",
     "clear_schema",
     "compile_delete",
+    "compile_query_plan_update",
+    "compile_query_plan_values",
     "compile_select",
+    "compile_simple_update",
+    "compile_simple_values_filter",
     "compile_update",
     "compile_values_list_get",
     "execute_fetchall",
     "execute_fetchone_pair",
     "export_model",
+    "initialize_schema_registry",
     "model_id",
     "q_to_tree",
     "register_model_from_meta",
 ]
 
 
+_IMPL = get_native_module()
+_ORM = getattr(_IMPL, "orm", None) if _IMPL is not None else None
+_MODEL_CACHE_ATTR = "_django_native_orm_model_id"
+_schema_generation = 0
+_schema_lock = threading.RLock()
+_dialect_cache: dict[str, int] = {}
+_ADAPTER_TYPES_UNSET = object()
+_postgresql_integer_types = _ADAPTER_TYPES_UNSET
+
+# These exact Django classes have preparation semantics that can be reproduced
+# by the native primitive binder without calling a Python Field hook. Class
+# identity is intentional: a custom IntegerField subclass may override
+# get_prep_value(), get_db_prep_value(), or from_db_value().
+_DIRECT_FIELD_CLASS_NAMES = frozenset(
+    {
+        "AutoField",
+        "BigAutoField",
+        "SmallAutoField",
+        "IntegerField",
+        "BigIntegerField",
+        "SmallIntegerField",
+        "PositiveIntegerField",
+        "PositiveBigIntegerField",
+        "PositiveSmallIntegerField",
+        "FloatField",
+        "BooleanField",
+        "CharField",
+        "TextField",
+    }
+)
+
+
+def _field_supports_direct_primitive_prep(field) -> bool:
+    cls = field.__class__
+    return (
+        cls.__module__ == "django.db.models.fields"
+        and cls.__name__ in _DIRECT_FIELD_CLASS_NAMES
+        and not field.is_relation
+        and not field.generated
+    )
+
+
 def _orm():
-    impl = get_native_module()
-    if impl is None:
-        return None
-    return getattr(impl, "orm", None)
+    return _ORM
 
 
 def clear_schema() -> None:
+    global _postgresql_integer_types, _schema_generation
+
     orm = _orm()
     if orm is not None:
-        orm.clear_schema()
+        with _schema_lock:
+            orm.clear_schema()
+            _schema_generation += 1
+            _dialect_cache.clear()
+            _postgresql_integer_types = _ADAPTER_TYPES_UNSET
 
 
 def model_id(label: str) -> int | None:
@@ -65,6 +116,8 @@ def _field_row(
     m2m_column="",
     m2m_reverse="",
     remote_fk_column="",
+    native_direct=False,
+    generated=False,
 ):
     return (
         name,
@@ -81,164 +134,227 @@ def _field_row(
         m2m_column or "",
         m2m_reverse or "",
         remote_fk_column or "",
+        bool(native_direct),
+        bool(generated),
     )
 
 
-def register_model_from_meta(model, _seen: set | None = None) -> int | None:
+def register_model_from_meta(
+    model, _seen: set | None = None, *, force: bool = False
+) -> int | None:
     """
     Snapshot model._meta into the C++ SchemaRegistry.
 
     Includes forward FK, reverse FK, and M2M relation hops. Recursively
     exports related models for multi-hop joins.
     """
+    cached = getattr(model, _MODEL_CACHE_ATTR, None)
+    if not force and cached is not None and cached[0] == _schema_generation:
+        return cached[1]
+
     orm = _orm()
     if orm is None:
         return None
-    if _seen is None:
-        _seen = set()
-    opts = model._meta
-    label = f"{opts.app_label}.{opts.object_name}"
-    if label in _seen:
-        return model_id(label)
-    _seen.add(label)
+    with _schema_lock:
+        cached = getattr(model, _MODEL_CACHE_ATTR, None)
+        if not force and cached is not None and cached[0] == _schema_generation:
+            return cached[1]
+        if _seen is None:
+            _seen = set()
+        opts = model._meta
+        label = f"{opts.app_label}.{opts.object_name}"
+        if label in _seen:
+            return model_id(label)
+        _seen.add(label)
 
-    fields = []
+        fields = []
 
-    # Concrete local fields (columns + forward FK).
-    for f in opts.concrete_fields:
-        if not f.column:
-            continue
-        remote_table = remote_pk = remote_label = rel_kind = ""
-        if f.is_relation and (f.many_to_one or f.one_to_one):
-            try:
-                remote_model = f.remote_field.model
-                register_model_from_meta(remote_model, _seen)
-                remote = remote_model._meta
-                remote_table = remote.db_table
-                remote_pk = remote.pk.column
-                remote_label = f"{remote.app_label}.{remote.object_name}"
-                rel_kind = "fk"
-            except Exception:
-                pass
-        fields.append(
-            _field_row(
-                f.name,
-                f.attname,
-                f.column,
-                f.__class__.__name__,
-                f.primary_key,
-                f.null,
-                remote_table,
-                remote_pk,
-                remote_label,
-                rel_kind,
-            )
-        )
-
-    # Forward M2M (not auto-created reverse side).
-    for f in opts.many_to_many:
-        if f.auto_created:
-            continue
-        try:
-            remote_model = f.remote_field.model
-            register_model_from_meta(remote_model, _seen)
-            remote = remote_model._meta
-            through = f.remote_field.through._meta
-            # Columns on through pointing to each side.
-            m2m_column = f.m2m_column_name()
-            m2m_reverse = f.m2m_reverse_name()
+        # Concrete local fields (columns + forward FK).
+        for f in opts.concrete_fields:
+            if not f.column:
+                continue
+            remote_table = remote_pk = remote_label = rel_kind = ""
+            if f.is_relation and (f.many_to_one or f.one_to_one):
+                try:
+                    remote_model = f.remote_field.model
+                    register_model_from_meta(remote_model, _seen, force=force)
+                    remote = remote_model._meta
+                    remote_table = remote.db_table
+                    remote_pk = remote.pk.column
+                    remote_label = f"{remote.app_label}.{remote.object_name}"
+                    rel_kind = "fk"
+                except Exception:
+                    pass
             fields.append(
                 _field_row(
                     f.name,
-                    f.name,
-                    "",
-                    "ManyToManyField",
-                    False,
-                    True,
-                    remote.db_table,
-                    remote.pk.column,
-                    f"{remote.app_label}.{remote.object_name}",
-                    "m2m",
-                    through.db_table,
-                    m2m_column,
-                    m2m_reverse,
-                    "",
+                    f.attname,
+                    f.column,
+                    f.__class__.__name__,
+                    f.primary_key,
+                    f.null,
+                    remote_table,
+                    remote_pk,
+                    remote_label,
+                    rel_kind,
+                    native_direct=_field_supports_direct_primitive_prep(f),
+                    generated=f.generated,
                 )
             )
-        except Exception:
-            continue
 
-    # Reverse relations (reverse FK and reverse M2M).
-    for rel in opts.related_objects:
-        accessor = rel.get_accessor_name()
-        if not accessor:
-            continue
-        try:
-            remote_model = rel.related_model
-            register_model_from_meta(remote_model, _seen)
-            remote = remote_model._meta
-            remote_label = f"{remote.app_label}.{remote.object_name}"
-            if rel.many_to_many:
-                # Reverse M2M: through from the field on the other side.
-                field = rel.field
-                through = field.remote_field.through._meta
-                # From this model, through column to us is m2m_reverse_name on
-                # the forward field, and to remote is m2m_column_name.
-                m2m_column = field.m2m_reverse_name()
-                m2m_reverse = field.m2m_column_name()
+        # Forward M2M (not auto-created reverse side).
+        for f in opts.many_to_many:
+            if f.auto_created:
+                continue
+            try:
+                remote_model = f.remote_field.model
+                register_model_from_meta(remote_model, _seen, force=force)
+                remote = remote_model._meta
+                through = f.remote_field.through._meta
+                # Columns on through pointing to each side.
+                m2m_column = f.m2m_column_name()
+                m2m_reverse = f.m2m_reverse_name()
                 fields.append(
                     _field_row(
-                        accessor,
-                        accessor,
+                        f.name,
+                        f.name,
                         "",
-                        "ManyToManyRel",
+                        "ManyToManyField",
                         False,
                         True,
                         remote.db_table,
                         remote.pk.column,
-                        remote_label,
-                        "rev_m2m",
+                        f"{remote.app_label}.{remote.object_name}",
+                        "m2m",
                         through.db_table,
                         m2m_column,
                         m2m_reverse,
                         "",
                     )
                 )
-            else:
-                # Reverse FK / O2O
-                fields.append(
-                    _field_row(
-                        accessor,
-                        accessor,
-                        "",
-                        "ManyToOneRel",
-                        False,
-                        True,
-                        remote.db_table,
-                        remote.pk.column,
-                        remote_label,
-                        "rev_fk",
-                        "",
-                        "",
-                        "",
-                        rel.field.column,
-                    )
-                )
-        except Exception:
-            continue
+            except Exception:
+                continue
 
-    return orm.register_model(label, opts.db_table, fields)
+        # Reverse relations (reverse FK and reverse M2M).
+        for rel in opts.related_objects:
+            accessor = rel.get_accessor_name()
+            if not accessor:
+                continue
+            try:
+                remote_model = rel.related_model
+                register_model_from_meta(remote_model, _seen, force=force)
+                remote = remote_model._meta
+                remote_label = f"{remote.app_label}.{remote.object_name}"
+                if rel.many_to_many:
+                    # Reverse M2M: through from the field on the other side.
+                    field = rel.field
+                    through = field.remote_field.through._meta
+                    # From this model, through column to us is
+                    # m2m_reverse_name on the forward field, and to remote is
+                    # m2m_column_name.
+                    m2m_column = field.m2m_reverse_name()
+                    m2m_reverse = field.m2m_column_name()
+                    fields.append(
+                        _field_row(
+                            accessor,
+                            accessor,
+                            "",
+                            "ManyToManyRel",
+                            False,
+                            True,
+                            remote.db_table,
+                            remote.pk.column,
+                            remote_label,
+                            "rev_m2m",
+                            through.db_table,
+                            m2m_column,
+                            m2m_reverse,
+                            "",
+                        )
+                    )
+                else:
+                    # Reverse FK / O2O.
+                    fields.append(
+                        _field_row(
+                            accessor,
+                            accessor,
+                            "",
+                            "ManyToOneRel",
+                            False,
+                            True,
+                            remote.db_table,
+                            remote.pk.column,
+                            remote_label,
+                            "rev_fk",
+                            "",
+                            "",
+                            "",
+                            rel.field.column,
+                        )
+                    )
+            except Exception:
+                continue
+
+        mid = orm.register_model(label, opts.db_table, fields)
+        setattr(model, _MODEL_CACHE_ATTR, (_schema_generation, int(mid)))
+        return int(mid)
 
 
 def export_model(model) -> int | None:
     return register_model_from_meta(model)
 
 
+def initialize_schema_registry(apps_registry=None) -> None:
+    """Export installed models once after the app registry is ready."""
+    if _orm() is None:
+        return
+    if apps_registry is None:
+        from django.apps import apps as apps_registry
+
+    for model in apps_registry.get_models(include_auto_created=True):
+        register_model_from_meta(model)
+
+
 def dialect_for_connection(connection) -> int | None:
     orm = _orm()
     if orm is None:
         return None
-    return int(orm.dialect_from_vendor(connection.vendor))
+    vendor = connection.vendor
+    dialect = _dialect_cache.get(vendor)
+    if dialect is not None:
+        return dialect
+    if vendor in ("postgresql", "postgres"):
+        dialect = int(orm.DIALECT_POSTGRES)
+    elif vendor in ("mysql", "mariadb"):
+        dialect = int(orm.DIALECT_MYSQL)
+    else:
+        dialect = int(orm.DIALECT_SQLITE)
+    _dialect_cache[vendor] = dialect
+    return dialect
+
+
+def _parameter_types_for_connection(connection):
+    """Return cached psycopg integer wrapper types for native parameter output."""
+    if connection.vendor not in ("postgresql", "postgres"):
+        return None
+    global _postgresql_integer_types
+    if _postgresql_integer_types is _ADAPTER_TYPES_UNSET:
+        ops = getattr(connection, "ops", None)
+        type_map = getattr(ops, "integerfield_type_map", None)
+        if type_map is None:
+            # psycopg2 and nonstandard PostgreSQL backends don't use the
+            # psycopg 3 integer wrapper classes.
+            _postgresql_integer_types = None
+        else:
+            try:
+                _postgresql_integer_types = (
+                    type_map["SmallIntegerField"],
+                    type_map["IntegerField"],
+                    type_map["BigIntegerField"],
+                )
+            except (KeyError, TypeError):
+                _postgresql_integer_types = None
+    return _postgresql_integer_types
 
 
 def q_to_tree(node) -> dict | None:
@@ -313,10 +429,15 @@ def build_queryset(
     dialect = dialect_for_connection(connection)
     if dialect is None:
         return None
-    qs = orm.QuerySet.create(int(mid), int(dialect))
     if q is not None:
-        if not apply_q(qs, q):
+        tree = q_to_tree(q)
+        if tree is None:
             return None
+        qs = orm.QuerySet.create_from_q(int(mid), int(dialect), tree)
+        if qs is None:
+            return None
+    else:
+        qs = orm.QuerySet.create(int(mid), int(dialect))
     if kwargs:
         payload = {}
         for k, v in kwargs.items():
@@ -337,16 +458,137 @@ def compile_values_list_get(
     limit: int,
     connection,
 ) -> tuple[str, list] | None:
-    qs = build_queryset(model, connection, kwargs={lookup_field: lookup_value})
-    if qs is None:
+    orm = _orm()
+    if orm is None:
         return None
-    if field_names and not qs.values_list(list(field_names), False):
+    mid = register_model_from_meta(model)
+    dialect = dialect_for_connection(connection)
+    if mid is None or dialect is None or not field_names:
         return None
-    qs.set_limit(int(limit))
-    sql, params = qs.compile_sql()
-    if not sql:
+    compiled = orm.compile_simple_values_get(
+        int(mid),
+        int(dialect),
+        field_names,
+        lookup_field,
+        lookup_value,
+        int(limit),
+        _parameter_types_for_connection(connection),
+    )
+    if compiled is None:
         return None
-    return sql, list(params)
+    return compiled
+
+
+def compile_simple_values_filter(
+    model,
+    connection,
+    *,
+    field_names,
+    lookup_field: str,
+    lookup_values,
+    lookup_in: bool,
+    ordering_names=(),
+    limit: int = 0,
+    offset: int = 0,
+) -> tuple[str, list] | None:
+    """Compile a single-table exact/IN projection in one native call."""
+    orm = _orm()
+    if orm is None or not field_names or not lookup_values:
+        return None
+    mid = register_model_from_meta(model)
+    dialect = dialect_for_connection(connection)
+    if mid is None or dialect is None:
+        return None
+    return orm.compile_simple_values_filter(
+        int(mid),
+        int(dialect),
+        field_names,
+        lookup_field,
+        bool(lookup_in),
+        lookup_values,
+        ordering_names,
+        int(limit),
+        int(offset),
+        _parameter_types_for_connection(connection),
+    )
+
+
+def compile_simple_update(
+    model,
+    connection,
+    *,
+    lookup_field: str,
+    lookup_value,
+    update_names,
+    update_values,
+) -> tuple[str, list] | None:
+    """Compile one exact filter and all assignments in one native call."""
+    orm = _orm()
+    if orm is None or not update_names:
+        return None
+    mid = register_model_from_meta(model)
+    dialect = dialect_for_connection(connection)
+    if mid is None or dialect is None:
+        return None
+    return orm.compile_simple_update(
+        int(mid),
+        int(dialect),
+        lookup_field,
+        lookup_value,
+        update_names,
+        update_values,
+        _parameter_types_for_connection(connection),
+    )
+
+
+def compile_query_plan_values(
+    model,
+    connection,
+    plan,
+    *,
+    limit: int = 0,
+    offset: int = 0,
+) -> tuple[str, list] | None:
+    """Compile a compact C++ exact/IN projection plan in one crossing."""
+    orm = _orm()
+    if orm is None or plan is None:
+        return None
+    mid = register_model_from_meta(model)
+    dialect = dialect_for_connection(connection)
+    if mid is None or dialect is None:
+        return None
+    return orm.compile_simple_values_plan(
+        int(mid),
+        int(dialect),
+        plan,
+        int(limit),
+        int(offset),
+        _parameter_types_for_connection(connection),
+    )
+
+
+def compile_query_plan_update(
+    model,
+    connection,
+    plan,
+    *,
+    updates,
+) -> tuple[str, list] | None:
+    """Compile a compact C++ exact-filter update plan in one crossing."""
+    orm = _orm()
+    if orm is None or plan is None or not updates:
+        return None
+    mid = register_model_from_meta(model)
+    dialect = dialect_for_connection(connection)
+    if mid is None or dialect is None:
+        return None
+    return orm.compile_simple_update_plan(
+        int(mid),
+        int(dialect),
+        plan,
+        updates,
+        _parameter_types_for_connection(connection),
+    )
 
 
 def compile_select(
@@ -359,6 +601,18 @@ def compile_select(
     limit: int | None = None,
     flat: bool = False,
 ) -> tuple[str, list] | None:
+    if field_names and not kwargs and q is None and (limit is None or limit > 0):
+        orm = _orm()
+        if orm is None:
+            return None
+        mid = register_model_from_meta(model)
+        dialect = dialect_for_connection(connection)
+        if mid is None or dialect is None:
+            return None
+        compiled = orm.compile_simple_values_select(
+            int(mid), int(dialect), field_names, (), int(limit or 0), 0
+        )
+        return compiled
     qs = build_queryset(model, connection, kwargs=kwargs or None, q=q)
     if qs is None:
         return None
@@ -367,7 +621,7 @@ def compile_select(
             return None
     if limit is not None:
         qs.set_limit(int(limit))
-    sql, params = qs.compile_sql()
+    sql, params = qs.compile_sql(_parameter_types_for_connection(connection))
     if not sql:
         return None
     return sql, list(params)
@@ -384,10 +638,12 @@ def compile_update(
     qs = build_queryset(model, connection, kwargs=filter_kwargs or None, q=q)
     if qs is None or not update_kwargs:
         return None
-    for name, value in update_kwargs.items():
-        if not qs.add_update(name, value):
-            return None
-    sql, params = qs.compile_sql()
+    compiled = qs.compile_update_kwargs(
+        update_kwargs, _parameter_types_for_connection(connection)
+    )
+    if compiled is None:
+        return None
+    sql, params = compiled
     if not sql:
         return None
     return sql, list(params)
@@ -404,7 +660,7 @@ def compile_delete(
     if qs is None:
         return None
     qs.set_delete()
-    sql, params = qs.compile_sql()
+    sql, params = qs.compile_sql(_parameter_types_for_connection(connection))
     if not sql:
         return None
     return sql, list(params)
@@ -441,7 +697,7 @@ def materialize_models(model, connection, handle, *, limit=None):
                 return None
         if limit is not None:
             qs.set_limit(int(limit))
-        sql, params = qs.compile_sql()
+        sql, params = qs.compile_sql(_parameter_types_for_connection(connection))
         if not sql:
             return None
         rows = execute_fetchall(connection, sql, params)
@@ -620,9 +876,7 @@ def _run_native_prefetch(model, objs, handle, specs, connection):
                 continue
 
             for row in rows:
-                rel_obj = rel_model.from_db(
-                    db, remote_atts, row[: len(remote_atts)]
-                )
+                rel_obj = rel_model.from_db(db, remote_atts, row[: len(remote_atts)])
                 parent_id = None
                 if rel in ("rev_fk", "reverse_fk"):
                     fk_col = spec.get("remote_fk_column") or ""
@@ -664,7 +918,7 @@ def _run_native_prefetch(model, objs, handle, specs, connection):
 def materialize_aggregate(connection, handle):
     """Run aggregate-style select; return dict alias→value or None."""
     try:
-        sql, params = handle.compile_sql()
+        sql, params = handle.compile_sql(_parameter_types_for_connection(connection))
         if not sql:
             return None
         rows = execute_fetchall(connection, sql, params)

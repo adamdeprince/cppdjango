@@ -1,11 +1,22 @@
-from django.utils.version import get_version
+from django.utils.version import get_version as get_upstream_version
 
 VERSION = (6, 0, 7, "final", 0)
 
-__version__ = get_version(VERSION)
+# cppdjango follows the compatible upstream release and adds a PEP 440 post
+# release component. Keep VERSION as Django's public five-element compatibility
+# tuple; distribution and native-extension identity use __version__.
+UPSTREAM_VERSION = get_upstream_version(VERSION)
+__version__ = "6.0.7.post1"
 
 # This fork ships an optional nanobind/C++26 acceleration layer (django.native).
 NATIVE_FORK = True
+
+
+def get_version(version=None):
+    """Return the cppdjango release, or an explicitly supplied Django version."""
+    if version is None:
+        return __version__
+    return get_upstream_version(version)
 
 
 def setup(set_prefix=True):

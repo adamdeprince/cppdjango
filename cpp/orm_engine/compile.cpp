@@ -254,8 +254,10 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
     sql += "DISTINCT ";
   }
 
-  std::vector<SelectItem> items = q.select;
-  if (items.empty()) {
+  const std::vector<SelectItem>* items = &q.select;
+  std::vector<SelectItem> default_items;
+  if (items->empty()) {
+    default_items.reserve(m.fields.size());
     for (const auto& f : m.fields) {
       if (f.is_relation() && f.column.empty()) {
         continue;
@@ -265,14 +267,15 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
       }
       SelectItem it;
       it.col.field = f.id;
-      items.push_back(std::move(it));
+      default_items.push_back(std::move(it));
     }
+    items = &default_items;
   }
-  for (std::size_t i = 0; i < items.size(); ++i) {
+  for (std::size_t i = 0; i < items->size(); ++i) {
     if (i) {
       sql += ", ";
     }
-    emit_select_item(sql, order, d, q, m, items[i]);
+    emit_select_item(sql, order, d, q, m, (*items)[i]);
   }
 
   sql += " FROM ";
@@ -306,7 +309,7 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
     sql += " GROUP BY ";
     bool first = true;
     if (q.group_by_all_selected) {
-      for (const auto& it : items) {
+      for (const auto& it : *items) {
         if (it.kind != SelectKind::Column) {
           continue;
         }

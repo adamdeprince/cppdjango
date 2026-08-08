@@ -3,7 +3,6 @@ cmake_minimum_required(VERSION 3.26...4.3)
 
 project(
   ${SKBUILD_PROJECT_NAME}
-  VERSION ${SKBUILD_PROJECT_VERSION}
   LANGUAGES CXX
 )
 
@@ -89,7 +88,7 @@ target_link_libraries(_native PRIVATE OpenSSL::Crypto ZLIB::ZLIB)
 target_compile_definitions(
   _native
   PRIVATE
-    DJANGO_NATIVE_VERSION="${PROJECT_VERSION}"
+    DJANGO_NATIVE_VERSION="${SKBUILD_PROJECT_VERSION_FULL}"
 )
 
 if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")

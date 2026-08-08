@@ -6,7 +6,7 @@ requires = [
 build-backend = "scikit_build_core.build"
 
 [project]
-name = "Django"
+name = "cppdjango"
 dynamic = ["version"]
 requires-python = ">= 3.12"
 dependencies = [
@@ -15,18 +15,21 @@ dependencies = [
     "tzdata; sys_platform == 'win32'",
 ]
 authors = [
-  {name = "Django Software Foundation", email = "foundation@djangoproject.com"},
+  {name = "Django Software Foundation and individual contributors"},
+  {name = "cppdjango contributors"},
 ]
-description = "A high-level Python web framework that encourages rapid development and clean, pragmatic design."
+description = "A C++ port of Django 6.0.7 with native ORM and request-processing paths."
 readme = "README.rst"
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "LICENSE.python", "AUTHORS"]
+keywords = ["django", "cpp", "c++", "web framework", "orm", "postgresql"]
 classifiers = [
-    "Development Status :: 5 - Production/Stable",
+    "Development Status :: 4 - Beta",
     "Environment :: Web Environment",
     "Framework :: Django",
     "Intended Audience :: Developers",
-    "Operating System :: OS Independent",
+    "Operating System :: MacOS",
+    "Operating System :: POSIX :: Linux",
     "Programming Language :: C++",
     "Programming Language :: Python",
     "Programming Language :: Python :: 3",
@@ -55,12 +58,11 @@ native-dev = [
 django-admin = "django.core.management:execute_from_command_line"
 
 [project.urls]
-Homepage = "https://www.djangoproject.com/"
-Documentation = "https://docs.djangoproject.com/"
-"Release notes" = "https://docs.djangoproject.com/en/stable/releases/"
-Funding = "https://www.djangoproject.com/fundraising/"
-Source = "https://github.com/django/django"
-Tracker = "https://code.djangoproject.com/"
+Homepage = "https://django.goblinreactor.com/"
+Documentation = "https://django.goblinreactor.com/#install"
+Benchmarks = "https://django.goblinreactor.com/#numbers"
+Source = "https://github.com/adamdeprince/cppdjango"
+Tracker = "https://github.com/adamdeprince/cppdjango/issues"
 
 [tool.scikit-build]
 minimum-version = "build-system.requires"
@@ -93,13 +95,8 @@ CMAKE_CXX_EXTENSIONS = "OFF"
 [tool.scikit-build.metadata.version]
 provider = "scikit_build_core.metadata.regex"
 input = "django/__init__.py"
-regex = '''(?x)
-    VERSION\s*=\s*\(\s*
-        (?P<major>\d+)\s*,\s*
-        (?P<minor>\d+)\s*,\s*
-        (?P<patch>\d+)
-'''
-result = "{major}.{minor}.{patch}"
+regex = '''__version__\s*=\s*["'](?P<value>[^"']+)["']'''
+result = "{value}"
 
 [tool.black]
 target-version = ["py312"]

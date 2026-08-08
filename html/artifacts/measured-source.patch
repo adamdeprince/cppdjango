@@ -1,0 +1,5170 @@
+diff --git a/cpp/orm_engine/bind.cpp b/cpp/orm_engine/bind.cpp
+index c3e0de7579..26c603522e 100644
+--- a/cpp/orm_engine/bind.cpp
++++ b/cpp/orm_engine/bind.cpp
+@@ -10,9 +10,14 @@
+ #include "nb_util.hpp"
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
++#include <mutex>
++#include <optional>
+ #include <stdexcept>
+ #include <string>
++#include <string_view>
++#include <unordered_map>
+ #include <utility>
+ #include <vector>
+ 
+@@ -20,6 +25,90 @@ namespace nb = nanobind;
+ 
+ namespace {
+ 
++std::mutex g_simple_compile_cache_mutex;
++std::unordered_map<std::string, std::string> g_simple_compile_cache;
++std::atomic<std::uint64_t> g_simple_compile_cache_hits{0};
++std::atomic<std::uint64_t> g_simple_compile_cache_misses{0};
++
++void append_key_part(std::string& key, std::string_view part) {
++  key += std::to_string(part.size());
++  key += ':';
++  key.append(part);
++  key += '|';
++}
++
++std::string simple_compile_key(
++    char kind, std::uint32_t model_id, int dialect,
++    const std::vector<std::string>& fields, std::string_view lookup,
++    const std::vector<std::string>& ordering, std::uint64_t limit,
++    std::uint64_t offset, bool null_lookup = false) {
++  std::string key;
++  key.reserve(64 + fields.size() * 16 + ordering.size() * 16);
++  key += kind;
++  key += '|';
++  key += std::to_string(
++      django::orm::SchemaRegistry::instance().generation());
++  key += '|';
++  key += std::to_string(model_id);
++  key += '|';
++  key += std::to_string(dialect);
++  key += '|';
++  key += std::to_string(limit);
++  key += '|';
++  key += std::to_string(offset);
++  key += '|';
++  key += null_lookup ? "null|" : "value|";
++  append_key_part(key, lookup);
++  for (const auto& field : fields) {
++    append_key_part(key, field);
++  }
++  key += "#|";
++  for (const auto& item : ordering) {
++    append_key_part(key, item);
++  }
++  return key;
++}
++
++template <typename Builder>
++std::string cached_simple_sql(const std::string& key, Builder&& builder) {
++  {
++    std::lock_guard lock(g_simple_compile_cache_mutex);
++    if (auto it = g_simple_compile_cache.find(key);
++        it != g_simple_compile_cache.end()) {
++      ++g_simple_compile_cache_hits;
++      return it->second;
++    }
++  }
++  std::string sql = builder();
++  if (sql.empty()) {
++    return {};
++  }
++  std::lock_guard lock(g_simple_compile_cache_mutex);
++  auto [it, inserted] = g_simple_compile_cache.emplace(key, std::move(sql));
++  if (inserted) {
++    ++g_simple_compile_cache_misses;
++  } else {
++    ++g_simple_compile_cache_hits;
++  }
++  return it->second;
++}
++
++void clear_simple_compile_cache() {
++  std::lock_guard lock(g_simple_compile_cache_mutex);
++  g_simple_compile_cache.clear();
++  g_simple_compile_cache_hits = 0;
++  g_simple_compile_cache_misses = 0;
++}
++
++std::vector<std::string> strings_from_sequence(nb::sequence values) {
++  std::vector<std::string> out;
++  out.reserve(nb::len(values));
++  for (nb::handle value : values) {
++    out.push_back(nb::cast<std::string>(value));
++  }
++  return out;
++}
++
+ django::orm::ParamValue param_from_python(nb::handle h) {
+   if (h.is_none()) {
+     return django::orm::ParamValue::null();
+@@ -43,7 +132,61 @@ django::orm::ParamValue param_from_python(nb::handle h) {
+   return django::orm::ParamValue::from_string(nb::cast<std::string>(nb::str(h)));
+ }
+ 
+-nb::object param_to_python(const django::orm::ParamValue& p) {
++nb::object postgres_integer_to_python(
++    const django::orm::ParamValue& p, nb::handle integer_types) {
++  using H = django::orm::ParamValue::TypeHint;
++  std::size_t index = 0;
++  switch (p.type_hint) {
++    case H::PostgresInt2:
++      index = 0;
++      break;
++    case H::PostgresInt4:
++      index = 1;
++      break;
++    case H::PostgresInt8:
++      index = 2;
++      break;
++    case H::Default:
++      return nb::int_(p.i);
++  }
++  if (integer_types.is_none()) {
++    return nb::int_(p.i);
++  }
++  if (!nb::isinstance<nb::tuple>(integer_types) || nb::len(integer_types) != 3) {
++    throw nb::type_error("PostgreSQL integer types must be a 3-tuple");
++  }
++  PyObject* type_object = PyTuple_GET_ITEM(integer_types.ptr(), index);
++  if (!PyType_Check(type_object) ||
++      !PyType_IsSubtype(reinterpret_cast<PyTypeObject*>(type_object),
++                        &PyLong_Type)) {
++    throw nb::type_error("PostgreSQL integer adapter must subclass int");
++  }
++
++  // psycopg's Int2/Int4/Int8 are slotless int subclasses whose Python
++  // __new__ methods delegate directly to int.__new__. Call that C slot
++  // ourselves so native preparation doesn't bounce through Python bytecode.
++  PyObject* raw_value = PyLong_FromLongLong(p.i);
++  if (!raw_value) {
++    throw nb::python_error();
++  }
++  PyObject* args = PyTuple_New(1);
++  if (!args) {
++    Py_DECREF(raw_value);
++    throw nb::python_error();
++  }
++  PyTuple_SET_ITEM(args, 0, raw_value);  // Steals raw_value.
++  PyObject* wrapped = PyLong_Type.tp_new(
++      reinterpret_cast<PyTypeObject*>(type_object), args, nullptr);
++  Py_DECREF(args);
++  if (!wrapped) {
++    throw nb::python_error();
++  }
++  return nb::steal<nb::object>(wrapped);
++}
++
++nb::object param_to_python(
++    const django::orm::ParamValue& p,
++    nb::handle postgres_integer_types = nb::none()) {
+   using K = django::orm::ParamValue::Kind;
+   switch (p.kind) {
+     case K::None:
+@@ -51,7 +194,7 @@ nb::object param_to_python(const django::orm::ParamValue& p) {
+     case K::Bool:
+       return nb::bool_(p.b);
+     case K::Int:
+-      return nb::int_(p.i);
++      return postgres_integer_to_python(p, postgres_integer_types);
+     case K::Float:
+       return nb::float_(p.f);
+     case K::String:
+@@ -63,7 +206,368 @@ nb::object param_to_python(const django::orm::ParamValue& p) {
+   return nb::none();
+ }
+ 
+-nb::tuple compile_to_tuple(const django::orm::QuerySet& self) {
++const django::orm::ModelSchema* registered_model(std::uint32_t model_id) {
++  return django::orm::SchemaRegistry::instance().get(
++      static_cast<django::orm::ModelId>(model_id));
++}
++
++const django::orm::FieldSchema* registered_native_field(
++    const django::orm::ModelSchema& model, std::string_view name) {
++  auto it = model.field_by_name.find(std::string(name));
++  if (it == model.field_by_name.end() || it->second >= model.fields.size()) {
++    return nullptr;
++  }
++  const auto& field = model.fields[it->second];
++  return field.is_native_scalar() ? &field : nullptr;
++}
++
++std::optional<django::orm::ParamValue> direct_param_from_python(
++    nb::handle value, const django::orm::FieldSchema& field,
++    bool allow_null = false) {
++  using django::orm::FieldType;
++  using django::orm::ParamValue;
++
++  if (value.is_none()) {
++    if (allow_null) {
++      return ParamValue::null();
++    }
++    return std::nullopt;
++  }
++
++  const auto integer_value = [&]() -> std::optional<ParamValue> {
++    if (!PyLong_CheckExact(value.ptr())) {
++      return std::nullopt;
++    }
++    int overflow = 0;
++    const long long converted = PyLong_AsLongLongAndOverflow(value.ptr(), &overflow);
++    if (overflow != 0 || PyErr_Occurred()) {
++      PyErr_Clear();
++      return std::nullopt;
++    }
++    ParamValue::TypeHint type_hint = ParamValue::TypeHint::Default;
++    switch (field.type) {
++      case FieldType::SmallInteger:
++        type_hint = ParamValue::TypeHint::PostgresInt2;
++        break;
++      case FieldType::Integer:
++        type_hint = ParamValue::TypeHint::PostgresInt4;
++        break;
++      case FieldType::BigInteger:
++        type_hint = ParamValue::TypeHint::PostgresInt8;
++        break;
++      default:
++        break;
++    }
++    return ParamValue::from_int(
++        static_cast<std::int64_t>(converted), type_hint);
++  };
++
++  switch (field.type) {
++    case FieldType::Integer:
++    case FieldType::BigInteger:
++    case FieldType::SmallInteger:
++    case FieldType::Auto:
++    case FieldType::BigAuto:
++      return integer_value();
++    case FieldType::Float: {
++      if (PyFloat_CheckExact(value.ptr())) {
++        return ParamValue::from_float(PyFloat_AS_DOUBLE(value.ptr()));
++      }
++      auto integer = integer_value();
++      if (!integer) {
++        return std::nullopt;
++      }
++      return ParamValue::from_float(static_cast<double>(integer->i));
++    }
++    case FieldType::Boolean:
++      if (!PyBool_Check(value.ptr())) {
++        return std::nullopt;
++      }
++      return ParamValue::from_bool(value.ptr() == Py_True);
++    case FieldType::Text:
++    case FieldType::Char:
++      if (!PyUnicode_CheckExact(value.ptr())) {
++        return std::nullopt;
++      }
++      return ParamValue::from_string(nb::cast<std::string>(value));
++    default:
++      return std::nullopt;
++  }
++}
++
++struct NativeLookup {
++  const django::orm::FieldSchema* field = nullptr;
++  std::string field_name;
++  std::string lookup = "exact";
++};
++
++std::optional<NativeLookup> registered_native_lookup(
++    const django::orm::ModelSchema& model, std::string_view key) {
++  if (key.empty()) {
++    return std::nullopt;
++  }
++  NativeLookup out;
++  const auto separator = key.find("__");
++  if (separator == std::string_view::npos) {
++    out.field_name = std::string(key);
++  } else {
++    if (key.find("__", separator + 2) != std::string_view::npos) {
++      return std::nullopt;
++    }
++    out.field_name = std::string(key.substr(0, separator));
++    out.lookup = std::string(key.substr(separator + 2));
++    if (out.lookup != "exact" && out.lookup != "gt" &&
++        out.lookup != "gte" && out.lookup != "lt" &&
++        out.lookup != "lte" && out.lookup != "in" &&
++        out.lookup != "isnull") {
++      return std::nullopt;
++    }
++  }
++  if (out.field_name.empty()) {
++    return std::nullopt;
++  }
++  out.field = registered_native_field(model, out.field_name);
++  if (!out.field) {
++    return std::nullopt;
++  }
++  return out;
++}
++
++bool validate_native_projection(
++    const django::orm::ModelSchema& model,
++    const std::vector<std::string>& fields) {
++  if (fields.empty()) {
++    return false;
++  }
++  return std::all_of(fields.begin(), fields.end(), [&](const auto& name) {
++    return name.find("__") == std::string::npos &&
++           registered_native_field(model, name) != nullptr;
++  });
++}
++
++bool validate_native_ordering(
++    const django::orm::ModelSchema& model,
++    const std::vector<std::string>& ordering) {
++  return std::all_of(ordering.begin(), ordering.end(), [&](const auto& item) {
++    std::string_view name(item);
++    if (!name.empty() && name.front() == '-') {
++      name.remove_prefix(1);
++    }
++    return !name.empty() && name != "?" &&
++           name.find("__") == std::string_view::npos &&
++           registered_native_field(model, name) != nullptr;
++  });
++}
++
++std::optional<django::orm::QNode> native_q_node_from_python(
++    const django::orm::ModelSchema& model, nb::handle value,
++    bool negated = false) {
++  if (!nb::isinstance<nb::dict>(value)) {
++    return std::nullopt;
++  }
++  nb::dict tree = nb::cast<nb::dict>(value);
++  if (!tree.contains("kind") || !PyUnicode_CheckExact(tree["kind"].ptr())) {
++    return std::nullopt;
++  }
++  const std::string kind = nb::cast<std::string>(tree["kind"]);
++  django::orm::QNode node;
++  if (kind == "atom") {
++    node.kind = 3;
++    if (!tree.contains("key") || !PyUnicode_CheckExact(tree["key"].ptr()) ||
++        tree.contains("rhs_sql")) {
++      return std::nullopt;
++    }
++    node.key = nb::cast<std::string>(tree["key"]);
++    auto lookup = registered_native_lookup(model, node.key);
++    if (!lookup || (negated && lookup->field->nullable) ||
++        !tree.contains("values")) {
++      return std::nullopt;
++    }
++
++    nb::handle raw_values = tree["values"];
++    const bool sequence = nb::isinstance<nb::list>(raw_values) ||
++                          nb::isinstance<nb::tuple>(raw_values);
++    if (lookup->lookup == "isnull") {
++      if (!sequence || nb::len(raw_values) != 1) {
++        return std::nullopt;
++      }
++      nb::sequence raw_sequence = nb::cast<nb::sequence>(raw_values);
++      nb::handle raw = raw_sequence[0];
++      if (!PyBool_Check(raw.ptr())) {
++        return std::nullopt;
++      }
++      node.values.push_back(
++          django::orm::ParamValue::from_bool(raw.ptr() == Py_True));
++      return node;
++    }
++    if (!sequence) {
++      return std::nullopt;
++    }
++    const std::size_t count = nb::len(raw_values);
++    if ((lookup->lookup == "in" && count == 0) ||
++        (lookup->lookup != "in" && count != 1)) {
++      return std::nullopt;
++    }
++    node.values.reserve(count);
++    nb::sequence raw_sequence = nb::cast<nb::sequence>(raw_values);
++    for (nb::handle raw : raw_sequence) {
++      auto param = direct_param_from_python(raw, *lookup->field);
++      if (!param) {
++        return std::nullopt;
++      }
++      node.values.push_back(std::move(*param));
++    }
++    return node;
++  }
++
++  if (kind == "and") {
++    node.kind = 0;
++  } else if (kind == "or") {
++    node.kind = 1;
++  } else if (kind == "xor") {
++    node.kind = 4;
++  } else if (kind == "not") {
++    node.kind = 2;
++  } else {
++    return std::nullopt;
++  }
++  if (!tree.contains("children")) {
++    return std::nullopt;
++  }
++  nb::handle raw_children = tree["children"];
++  if (!nb::isinstance<nb::list>(raw_children) &&
++      !nb::isinstance<nb::tuple>(raw_children)) {
++    return std::nullopt;
++  }
++  const std::size_t count = nb::len(raw_children);
++  if (count == 0 || (node.kind == 2 && count != 1)) {
++    return std::nullopt;
++  }
++  node.children.reserve(count);
++  nb::sequence children = nb::cast<nb::sequence>(raw_children);
++  for (nb::handle raw : children) {
++    auto child = native_q_node_from_python(
++        model, raw, node.kind == 2 ? !negated : negated);
++    if (!child) {
++      return std::nullopt;
++    }
++    node.children.push_back(std::move(*child));
++  }
++  return node;
++}
++
++std::optional<django::orm::QNode> native_q_node_from_python(
++    std::uint32_t model_id, nb::handle tree) {
++  const auto* model = registered_model(model_id);
++  if (!model) {
++    return std::nullopt;
++  }
++  return native_q_node_from_python(*model, tree);
++}
++
++std::optional<std::vector<django::orm::ParamValue>>
++native_lookup_values_from_python(
++    const django::orm::ModelSchema& model, std::string_view field_name,
++    bool lookup_in, nb::sequence values) {
++  const auto* field = registered_native_field(model, field_name);
++  const std::size_t count = nb::len(values);
++  if (!field || count == 0 || (!lookup_in && count != 1)) {
++    return std::nullopt;
++  }
++  std::vector<django::orm::ParamValue> out;
++  out.reserve(count);
++  for (nb::handle raw : values) {
++    auto param = direct_param_from_python(raw, *field);
++    if (!param) {
++      return std::nullopt;
++    }
++    out.push_back(std::move(*param));
++  }
++  return out;
++}
++
++struct NativeUpdate {
++  std::string name;
++  django::orm::ParamValue value;
++  bool set_null = false;
++};
++
++std::optional<std::vector<NativeUpdate>> native_updates_from_python(
++    const django::orm::ModelSchema& model, nb::dict updates) {
++  if (nb::len(updates) == 0) {
++    return std::nullopt;
++  }
++  std::vector<NativeUpdate> out;
++  out.reserve(nb::len(updates));
++  for (auto item : updates) {
++    if (!PyUnicode_CheckExact(item.first.ptr())) {
++      return std::nullopt;
++    }
++    NativeUpdate update;
++    update.name = nb::cast<std::string>(item.first);
++    if (update.name.find("__") != std::string::npos) {
++      return std::nullopt;
++    }
++    const auto* field = registered_native_field(model, update.name);
++    if (!field) {
++      return std::nullopt;
++    }
++    update.set_null = item.second.is_none();
++    auto param = direct_param_from_python(
++        item.second, *field, update.set_null && field->nullable);
++    if (!param) {
++      return std::nullopt;
++    }
++    update.value = std::move(*param);
++    out.push_back(std::move(update));
++  }
++  return out;
++}
++
++std::optional<std::vector<NativeUpdate>> native_updates_from_python(
++    const django::orm::ModelSchema& model,
++    const std::vector<std::string>& names, nb::sequence values) {
++  if (names.empty() || names.size() != nb::len(values)) {
++    return std::nullopt;
++  }
++  std::vector<NativeUpdate> out;
++  out.reserve(names.size());
++  std::size_t index = 0;
++  for (nb::handle raw : values) {
++    NativeUpdate update;
++    update.name = names[index++];
++    if (update.name.find("__") != std::string::npos) {
++      return std::nullopt;
++    }
++    const auto* field = registered_native_field(model, update.name);
++    if (!field) {
++      return std::nullopt;
++    }
++    update.set_null = raw.is_none();
++    auto param = direct_param_from_python(
++        raw, *field, update.set_null && field->nullable);
++    if (!param) {
++      return std::nullopt;
++    }
++    update.value = std::move(*param);
++    out.push_back(std::move(update));
++  }
++  return out;
++}
++
++std::vector<std::string> update_cache_fields(
++    const std::vector<NativeUpdate>& updates) {
++  std::vector<std::string> out;
++  out.reserve(updates.size());
++  for (const auto& update : updates) {
++    out.push_back(update.name + (update.set_null ? "#null" : "#value"));
++  }
++  return out;
++}
++
++nb::tuple compile_to_tuple(
++    const django::orm::QuerySet& self,
++    nb::handle postgres_integer_types = nb::none()) {
+   auto compiled = self.compile();
+   nb::list params;
+   const auto& q = self.query();
+@@ -71,7 +575,7 @@ nb::tuple compile_to_tuple(const django::orm::QuerySet& self) {
+     if (idx >= q.params.size()) {
+       throw std::runtime_error("param index out of range");
+     }
+-    params.append(param_to_python(q.params[idx]));
++    params.append(param_to_python(q.params[idx], postgres_integer_types));
+   }
+   return nb::make_tuple(nb::str(compiled.sql.c_str(), compiled.sql.size()), params);
+ }
+@@ -127,22 +631,77 @@ django::orm::QNode q_node_from_python(nb::handle h) {
+   return node;
+ }
+ 
++nb::dict q_node_to_python(const django::orm::QNode& node) {
++  nb::dict out;
++  if (node.kind == 3) {
++    out["kind"] = "atom";
++    out["key"] = node.key;
++    nb::list values;
++    for (const auto& value : node.values) {
++      values.append(param_to_python(value));
++    }
++    out["values"] = values;
++    if (node.has_rhs_sql) {
++      out["rhs_sql"] = node.rhs_sql;
++      out["rhs_op"] = node.rhs_op;
++      nb::list params;
++      for (const auto& value : node.rhs_params) {
++        params.append(param_to_python(value));
++      }
++      out["rhs_params"] = params;
++    }
++    return out;
++  }
++
++  const char* kind = "and";
++  if (node.kind == 1) {
++    kind = "or";
++  } else if (node.kind == 2) {
++    kind = "not";
++  } else if (node.kind == 4) {
++    kind = "xor";
++  }
++  out["kind"] = kind;
++  nb::list children;
++  for (const auto& child : node.children) {
++    children.append(q_node_to_python(child));
++  }
++  out["children"] = children;
++  return out;
++}
++
+ }  // namespace
+ 
+ void register_orm_engine(nb::module_& parent) {
+   nb::module_ m = parent.def_submodule("orm", "Native ORM data plane");
+ 
+-  m.def("clear_schema",
+-        []() { django::orm::SchemaRegistry::instance().clear(); });
++  m.def("clear_schema", []() {
++    django::orm::SchemaRegistry::instance().clear();
++    clear_simple_compile_cache();
++  });
++
++  m.def(
++      "simple_compile_cache_info",
++      []() {
++        nb::dict out;
++        std::lock_guard lock(g_simple_compile_cache_mutex);
++        out["size"] = g_simple_compile_cache.size();
++        out["hits"] = g_simple_compile_cache_hits.load();
++        out["misses"] = g_simple_compile_cache_misses.load();
++        return out;
++      });
++
++  m.def("clear_simple_compile_cache", &clear_simple_compile_cache);
+ 
+   m.def(
+       "register_model",
+       [](const std::string& label, const std::string& db_table, nb::list fields) {
+-        // fields tuple (min 6, full 14):
++        // fields tuple (min 6, full 16):
+         // 0 name, 1 attname, 2 column, 3 class_name, 4 pk, 5 null,
+         // 6 remote_table, 7 remote_pk, 8 remote_label,
+         // 9 rel_kind ("fk"|"rev_fk"|"m2m"|"rev_m2m"|""),
+-        // 10 m2m_table, 11 m2m_column, 12 m2m_reverse_column, 13 remote_fk_column
++        // 10 m2m_table, 11 m2m_column, 12 m2m_reverse_column,
++        // 13 remote_fk_column, 14 native_direct, 15 generated.
+         django::orm::ModelSchema schema;
+         schema.label = label;
+         schema.db_table = db_table;
+@@ -175,8 +734,20 @@ void register_orm_engine(nb::module_& parent) {
+           if (n >= 14) {
+             f.remote_fk_column = nb::cast<std::string>(t[13]);
+           }
++          if (n >= 15) {
++            f.native_direct = nb::cast<bool>(t[14]);
++          } else {
++            // Compatibility for the low-level test/debug surface. Production
++            // schema exports always send the explicit exact-class bit.
++            f.native_direct =
++                django::orm::field_type_has_direct_primitive_prep(f.type);
++          }
++          if (n >= 16) {
++            f.generated = nb::cast<bool>(t[15]);
++          }
+           if (f.rel != django::orm::RelKind::None) {
+             f.type = django::orm::FieldType::ForeignKey;
++            f.native_direct = false;
+           }
+           schema.fields.push_back(std::move(f));
+         }
+@@ -208,6 +779,578 @@ void register_orm_engine(nb::module_& parent) {
+   m.attr("DIALECT_MYSQL") = 1;
+   m.attr("DIALECT_SQLITE") = 2;
+ 
++  nb::class_<django::orm::QueryPlan>(m, "QueryPlan")
++      .def_static(
++          "for_simple_filter",
++          [](std::uint32_t model_id, const std::string& lookup_field,
++             bool lookup_in, nb::sequence lookup_values) -> nb::object {
++            const auto* model = registered_model(model_id);
++            if (!model || lookup_field.find("__") != std::string::npos) {
++              return nb::none();
++            }
++            auto values = native_lookup_values_from_python(
++                *model, lookup_field, lookup_in, lookup_values);
++            if (!values) {
++              return nb::none();
++            }
++            return nb::cast(
++                django::orm::QueryPlan(
++                    static_cast<django::orm::ModelId>(model_id))
++                    .with_simple_filter(
++                        lookup_field, lookup_in, std::move(*values)));
++          },
++          nb::arg("model_id"), nb::arg("lookup_field"),
++          nb::arg("lookup_in"), nb::arg("lookup_values"))
++      .def_static(
++          "for_q",
++          [](std::uint32_t model_id, nb::dict tree) -> nb::object {
++            auto node = native_q_node_from_python(model_id, tree);
++            if (!node) {
++              return nb::none();
++            }
++            return nb::cast(
++                django::orm::QueryPlan(
++                    static_cast<django::orm::ModelId>(model_id))
++                    .with_filter(std::move(*node)));
++          },
++          nb::arg("model_id"), nb::arg("tree"))
++      .def_static(
++          "for_ordering",
++          [](std::uint32_t model_id, nb::sequence names) -> nb::object {
++            const auto* model = registered_model(model_id);
++            auto ordering = strings_from_sequence(names);
++            if (!model || !validate_native_ordering(*model, ordering)) {
++              return nb::none();
++            }
++            return nb::cast(
++                django::orm::QueryPlan(
++                    static_cast<django::orm::ModelId>(model_id))
++                    .with_ordering(std::move(ordering)));
++          },
++          nb::arg("model_id"), nb::arg("names"))
++      .def_static(
++          "for_values",
++          [](std::uint32_t model_id, nb::sequence names) -> nb::object {
++            const auto* model = registered_model(model_id);
++            auto fields = strings_from_sequence(names);
++            if (!model || !validate_native_projection(*model, fields)) {
++              return nb::none();
++            }
++            return nb::cast(
++                django::orm::QueryPlan(
++                    static_cast<django::orm::ModelId>(model_id))
++                    .with_values(std::move(fields)));
++          },
++          nb::arg("model_id"), nb::arg("names"))
++      .def_static(
++          "from_simple_filter",
++          [](const std::string& lookup_field, bool lookup_in,
++             nb::sequence lookup_values) {
++            std::vector<django::orm::ParamValue> values;
++            values.reserve(nb::len(lookup_values));
++            for (nb::handle value : lookup_values) {
++              values.push_back(param_from_python(value));
++            }
++            return django::orm::QueryPlan{}.with_simple_filter(
++                lookup_field, lookup_in, std::move(values));
++          },
++          nb::arg("lookup_field"), nb::arg("lookup_in"),
++          nb::arg("lookup_values"))
++      .def_static(
++          "from_q",
++          [](nb::dict tree) {
++            return django::orm::QueryPlan{}.with_filter(
++                q_node_from_python(tree));
++          },
++          nb::arg("tree"))
++      .def_static(
++          "from_ordering",
++          [](nb::sequence names) {
++            return django::orm::QueryPlan{}.with_ordering(
++                strings_from_sequence(names));
++          },
++          nb::arg("names"))
++      .def_static(
++          "from_values",
++          [](nb::sequence names) {
++            return django::orm::QueryPlan{}.with_values(
++                strings_from_sequence(names));
++          },
++          nb::arg("names"))
++      .def(
++          "with_q",
++          [](const django::orm::QueryPlan& self, nb::dict tree) -> nb::object {
++            if (!self.is_model_bound()) {
++              return nb::cast(self.with_filter(q_node_from_python(tree)));
++            }
++            auto model_id = self.model_id();
++            if (!model_id || !self.matches_model(*model_id)) {
++              return nb::none();
++            }
++            auto node = native_q_node_from_python(
++                static_cast<std::uint32_t>(*model_id), tree);
++            if (!node) {
++              return nb::none();
++            }
++            return nb::cast(self.with_filter(std::move(*node)));
++          },
++          nb::arg("tree"))
++      .def(
++          "with_ordering",
++          [](const django::orm::QueryPlan& self,
++             nb::sequence names) -> nb::object {
++            auto ordering = strings_from_sequence(names);
++            if (!self.is_model_bound()) {
++              return nb::cast(self.with_ordering(std::move(ordering)));
++            }
++            auto model_id = self.model_id();
++            const auto* model = model_id ? registered_model(*model_id) : nullptr;
++            if (!model_id || !self.matches_model(*model_id) || !model ||
++                !validate_native_ordering(*model, ordering)) {
++              return nb::none();
++            }
++            return nb::cast(self.with_ordering(std::move(ordering)));
++          },
++          nb::arg("names"))
++      .def(
++          "with_values",
++          [](const django::orm::QueryPlan& self,
++             nb::sequence names) -> nb::object {
++            auto fields = strings_from_sequence(names);
++            if (!self.is_model_bound()) {
++              return nb::cast(self.with_values(std::move(fields)));
++            }
++            auto model_id = self.model_id();
++            const auto* model = model_id ? registered_model(*model_id) : nullptr;
++            if (!model_id || !self.matches_model(*model_id) || !model ||
++                !validate_native_projection(*model, fields)) {
++              return nb::none();
++            }
++            return nb::cast(self.with_values(std::move(fields)));
++          },
++          nb::arg("names"))
++      .def("has_only_projection",
++           &django::orm::QueryPlan::has_only_projection)
++      .def("has_simple_filter", &django::orm::QueryPlan::has_simple_filter)
++      .def(
++          "simple_filter",
++          [](const django::orm::QueryPlan& self) -> nb::object {
++            for (const auto& operation : self.operations()) {
++              if (operation.kind !=
++                      django::orm::QueryPlan::OperationKind::Filter ||
++                  !operation.simple_filter) {
++                continue;
++              }
++              nb::list values;
++              for (const auto& value : operation.filter.values) {
++                values.append(param_to_python(value));
++              }
++              return nb::make_tuple(operation.lookup_field,
++                                    operation.lookup_in, values);
++            }
++            return nb::none();
++          })
++      .def(
++          "replay",
++          [](const django::orm::QueryPlan& self) {
++            nb::list replay;
++            for (const auto& operation : self.operations()) {
++              switch (operation.kind) {
++                case django::orm::QueryPlan::OperationKind::Filter:
++                  replay.append(nb::make_tuple(
++                      "filter", q_node_to_python(operation.filter)));
++                  break;
++                case django::orm::QueryPlan::OperationKind::OrderBy:
++                  replay.append(nb::make_tuple(
++                      "order_by",
++                      django::native::list_from_strings(operation.names)));
++                  break;
++                case django::orm::QueryPlan::OperationKind::Values:
++                  replay.append(nb::make_tuple(
++                      "values",
++                      django::native::list_from_strings(operation.names)));
++                  break;
++              }
++            }
++            return replay;
++          });
++
++  m.def(
++      "compile_simple_values_get",
++      [](std::uint32_t model_id, int dialect, nb::sequence field_names,
++         const std::string& lookup_field, nb::handle lookup_value,
++         std::uint64_t limit,
++         nb::handle postgres_integer_types) -> nb::object {
++        auto fields = strings_from_sequence(field_names);
++        const auto* model = registered_model(model_id);
++        auto lookup = model
++                          ? registered_native_lookup(*model, lookup_field)
++                          : std::optional<NativeLookup>{};
++        if (!model || !validate_native_projection(*model, fields) || !lookup ||
++            lookup->lookup != "exact") {
++          return nb::none();
++        }
++        const bool null_lookup = lookup_value.is_none();
++        auto prepared = direct_param_from_python(
++            lookup_value, *lookup->field, null_lookup);
++        if (!prepared) {
++          return nb::none();
++        }
++        const auto key = simple_compile_key(
++            'G', model_id, dialect, fields, lookup_field, {}, limit, 0,
++            null_lookup);
++        auto sql = cached_simple_sql(key, [&]() {
++          django::orm::QuerySet qs(
++              static_cast<django::orm::ModelId>(model_id),
++              static_cast<django::orm::DialectId>(dialect));
++          if (!qs.values(fields, true, django::orm::ResultMode::ValuesList)) {
++            return std::string{};
++          }
++          const bool filtered =
++              null_lookup
++                  ? qs.filter_isnull(lookup_field, true)
++                  : qs.filter_eq(lookup_field,
++                                 django::orm::ParamValue::from_int(0));
++          if (!filtered) {
++            return std::string{};
++          }
++          qs.set_limit(limit);
++          return qs.compile().sql;
++        });
++        if (sql.empty()) {
++          return nb::none();
++        }
++        nb::list params;
++        if (!null_lookup) {
++          params.append(param_to_python(*prepared, postgres_integer_types));
++        }
++        return nb::make_tuple(nb::str(sql.c_str(), sql.size()), params);
++      },
++      nb::arg("model_id"), nb::arg("dialect"), nb::arg("field_names"),
++      nb::arg("lookup_field"), nb::arg("lookup_value"), nb::arg("limit"),
++      nb::arg("postgres_integer_types") = nb::none());
++
++  m.def(
++      "compile_simple_values_select",
++      [](std::uint32_t model_id, int dialect, nb::sequence field_names,
++         nb::sequence ordering_names, std::uint64_t limit,
++         std::uint64_t offset) -> nb::object {
++        auto fields = strings_from_sequence(field_names);
++        auto ordering = strings_from_sequence(ordering_names);
++        const auto* model = registered_model(model_id);
++        if (!model || !validate_native_projection(*model, fields) ||
++            !validate_native_ordering(*model, ordering)) {
++          return nb::none();
++        }
++        const auto key = simple_compile_key(
++            'S', model_id, dialect, fields, {}, ordering, limit, offset);
++        auto sql = cached_simple_sql(key, [&]() {
++          django::orm::QuerySet qs(
++              static_cast<django::orm::ModelId>(model_id),
++              static_cast<django::orm::DialectId>(dialect));
++          if (!qs.values(fields, true, django::orm::ResultMode::ValuesList)) {
++            return std::string{};
++          }
++          for (const auto& item : ordering) {
++            bool desc = !item.empty() && item.front() == '-';
++            std::string_view name(item);
++            if (desc) {
++              name.remove_prefix(1);
++            }
++            if (name.empty() || name == "?" || !qs.order_by(name, desc)) {
++              return std::string{};
++            }
++          }
++          if (limit > 0) {
++            qs.set_limit(limit);
++          }
++          if (offset > 0) {
++            qs.set_offset(offset);
++          }
++          return qs.compile().sql;
++        });
++        if (sql.empty()) {
++          return nb::none();
++        }
++        return nb::make_tuple(nb::str(sql.c_str(), sql.size()), nb::list());
++      },
++      nb::arg("model_id"), nb::arg("dialect"), nb::arg("field_names"),
++      nb::arg("ordering_names"), nb::arg("limit") = 0,
++      nb::arg("offset") = 0);
++
++  m.def(
++      "compile_simple_values_filter",
++      [](std::uint32_t model_id, int dialect, nb::sequence field_names,
++         const std::string& lookup_field, bool lookup_in,
++         nb::sequence lookup_values, nb::sequence ordering_names,
++         std::uint64_t limit, std::uint64_t offset,
++         nb::handle postgres_integer_types) -> nb::object {
++        auto fields = strings_from_sequence(field_names);
++        auto ordering = strings_from_sequence(ordering_names);
++        const auto* model = registered_model(model_id);
++        const std::size_t value_count = nb::len(lookup_values);
++        auto prepared = model ? native_lookup_values_from_python(
++                                    *model, lookup_field, lookup_in,
++                                    lookup_values)
++                              : std::nullopt;
++        if (!model || !validate_native_projection(*model, fields) ||
++            !validate_native_ordering(*model, ordering) || !prepared ||
++            value_count == 0 || (!lookup_in && value_count != 1)) {
++          return nb::none();
++        }
++        std::string lookup_key = lookup_field;
++        lookup_key += lookup_in ? "__in#" : "__exact#";
++        lookup_key += std::to_string(value_count);
++        const auto key = simple_compile_key(
++            'F', model_id, dialect, fields, lookup_key, ordering, limit, offset);
++        auto sql = cached_simple_sql(key, [&]() {
++          django::orm::QuerySet qs(
++              static_cast<django::orm::ModelId>(model_id),
++              static_cast<django::orm::DialectId>(dialect));
++          if (!qs.values(fields, true, django::orm::ResultMode::ValuesList)) {
++            return std::string{};
++          }
++          bool filtered = false;
++          if (lookup_in) {
++            std::vector<django::orm::ParamValue> values;
++            values.reserve(value_count);
++            for (std::size_t i = 0; i < value_count; ++i) {
++              values.push_back(django::orm::ParamValue::from_int(0));
++            }
++            filtered = qs.filter_in(lookup_field, std::move(values));
++          } else {
++            filtered = qs.filter_eq(lookup_field,
++                                    django::orm::ParamValue::from_int(0));
++          }
++          if (!filtered) {
++            return std::string{};
++          }
++          for (const auto& item : ordering) {
++            const bool desc = !item.empty() && item.front() == '-';
++            std::string_view name(item);
++            if (desc) {
++              name.remove_prefix(1);
++            }
++            if (name.empty() || name == "?" || !qs.order_by(name, desc)) {
++              return std::string{};
++            }
++          }
++          if (limit > 0) {
++            qs.set_limit(limit);
++          }
++          if (offset > 0) {
++            qs.set_offset(offset);
++          }
++          return qs.compile().sql;
++        });
++        if (sql.empty()) {
++          return nb::none();
++        }
++        nb::list params;
++        for (const auto& value : *prepared) {
++          params.append(param_to_python(value, postgres_integer_types));
++        }
++        return nb::make_tuple(nb::str(sql.c_str(), sql.size()), params);
++      },
++      nb::arg("model_id"), nb::arg("dialect"), nb::arg("field_names"),
++      nb::arg("lookup_field"), nb::arg("lookup_in"),
++      nb::arg("lookup_values"), nb::arg("ordering_names") = nb::tuple(),
++      nb::arg("limit") = 0, nb::arg("offset") = 0,
++      nb::arg("postgres_integer_types") = nb::none());
++
++  m.def(
++      "compile_simple_values_plan",
++      [](std::uint32_t model_id, int dialect,
++         const django::orm::QueryPlan& plan, std::uint64_t limit,
++         std::uint64_t offset,
++         nb::handle postgres_integer_types) -> nb::object {
++        auto shape = plan.simple_values_shape();
++        if (!shape || !plan.matches_model(
++                          static_cast<django::orm::ModelId>(model_id))) {
++          return nb::none();
++        }
++        std::string lookup_key = shape->lookup_field;
++        lookup_key += shape->lookup_in ? "__in#" : "__exact#";
++        lookup_key += std::to_string(shape->lookup_values->size());
++        const auto key = simple_compile_key(
++            'F', model_id, dialect, shape->fields, lookup_key,
++            shape->ordering, limit, offset);
++        auto sql = cached_simple_sql(key, [&]() {
++          django::orm::QuerySet qs(
++              static_cast<django::orm::ModelId>(model_id),
++              static_cast<django::orm::DialectId>(dialect));
++          if (!qs.values(shape->fields, true,
++                         django::orm::ResultMode::ValuesList)) {
++            return std::string{};
++          }
++          bool filtered = false;
++          if (shape->lookup_in) {
++            std::vector<django::orm::ParamValue> values;
++            values.reserve(shape->lookup_values->size());
++            for (std::size_t i = 0; i < shape->lookup_values->size(); ++i) {
++              values.push_back(django::orm::ParamValue::from_int(0));
++            }
++            filtered = qs.filter_in(shape->lookup_field, std::move(values));
++          } else {
++            filtered = qs.filter_eq(shape->lookup_field,
++                                    django::orm::ParamValue::from_int(0));
++          }
++          if (!filtered) {
++            return std::string{};
++          }
++          for (const auto& item : shape->ordering) {
++            const bool desc = !item.empty() && item.front() == '-';
++            std::string_view name(item);
++            if (desc) {
++              name.remove_prefix(1);
++            }
++            if (name.empty() || name == "?" || !qs.order_by(name, desc)) {
++              return std::string{};
++            }
++          }
++          if (limit > 0) {
++            qs.set_limit(limit);
++          }
++          if (offset > 0) {
++            qs.set_offset(offset);
++          }
++          return qs.compile().sql;
++        });
++        if (sql.empty()) {
++          return nb::none();
++        }
++        nb::list params;
++        for (const auto& value : *shape->lookup_values) {
++          params.append(param_to_python(value, postgres_integer_types));
++        }
++        return nb::make_tuple(nb::str(sql.c_str(), sql.size()), params);
++      },
++      nb::arg("model_id"), nb::arg("dialect"), nb::arg("plan"),
++      nb::arg("limit") = 0, nb::arg("offset") = 0,
++      nb::arg("postgres_integer_types") = nb::none());
++
++  m.def(
++      "compile_simple_update",
++      [](std::uint32_t model_id, int dialect,
++         const std::string& lookup_field, nb::handle lookup_value,
++         nb::sequence update_names, nb::sequence update_values,
++         nb::handle postgres_integer_types) -> nb::object {
++        auto fields = strings_from_sequence(update_names);
++        const auto* model = registered_model(model_id);
++        auto lookup = model
++                          ? registered_native_lookup(*model, lookup_field)
++                          : std::optional<NativeLookup>{};
++        auto prepared_lookup = lookup
++                                   ? direct_param_from_python(
++                                         lookup_value, *lookup->field)
++                                   : std::nullopt;
++        auto updates = model ? native_updates_from_python(
++                                   *model, fields, update_values)
++                             : std::nullopt;
++        if (!model || !lookup || lookup->lookup != "exact" ||
++            !prepared_lookup || !updates) {
++          return nb::none();
++        }
++        const auto cache_fields = update_cache_fields(*updates);
++        const auto key = simple_compile_key(
++            'U', model_id, dialect, cache_fields, lookup_field, {}, 0, 0);
++        auto sql = cached_simple_sql(key, [&]() {
++          django::orm::QuerySet qs(
++              static_cast<django::orm::ModelId>(model_id),
++              static_cast<django::orm::DialectId>(dialect));
++          if (!qs.filter_eq(lookup_field,
++                            django::orm::ParamValue::from_int(0))) {
++            return std::string{};
++          }
++          for (const auto& update : *updates) {
++            const bool added =
++                update.set_null
++                    ? qs.add_update_null(update.name)
++                    : qs.add_update(
++                          update.name,
++                          django::orm::ParamValue::from_int(0));
++            if (!added) {
++              return std::string{};
++            }
++          }
++          return qs.compile().sql;
++        });
++        if (sql.empty()) {
++          return nb::none();
++        }
++        nb::list params;
++        for (const auto& update : *updates) {
++          if (!update.set_null) {
++            params.append(
++                param_to_python(update.value, postgres_integer_types));
++          }
++        }
++        params.append(
++            param_to_python(*prepared_lookup, postgres_integer_types));
++        return nb::make_tuple(nb::str(sql.c_str(), sql.size()), params);
++      },
++      nb::arg("model_id"), nb::arg("dialect"), nb::arg("lookup_field"),
++      nb::arg("lookup_value"), nb::arg("update_names"),
++      nb::arg("update_values"),
++      nb::arg("postgres_integer_types") = nb::none());
++
++  m.def(
++      "compile_simple_update_plan",
++      [](std::uint32_t model_id, int dialect,
++         const django::orm::QueryPlan& plan, nb::dict raw_updates,
++         nb::handle postgres_integer_types) -> nb::object {
++        auto shape = plan.simple_update_shape();
++        const auto* model = registered_model(model_id);
++        auto updates = model
++                           ? native_updates_from_python(*model, raw_updates)
++                           : std::nullopt;
++        if (!shape || !model || !updates ||
++            !plan.matches_model(
++                static_cast<django::orm::ModelId>(model_id))) {
++          return nb::none();
++        }
++        const auto cache_fields = update_cache_fields(*updates);
++        const auto key = simple_compile_key(
++            'U', model_id, dialect, cache_fields, shape->lookup_field, {}, 0, 0);
++        auto sql = cached_simple_sql(key, [&]() {
++          django::orm::QuerySet qs(
++              static_cast<django::orm::ModelId>(model_id),
++              static_cast<django::orm::DialectId>(dialect));
++          if (!qs.filter_eq(shape->lookup_field,
++                            django::orm::ParamValue::from_int(0))) {
++            return std::string{};
++          }
++          for (const auto& update : *updates) {
++            const bool added =
++                update.set_null
++                    ? qs.add_update_null(update.name)
++                    : qs.add_update(
++                          update.name,
++                          django::orm::ParamValue::from_int(0));
++            if (!added) {
++              return std::string{};
++            }
++          }
++          return qs.compile().sql;
++        });
++        if (sql.empty()) {
++          return nb::none();
++        }
++        nb::list params;
++        for (const auto& update : *updates) {
++          if (!update.set_null) {
++            params.append(
++                param_to_python(update.value, postgres_integer_types));
++          }
++        }
++        params.append(
++            param_to_python(*shape->lookup_value, postgres_integer_types));
++        return nb::make_tuple(nb::str(sql.c_str(), sql.size()), params);
++      },
++      nb::arg("model_id"), nb::arg("dialect"), nb::arg("plan"),
++      nb::arg("updates"),
++      nb::arg("postgres_integer_types") = nb::none());
++
+   nb::class_<django::orm::QuerySet>(m, "QuerySet")
+       .def(nb::init<>())
+       .def_static(
+@@ -218,7 +1361,39 @@ void register_orm_engine(nb::module_& parent) {
+                 static_cast<django::orm::DialectId>(dialect));
+           },
+           nb::arg("model_id"), nb::arg("dialect") = 0)
++      .def_static(
++          "create_from_q",
++          [](std::uint32_t model_id, int dialect, nb::dict tree) -> nb::object {
++            django::orm::QuerySet qs(
++                static_cast<django::orm::ModelId>(model_id),
++                static_cast<django::orm::DialectId>(dialect));
++            if (!qs.apply_q(q_node_from_python(tree))) {
++              return nb::none();
++            }
++            return nb::cast(std::move(qs));
++          },
++          nb::arg("model_id"), nb::arg("dialect"), nb::arg("tree"))
++      .def_static(
++          "create_from_native_q",
++          [](std::uint32_t model_id, int dialect,
++             nb::dict tree) -> nb::object {
++            auto node = native_q_node_from_python(model_id, tree);
++            if (!node) {
++              return nb::none();
++            }
++            django::orm::QuerySet qs(
++                static_cast<django::orm::ModelId>(model_id),
++                static_cast<django::orm::DialectId>(dialect));
++            if (!qs.apply_q(*node)) {
++              return nb::none();
++            }
++            return nb::cast(std::move(qs));
++          },
++          nb::arg("model_id"), nb::arg("dialect"), nb::arg("tree"))
+       .def("clone", &django::orm::QuerySet::clone)
++      .def("shares_state_with", &django::orm::QuerySet::shares_state_with,
++           nb::arg("other"))
++      .def("compile_runs", &django::orm::QuerySet::compile_runs)
+       .def(
+           "filter_eq",
+           [](django::orm::QuerySet& self, const std::string& field,
+@@ -280,6 +1455,33 @@ void register_orm_engine(nb::module_& parent) {
+           },
+           nb::arg("tree"),
+           "Apply a full Q-tree dict (and/or/not/xor/atom) in C++.")
++      .def(
++          "with_q",
++          [](const django::orm::QuerySet& self, nb::dict tree) -> nb::object {
++            django::orm::QuerySet qs = self.clone();
++            if (!qs.apply_q(q_node_from_python(tree))) {
++              return nb::none();
++            }
++            return nb::cast(std::move(qs));
++          },
++          nb::arg("tree"),
++          "Return a COW clone with a Q-tree applied.")
++      .def(
++          "with_native_q",
++          [](const django::orm::QuerySet& self,
++             nb::dict tree) -> nb::object {
++            auto node = native_q_node_from_python(self.model_id(), tree);
++            if (!node) {
++              return nb::none();
++            }
++            django::orm::QuerySet qs = self.clone();
++            if (!qs.apply_q(*node)) {
++              return nb::none();
++            }
++            return nb::cast(std::move(qs));
++          },
++          nb::arg("tree"),
++          "Return a COW clone with a schema-validated primitive Q-tree.")
+       .def(
+           "filter_subquery",
+           [](django::orm::QuerySet& self, const std::string& field, int op,
+@@ -304,6 +1506,20 @@ void register_orm_engine(nb::module_& parent) {
+             return self.values(ns, true, mode);
+           },
+           nb::arg("names"), nb::arg("flat") = false)
++      .def(
++          "with_values_list",
++          [](const django::orm::QuerySet& self, nb::sequence names,
++             bool flat) -> nb::object {
++            django::orm::QuerySet qs = self.clone();
++            auto ns = strings_from_sequence(names);
++            auto mode = flat ? django::orm::ResultMode::ValuesListFlat
++                             : django::orm::ResultMode::ValuesList;
++            if (!qs.values(ns, true, mode)) {
++              return nb::none();
++            }
++            return nb::cast(std::move(qs));
++          },
++          nb::arg("names"), nb::arg("flat") = false)
+       .def(
+           "values",
+           [](django::orm::QuerySet& self, nb::sequence names) {
+@@ -314,6 +1530,18 @@ void register_orm_engine(nb::module_& parent) {
+             return self.values(ns, true, django::orm::ResultMode::ValuesDict);
+           },
+           nb::arg("names"))
++      .def(
++          "with_values",
++          [](const django::orm::QuerySet& self,
++             nb::sequence names) -> nb::object {
++            django::orm::QuerySet qs = self.clone();
++            auto ns = strings_from_sequence(names);
++            if (!qs.values(ns, true, django::orm::ResultMode::ValuesDict)) {
++              return nb::none();
++            }
++            return nb::cast(std::move(qs));
++          },
++          nb::arg("names"))
+       .def("clear_select", &django::orm::QuerySet::clear_select)
+       .def("select_model_columns", &django::orm::QuerySet::select_model_columns)
+       .def(
+@@ -530,10 +1758,76 @@ void register_orm_engine(nb::module_& parent) {
+             return self.order_by_alias(alias, desc);
+           },
+           nb::arg("alias"), nb::arg("desc") = false)
++      .def(
++          "set_ordering",
++          [](django::orm::QuerySet& self, nb::sequence names) {
++            self.clear_ordering();
++            for (nb::handle value : names) {
++              std::string item = nb::cast<std::string>(value);
++              bool desc = !item.empty() && item.front() == '-';
++              std::string_view name(item);
++              if (desc) {
++                name.remove_prefix(1);
++              }
++              if (name.empty() || name == "?" || !self.order_by(name, desc)) {
++                return false;
++              }
++            }
++            return true;
++          },
++          nb::arg("names"))
++      .def(
++          "with_ordering",
++          [](const django::orm::QuerySet& self,
++             nb::sequence names) -> nb::object {
++            django::orm::QuerySet qs = self.clone();
++            qs.clear_ordering();
++            for (nb::handle value : names) {
++              std::string item = nb::cast<std::string>(value);
++              bool desc = !item.empty() && item.front() == '-';
++              std::string_view name(item);
++              if (desc) {
++                name.remove_prefix(1);
++              }
++              if (name.empty() || name == "?" || !qs.order_by(name, desc)) {
++                return nb::none();
++              }
++            }
++            return nb::cast(std::move(qs));
++          },
++          nb::arg("names"))
++      .def(
++          "compile_update_kwargs",
++          [](const django::orm::QuerySet& self, nb::dict kwargs,
++             nb::handle postgres_integer_types) -> nb::object {
++            const auto* model = registered_model(self.model_id());
++            auto updates = model
++                               ? native_updates_from_python(*model, kwargs)
++                               : std::nullopt;
++            if (!updates) {
++              return nb::none();
++            }
++            django::orm::QuerySet qs = self.clone();
++            for (const auto& update : *updates) {
++              const bool added = update.set_null
++                                     ? qs.add_update_null(update.name)
++                                     : qs.add_update(update.name, update.value);
++              if (!added) {
++                return nb::none();
++              }
++            }
++            if (qs.compile().sql.empty()) {
++              return nb::none();
++            }
++            return compile_to_tuple(qs, postgres_integer_types);
++          },
++          nb::arg("kwargs"),
++          nb::arg("postgres_integer_types") = nb::none())
+       .def("set_limit", &django::orm::QuerySet::set_limit, nb::arg("n"))
+       .def("set_offset", &django::orm::QuerySet::set_offset, nb::arg("n"))
+       .def("set_distinct", &django::orm::QuerySet::set_distinct, nb::arg("v"))
+-      .def("compile_sql", &compile_to_tuple)
++      .def("compile_sql", &compile_to_tuple,
++           nb::arg("postgres_integer_types") = nb::none())
+       .def("base_attnames",
+            [](const django::orm::QuerySet& self) {
+              return django::native::list_from_strings(self.base_attnames());
+diff --git a/cpp/orm_engine/compile.cpp b/cpp/orm_engine/compile.cpp
+index c16a660ed4..743948b7de 100644
+--- a/cpp/orm_engine/compile.cpp
++++ b/cpp/orm_engine/compile.cpp
+@@ -254,8 +254,10 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
+     sql += "DISTINCT ";
+   }
+ 
+-  std::vector<SelectItem> items = q.select;
+-  if (items.empty()) {
++  const std::vector<SelectItem>* items = &q.select;
++  std::vector<SelectItem> default_items;
++  if (items->empty()) {
++    default_items.reserve(m.fields.size());
+     for (const auto& f : m.fields) {
+       if (f.is_relation() && f.column.empty()) {
+         continue;
+@@ -265,14 +267,15 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
+       }
+       SelectItem it;
+       it.col.field = f.id;
+-      items.push_back(std::move(it));
++      default_items.push_back(std::move(it));
+     }
++    items = &default_items;
+   }
+-  for (std::size_t i = 0; i < items.size(); ++i) {
++  for (std::size_t i = 0; i < items->size(); ++i) {
+     if (i) {
+       sql += ", ";
+     }
+-    emit_select_item(sql, order, d, q, m, items[i]);
++    emit_select_item(sql, order, d, q, m, (*items)[i]);
+   }
+ 
+   sql += " FROM ";
+@@ -306,7 +309,7 @@ CompiledSql compile_select_inner(const Query& q, const ModelSchema& m) {
+     sql += " GROUP BY ";
+     bool first = true;
+     if (q.group_by_all_selected) {
+-      for (const auto& it : items) {
++      for (const auto& it : *items) {
+         if (it.kind != SelectKind::Column) {
+           continue;
+         }
+diff --git a/cpp/orm_engine/query.cpp b/cpp/orm_engine/query.cpp
+index e36df33f04..973e62ddfb 100644
+--- a/cpp/orm_engine/query.cpp
++++ b/cpp/orm_engine/query.cpp
+@@ -63,9 +63,6 @@ std::optional<CmpOp> cmp_op_from_lookup(std::string_view lookup) {
+   if (lookup.empty() || lookup == "exact") {
+     return CmpOp::Eq;
+   }
+-  if (lookup == "iexact") {
+-    return CmpOp::Eq;  // emit same; collations later
+-  }
+   if (lookup == "gt") {
+     return CmpOp::Gt;
+   }
+diff --git a/cpp/orm_engine/query.hpp b/cpp/orm_engine/query.hpp
+index 855580bec6..b2e93997d9 100644
+--- a/cpp/orm_engine/query.hpp
++++ b/cpp/orm_engine/query.hpp
+@@ -37,7 +37,18 @@ struct ParamValue {
+     String,
+     Bytes,
+   };
++  // Logical database type information needed by a driver at the final
++  // Python boundary. PostgreSQL's server-side binding otherwise chooses an
++  // integer OID from the value's magnitude (for example, 7 -> int2), whereas
++  // Django binds an IntegerField as int4 regardless of value.
++  enum class TypeHint : std::uint8_t {
++    Default = 0,
++    PostgresInt2,
++    PostgresInt4,
++    PostgresInt8,
++  };
+   Kind kind = Kind::None;
++  TypeHint type_hint = TypeHint::Default;
+   bool b = false;
+   std::int64_t i = 0;
+   double f = 0;
+@@ -51,9 +62,11 @@ struct ParamValue {
+     p.b = v;
+     return p;
+   }
+-  static ParamValue from_int(std::int64_t v) {
++  static ParamValue from_int(
++      std::int64_t v, TypeHint hint = TypeHint::Default) {
+     ParamValue p;
+     p.kind = Kind::Int;
++    p.type_hint = hint;
+     p.i = v;
+     return p;
+   }
+diff --git a/cpp/orm_engine/queryset.cpp b/cpp/orm_engine/queryset.cpp
+index 477f51da4d..aed23101d3 100644
+--- a/cpp/orm_engine/queryset.cpp
++++ b/cpp/orm_engine/queryset.cpp
+@@ -1,5 +1,7 @@
+ #include "orm_engine/queryset.hpp"
+ 
++#include <algorithm>
++
+ namespace django::orm {
+ namespace {
+ 
+@@ -21,22 +23,177 @@ std::vector<std::string> split_lookup_sep(std::string_view key) {
+ 
+ }  // namespace
+ 
+-QuerySet::QuerySet(ModelId model, DialectId dialect) {
+-  query_.model = model;
+-  query_.dialect = dialect;
++QueryPlan::QueryPlan(ModelId model)
++    : model_(model),
++      schema_generation_(SchemaRegistry::instance().generation()) {}
++
++bool QueryPlan::matches_model(ModelId model) const {
++  return model_ && *model_ == model &&
++         schema_generation_ == SchemaRegistry::instance().generation() &&
++         SchemaRegistry::instance().get(model) != nullptr;
++}
++
++QueryPlan QueryPlan::with_filter(QNode filter) const {
++  Operation operation;
++  operation.kind = OperationKind::Filter;
++  operation.filter = std::move(filter);
++  return append(std::move(operation));
++}
++
++QueryPlan QueryPlan::with_simple_filter(
++    std::string lookup_field, bool lookup_in,
++    std::vector<ParamValue> lookup_values) const {
++  Operation operation;
++  operation.kind = OperationKind::Filter;
++  operation.simple_filter = true;
++  operation.lookup_field = std::move(lookup_field);
++  operation.lookup_in = lookup_in;
++  operation.filter.kind = 3;
++  operation.filter.key = operation.lookup_field;
++  if (lookup_in) {
++    operation.filter.key += "__in";
++  }
++  operation.filter.values = std::move(lookup_values);
++  return append(std::move(operation));
++}
++
++QueryPlan QueryPlan::with_ordering(
++    std::vector<std::string> field_names) const {
++  Operation operation;
++  operation.kind = OperationKind::OrderBy;
++  operation.names = std::move(field_names);
++  return append(std::move(operation));
++}
++
++QueryPlan QueryPlan::with_values(
++    std::vector<std::string> field_names) const {
++  Operation operation;
++  operation.kind = OperationKind::Values;
++  operation.names = std::move(field_names);
++  return append(std::move(operation));
++}
++
++QueryPlan QueryPlan::append(Operation operation) const {
++  QueryPlan out;
++  out.tail_ = std::make_shared<Node>(Node{std::move(operation), tail_});
++  out.model_ = model_;
++  out.schema_generation_ = schema_generation_;
++  return out;
++}
++
++std::vector<QueryPlan::Operation> QueryPlan::operations() const {
++  std::vector<Operation> out;
++  for (auto node = tail_; node; node = node->previous) {
++    out.push_back(node->operation);
++  }
++  std::reverse(out.begin(), out.end());
++  return out;
++}
++
++bool QueryPlan::has_only_projection() const {
++  if (!tail_) {
++    return false;
++  }
++  for (auto node = tail_; node; node = node->previous) {
++    if (node->operation.kind != OperationKind::Values) {
++      return false;
++    }
++  }
++  return true;
++}
++
++bool QueryPlan::has_simple_filter() const {
++  for (auto node = tail_; node; node = node->previous) {
++    if (node->operation.kind == OperationKind::Filter &&
++        node->operation.simple_filter) {
++      return true;
++    }
++  }
++  return false;
++}
++
++std::optional<QueryPlan::SimpleValuesShape> QueryPlan::simple_values_shape()
++    const {
++  SimpleValuesShape shape;
++  std::size_t filter_count = 0;
++  std::size_t projection_count = 0;
++  bool found_ordering = false;
++  for (auto node = tail_; node; node = node->previous) {
++    const auto& operation = node->operation;
++    switch (operation.kind) {
++      case OperationKind::Filter:
++        if (!operation.simple_filter) {
++          return std::nullopt;
++        }
++        ++filter_count;
++        shape.lookup_field = operation.lookup_field;
++        shape.lookup_in = operation.lookup_in;
++        shape.lookup_values = &operation.filter.values;
++        break;
++      case OperationKind::OrderBy:
++        // Traversal is newest to oldest; Django's latest order_by() wins.
++        if (!found_ordering) {
++          shape.ordering = operation.names;
++          found_ordering = true;
++        }
++        break;
++      case OperationKind::Values:
++        ++projection_count;
++        shape.fields = operation.names;
++        break;
++    }
++  }
++  if (filter_count != 1 || projection_count != 1 || shape.fields.empty() ||
++      shape.lookup_values == nullptr || shape.lookup_values->empty()) {
++    return std::nullopt;
++  }
++  return shape;
++}
++
++std::optional<QueryPlan::SimpleUpdateShape> QueryPlan::simple_update_shape()
++    const {
++  if (!tail_ || tail_->previous) {
++    return std::nullopt;
++  }
++  const auto& operation = tail_->operation;
++  if (operation.kind != OperationKind::Filter || !operation.simple_filter ||
++      operation.lookup_in || operation.filter.values.size() != 1) {
++    return std::nullopt;
++  }
++  return SimpleUpdateShape{operation.lookup_field,
++                           &operation.filter.values.front()};
++}
++
++QuerySet::QuerySet() : state_(std::make_shared<State>()) {}
++
++QuerySet::QuerySet(ModelId model, DialectId dialect) : QuerySet() {
++  q().model = model;
++  q().dialect = dialect;
+   const ModelSchema* m = SchemaRegistry::instance().get(model);
+   if (m) {
+-    query_.base_alias = m->db_table;
++    q().base_alias = m->db_table;
++  }
++}
++
++void QuerySet::detach() {
++  if (state_.use_count() != 1) {
++    state_ = std::make_shared<State>(*state_);
+   }
+ }
+ 
++QuerySet::State& QuerySet::s() {
++  detach();
++  state_->compiled.reset();
++  return *state_;
++}
++
+ QuerySet QuerySet::clone() const {
+   QuerySet c = *this;
+   return c;
+ }
+ 
+ std::optional<FieldId> QuerySet::resolve_field(std::string_view name) const {
+-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
++  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
+   if (!m) {
+     return std::nullopt;
+   }
+@@ -49,11 +206,11 @@ std::optional<FieldId> QuerySet::resolve_field(std::string_view name) const {
+ 
+ bool QuerySet::append_pred(Pred p) {
+   BoolExpr atom = bool_atom(std::move(p));
+-  if (!query_.has_where) {
+-    query_.where = std::move(atom);
+-    query_.has_where = true;
++  if (!q().has_where) {
++    q().where = std::move(atom);
++    q().has_where = true;
+   } else {
+-    bool_and_append(query_.where, std::move(atom));
++    bool_and_append(q().where, std::move(atom));
+   }
+   return true;
+ }
+@@ -93,7 +250,7 @@ bool QuerySet::filter_cmp(std::string_view field_name, CmpOp op, ParamValue valu
+   Pred p;
+   p.op = op;
+   p.lhs = col;
+-  p.param_idxs.push_back(query_.add_param(std::move(value)));
++  p.param_idxs.push_back(q().add_param(std::move(value)));
+   return append_pred(std::move(p));
+ }
+ 
+@@ -138,7 +295,7 @@ bool QuerySet::filter_in(std::string_view field_name,
+   p.op = CmpOp::In;
+   p.lhs = col;
+   for (auto& v : values) {
+-    p.param_idxs.push_back(query_.add_param(std::move(v)));
++    p.param_idxs.push_back(q().add_param(std::move(v)));
+   }
+   return append_pred(std::move(p));
+ }
+@@ -167,7 +324,7 @@ bool QuerySet::filter_subquery(std::string_view field_name, CmpOp op,
+     p.rhs_sql = std::move(subquery_sql);
+   }
+   for (auto& v : subquery_params) {
+-    p.rhs_sql_param_idxs.push_back(query_.add_param(std::move(v)));
++    p.rhs_sql_param_idxs.push_back(q().add_param(std::move(v)));
+   }
+   return append_pred(std::move(p));
+ }
+@@ -186,7 +343,7 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
+     return {};
+   }
+   std::string prefix(path_prefix);
+-  if (auto jt = join_aliases_.find(prefix); jt != join_aliases_.end()) {
++  if (auto jt = s().join_aliases.find(prefix); jt != s().join_aliases.end()) {
+     return jt->second;
+   }
+ 
+@@ -203,8 +360,8 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
+     if (rel.m2m_table.empty()) {
+       return {};
+     }
+-    std::string through_alias = "T" + std::to_string(++join_counter_);
+-    std::string remote_alias = "J" + std::to_string(++join_counter_);
++    std::string through_alias = "T" + std::to_string(++s().join_counter);
++    std::string remote_alias = "J" + std::to_string(++s().join_counter);
+     JoinEdge through;
+     through.type = join_type;
+     through.alias = through_alias;
+@@ -222,13 +379,13 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
+                               ? std::string("to_id")
+                               : rel.m2m_reverse_column;
+     remote.remote_column = remote_pk;
+-    query_.joins.push_back(std::move(through));
+-    query_.joins.push_back(std::move(remote));
+-    join_aliases_[prefix] = remote_alias;
++    q().joins.push_back(std::move(through));
++    q().joins.push_back(std::move(remote));
++    s().join_aliases[prefix] = remote_alias;
+     return remote_alias;
+   }
+ 
+-  std::string alias = "J" + std::to_string(++join_counter_);
++  std::string alias = "J" + std::to_string(++s().join_counter);
+   JoinEdge edge;
+   edge.type = join_type;
+   edge.alias = alias;
+@@ -243,8 +400,8 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
+     edge.local_column = rel.column;
+     edge.remote_column = remote_pk;
+   }
+-  query_.joins.push_back(std::move(edge));
+-  join_aliases_[prefix] = alias;
++  q().joins.push_back(std::move(edge));
++  s().join_aliases[prefix] = alias;
+   return alias;
+ }
+ 
+@@ -255,12 +412,12 @@ std::string QuerySet::ensure_path_joins(std::string_view path, JoinType join_typ
+     return {};
+   }
+   const SchemaRegistry& reg = SchemaRegistry::instance();
+-  const ModelSchema* current = reg.get(query_.model);
++  const ModelSchema* current = reg.get(q().model);
+   if (!current) {
+     return {};
+   }
+   std::string current_alias =
+-      query_.base_alias.empty() ? current->db_table : query_.base_alias;
++      q().base_alias.empty() ? current->db_table : q().base_alias;
+   std::string path_prefix;
+   for (std::size_t i = 0; i < parts.size(); ++i) {
+     if (!path_prefix.empty()) {
+@@ -318,12 +475,12 @@ bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& o
+   }
+ 
+   const SchemaRegistry& reg = SchemaRegistry::instance();
+-  const ModelSchema* current = reg.get(query_.model);
++  const ModelSchema* current = reg.get(q().model);
+   if (!current) {
+     return false;
+   }
+   std::string current_alias =
+-      query_.base_alias.empty() ? current->db_table : query_.base_alias;
++      q().base_alias.empty() ? current->db_table : q().base_alias;
+   std::string path_prefix;
+ 
+   for (std::size_t i = 0; i + 1 < path.size(); ++i) {
+@@ -410,7 +567,7 @@ std::optional<Pred> QuerySet::pred_from_key_values(
+     }
+     p.op = CmpOp::In;
+     for (const auto& v : values) {
+-      p.param_idxs.push_back(query_.add_param(v));
++      p.param_idxs.push_back(q().add_param(v));
+     }
+     return p;
+   }
+@@ -418,7 +575,7 @@ std::optional<Pred> QuerySet::pred_from_key_values(
+     return std::nullopt;
+   }
+   p.op = op;
+-  p.param_idxs.push_back(query_.add_param(values[0]));
++  p.param_idxs.push_back(q().add_param(values[0]));
+   return p;
+ }
+ 
+@@ -443,7 +600,7 @@ std::optional<Pred> QuerySet::pred_from_q_atom(const QNode& node) {
+       p.rhs_sql = "(" + node.rhs_sql + ")";
+     }
+     for (const auto& v : node.rhs_params) {
+-      p.rhs_sql_param_idxs.push_back(query_.add_param(v));
++      p.rhs_sql_param_idxs.push_back(q().add_param(v));
+     }
+     return p;
+   }
+@@ -466,13 +623,13 @@ bool QuerySet::filter_kwargs(
+   }
+   BoolExpr combined =
+       disjunctive ? bool_or(std::move(atoms)) : bool_and(std::move(atoms));
+-  if (!query_.has_where) {
+-    query_.where = std::move(combined);
+-    query_.has_where = true;
++  if (!q().has_where) {
++    q().where = std::move(combined);
++    q().has_where = true;
+   } else if (disjunctive) {
+-    bool_or_append(query_.where, std::move(combined));
++    bool_or_append(q().where, std::move(combined));
+   } else {
+-    bool_and_append(query_.where, std::move(combined));
++    bool_and_append(q().where, std::move(combined));
+   }
+   return true;
+ }
+@@ -531,26 +688,26 @@ bool QuerySet::apply_q(const QNode& node) {
+       node.kind == 0) {
+     return true;
+   }
+-  if (!query_.has_where) {
+-    query_.where = std::move(*expr);
+-    query_.has_where = true;
++  if (!q().has_where) {
++    q().where = std::move(*expr);
++    q().has_where = true;
+   } else {
+-    bool_and_append(query_.where, std::move(*expr));
++    bool_and_append(q().where, std::move(*expr));
+   }
+   return true;
+ }
+ 
+ bool QuerySet::values(const std::vector<std::string>& field_names, bool out_aliases,
+                       ResultMode mode) {
+-  query_.select.clear();
+-  query_.related_selects.clear();
+-  query_.base_attnames.clear();
+-  query_.result_mode = mode;
+-  query_.kind = StmtKind::Select;
++  q().select.clear();
++  q().related_selects.clear();
++  q().base_attnames.clear();
++  q().result_mode = mode;
++  q().kind = StmtKind::Select;
+   for (const auto& name : field_names) {
+     auto fid = resolve_field(name);
+     if (!fid) {
+-      query_.select.clear();
++      q().select.clear();
+       return false;
+     }
+     SelectItem it;
+@@ -558,39 +715,39 @@ bool QuerySet::values(const std::vector<std::string>& field_names, bool out_alia
+     if (out_aliases) {
+       it.out_alias = name;
+     }
+-    query_.select.push_back(std::move(it));
+-    query_.base_attnames.push_back(name);
++    q().select.push_back(std::move(it));
++    q().base_attnames.push_back(name);
+   }
+-  query_.base_select_count = static_cast<int>(query_.select.size());
++  q().base_select_count = static_cast<int>(q().select.size());
+   return true;
+ }
+ 
+ void QuerySet::clear_select() {
+-  query_.select.clear();
+-  query_.base_attnames.clear();
+-  query_.related_selects.clear();
+-  query_.base_select_count = 0;
+-  query_.kind = StmtKind::Select;
++  q().select.clear();
++  q().base_attnames.clear();
++  q().related_selects.clear();
++  q().base_select_count = 0;
++  q().kind = StmtKind::Select;
+ }
+ 
+ bool QuerySet::select_model_columns() {
+-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
++  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
+   if (!m) {
+     return false;
+   }
+   clear_select();
+-  query_.result_mode = ResultMode::Model;
++  q().result_mode = ResultMode::Model;
+   for (const auto& f : m->fields) {
+     if (f.column.empty()) {
+       continue;
+     }
+     SelectItem it;
+     it.col.field = f.id;
+-    query_.select.push_back(std::move(it));
+-    query_.base_attnames.push_back(f.attname.empty() ? f.name : f.attname);
++    q().select.push_back(std::move(it));
++    q().base_attnames.push_back(f.attname.empty() ? f.name : f.attname);
+   }
+-  query_.base_select_count = static_cast<int>(query_.select.size());
+-  return !query_.select.empty();
++  q().base_select_count = static_cast<int>(q().select.size());
++  return !q().select.empty();
+ }
+ 
+ bool QuerySet::annotate_aggregate(std::string alias, std::string func,
+@@ -615,7 +772,7 @@ bool QuerySet::annotate_aggregate(std::string alias, std::string func,
+     }
+     it.col = col;
+   }
+-  query_.select.push_back(std::move(it));
++  q().select.push_back(std::move(it));
+   return true;
+ }
+ 
+@@ -630,9 +787,9 @@ bool QuerySet::annotate_sql(std::string alias, std::string sql_fragment,
+     it.sql_fragment = std::move(sql_fragment);
+   }
+   for (auto& p : params) {
+-    it.fragment_param_idxs.push_back(query_.add_param(std::move(p)));
++    it.fragment_param_idxs.push_back(q().add_param(std::move(p)));
+   }
+-  query_.select.push_back(std::move(it));
++  q().select.push_back(std::move(it));
+   return true;
+ }
+ 
+@@ -648,15 +805,15 @@ bool QuerySet::group_by_fields(const std::vector<std::string>& field_names) {
+       }
+       col.field = *fid;
+     }
+-    query_.group_by.push_back(col);
++    q().group_by.push_back(col);
+   }
+   return true;
+ }
+ 
+-void QuerySet::group_by_selected_columns() { query_.group_by_all_selected = true; }
++void QuerySet::group_by_selected_columns() { q().group_by_all_selected = true; }
+ 
+ bool QuerySet::add_select_related(std::string_view path) {
+-  if (query_.select.empty()) {
++  if (q().select.empty()) {
+     if (!select_model_columns()) {
+       return false;
+     }
+@@ -671,7 +828,7 @@ bool QuerySet::add_select_related(std::string_view path) {
+   rs.path = std::string(path);
+   rs.join_alias = alias;
+   rs.model_id = remote->id;
+-  rs.select_offset = static_cast<int>(query_.select.size());
++  rs.select_offset = static_cast<int>(q().select.size());
+   for (const auto& f : remote->fields) {
+     if (f.column.empty()) {
+       continue;
+@@ -681,11 +838,11 @@ bool QuerySet::add_select_related(std::string_view path) {
+     it.col.table_alias = alias;
+     it.col.column_override = f.column;
+     it.col.field = 0;
+-    query_.select.push_back(std::move(it));
++    q().select.push_back(std::move(it));
+     rs.field_attnames.push_back(f.attname.empty() ? f.name : f.attname);
+   }
+   rs.select_count = static_cast<int>(rs.field_attnames.size());
+-  query_.related_selects.push_back(std::move(rs));
++  q().related_selects.push_back(std::move(rs));
+   return true;
+ }
+ 
+@@ -693,13 +850,13 @@ bool QuerySet::add_select_related_all(int max_depth) {
+   if (max_depth < 1) {
+     return false;
+   }
+-  if (query_.select.empty()) {
++  if (q().select.empty()) {
+     if (!select_model_columns()) {
+       return false;
+     }
+   }
+   const SchemaRegistry& reg = SchemaRegistry::instance();
+-  const ModelSchema* base = reg.get(query_.model);
++  const ModelSchema* base = reg.get(q().model);
+   if (!base) {
+     return false;
+   }
+@@ -710,7 +867,7 @@ bool QuerySet::add_select_related_all(int max_depth) {
+     int depth;
+   };
+   std::vector<Node> queue;
+-  queue.push_back({"", query_.model, 0});
++  queue.push_back({"", q().model, 0});
+   std::vector<std::string> paths;
+   std::size_t qi = 0;
+   while (qi < queue.size()) {
+@@ -749,7 +906,7 @@ bool QuerySet::add_select_related_all(int max_depth) {
+ 
+ bool QuerySet::add_prefetch(std::string_view lookup) {
+   const SchemaRegistry& reg = SchemaRegistry::instance();
+-  const ModelSchema* m = reg.get(query_.model);
++  const ModelSchema* m = reg.get(q().model);
+   if (!m) {
+     return false;
+   }
+@@ -790,7 +947,7 @@ bool QuerySet::add_prefetch(std::string_view lookup) {
+     if (p.parent_pk_column.empty()) {
+       p.parent_pk_column = "id";
+     }
+-    query_.prefetches.push_back(std::move(p));
++    q().prefetches.push_back(std::move(p));
+     any = true;
+ 
+     // Advance to remote model for next hop; parent_path accumulates.
+@@ -812,8 +969,8 @@ bool QuerySet::add_prefetch(std::string_view lookup) {
+ 
+ std::vector<QuerySet::AnnotationSelect> QuerySet::annotation_selects() const {
+   std::vector<AnnotationSelect> out;
+-  for (std::size_t i = 0; i < query_.select.size(); ++i) {
+-    const SelectItem& it = query_.select[i];
++  for (std::size_t i = 0; i < q().select.size(); ++i) {
++    const SelectItem& it = q().select[i];
+     if (it.out_alias.empty()) {
+       continue;
+     }
+@@ -863,7 +1020,7 @@ bool QuerySet::annotate_subquery_qs(std::string alias, const QuerySet& sub) {
+ bool QuerySet::annotate_case(
+     std::string alias, const std::vector<std::pair<QNode, ParamValue>>& cases,
+     bool has_else, ParamValue else_value) {
+-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
++  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
+   if (!m || cases.empty()) {
+     return false;
+   }
+@@ -875,29 +1032,29 @@ bool QuerySet::annotate_case(
+       return false;
+     }
+     frag += " WHEN ";
+-    append_bool_sql(frag, order, query_, *m, *when_expr);
++    append_bool_sql(frag, order, q(), *m, *when_expr);
+     frag += " THEN %s";
+-    order.push_back(query_.add_param(then_val));
++    order.push_back(q().add_param(then_val));
+   }
+   if (has_else) {
+     frag += " ELSE %s";
+-    order.push_back(query_.add_param(std::move(else_value)));
++    order.push_back(q().add_param(std::move(else_value)));
+   }
+   frag += " END";
+   // Convert order (param indices) into fragment_param_idxs — already absolute
+-  // indices into query_.params.
++  // indices into q().params.
+   SelectItem it;
+   it.kind = SelectKind::SqlFragment;
+   it.out_alias = std::move(alias);
+   it.sql_fragment = std::move(frag);
+   it.fragment_param_idxs = std::move(order);
+-  query_.select.push_back(std::move(it));
++  q().select.push_back(std::move(it));
+   return true;
+ }
+ 
+ bool QuerySet::annotate_binop(std::string alias, std::string lhs_field,
+                               std::string op, ParamValue rhs) {
+-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
++  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
+   if (!m) {
+     return false;
+   }
+@@ -912,7 +1069,7 @@ bool QuerySet::annotate_binop(std::string alias, std::string lhs_field,
+     col.field = *fid;
+   }
+   std::string frag;
+-  append_column_sql(frag, query_.dialect, query_, *m, col);
++  append_column_sql(frag, q().dialect, q(), *m, col);
+   frag += ' ';
+   frag += op;
+   frag += " %s";
+@@ -920,14 +1077,14 @@ bool QuerySet::annotate_binop(std::string alias, std::string lhs_field,
+   it.kind = SelectKind::SqlFragment;
+   it.out_alias = std::move(alias);
+   it.sql_fragment = std::move(frag);
+-  it.fragment_param_idxs.push_back(query_.add_param(std::move(rhs)));
+-  query_.select.push_back(std::move(it));
++  it.fragment_param_idxs.push_back(q().add_param(std::move(rhs)));
++  q().select.push_back(std::move(it));
+   return true;
+ }
+ 
+ bool QuerySet::annotate_binop_fields(std::string alias, std::string lhs_field,
+                                      std::string op, std::string rhs_field) {
+-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
++  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
+   if (!m) {
+     return false;
+   }
+@@ -949,16 +1106,16 @@ bool QuerySet::annotate_binop_fields(std::string alias, std::string lhs_field,
+     rcol.field = *fid;
+   }
+   std::string frag;
+-  append_column_sql(frag, query_.dialect, query_, *m, lcol);
++  append_column_sql(frag, q().dialect, q(), *m, lcol);
+   frag += ' ';
+   frag += op;
+   frag += ' ';
+-  append_column_sql(frag, query_.dialect, query_, *m, rcol);
++  append_column_sql(frag, q().dialect, q(), *m, rcol);
+   SelectItem it;
+   it.kind = SelectKind::SqlFragment;
+   it.out_alias = std::move(alias);
+   it.sql_fragment = std::move(frag);
+-  query_.select.push_back(std::move(it));
++  q().select.push_back(std::move(it));
+   return true;
+ }
+ 
+@@ -967,13 +1124,13 @@ bool QuerySet::annotate_value(std::string alias, ParamValue value) {
+   it.kind = SelectKind::SqlFragment;
+   it.out_alias = std::move(alias);
+   it.sql_fragment = "%s";
+-  it.fragment_param_idxs.push_back(query_.add_param(std::move(value)));
+-  query_.select.push_back(std::move(it));
++  it.fragment_param_idxs.push_back(q().add_param(std::move(value)));
++  q().select.push_back(std::move(it));
+   return true;
+ }
+ 
+ bool QuerySet::annotate_f(std::string alias, std::string field_name) {
+-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
++  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
+   if (!m) {
+     return false;
+   }
+@@ -988,12 +1145,12 @@ bool QuerySet::annotate_f(std::string alias, std::string field_name) {
+     col.field = *fid;
+   }
+   std::string frag;
+-  append_column_sql(frag, query_.dialect, query_, *m, col);
++  append_column_sql(frag, q().dialect, q(), *m, col);
+   SelectItem it;
+   it.kind = SelectKind::SqlFragment;
+   it.out_alias = std::move(alias);
+   it.sql_fragment = std::move(frag);
+-  query_.select.push_back(std::move(it));
++  q().select.push_back(std::move(it));
+   return true;
+ }
+ 
+@@ -1009,7 +1166,7 @@ QuerySet::PrefetchSql QuerySet::compile_prefetch_secondary(
+   if (!rid) {
+     return out;
+   }
+-  QuerySet sub(*rid, query_.dialect);
++  QuerySet sub(*rid, q().dialect);
+   if (!sub.select_model_columns()) {
+     return out;
+   }
+@@ -1103,11 +1260,11 @@ bool QuerySet::add_update(std::string_view field_name, ParamValue value) {
+   if (!fid) {
+     return false;
+   }
+-  query_.kind = StmtKind::Update;
++  q().kind = StmtKind::Update;
+   Assignment a;
+   a.field = *fid;
+-  a.param_idx = query_.add_param(std::move(value));
+-  query_.assignments.push_back(a);
++  a.param_idx = q().add_param(std::move(value));
++  q().assignments.push_back(a);
+   return true;
+ }
+ 
+@@ -1116,15 +1273,15 @@ bool QuerySet::add_update_null(std::string_view field_name) {
+   if (!fid) {
+     return false;
+   }
+-  query_.kind = StmtKind::Update;
++  q().kind = StmtKind::Update;
+   Assignment a;
+   a.field = *fid;
+   a.set_null = true;
+-  query_.assignments.push_back(a);
++  q().assignments.push_back(a);
+   return true;
+ }
+ 
+-void QuerySet::set_delete() { query_.kind = StmtKind::Delete; }
++void QuerySet::set_delete() { q().kind = StmtKind::Delete; }
+ 
+ bool QuerySet::order_by(std::string_view field_name, bool desc) {
+   auto fid = resolve_field(field_name);
+@@ -1138,13 +1295,13 @@ bool QuerySet::order_by(std::string_view field_name, bool desc) {
+     OrderItem o;
+     o.col = col;
+     o.desc = desc;
+-    query_.order_by.push_back(o);
++    q().order_by.push_back(o);
+     return true;
+   }
+   OrderItem o;
+   o.col.field = *fid;
+   o.desc = desc;
+-  query_.order_by.push_back(o);
++  q().order_by.push_back(o);
+   return true;
+ }
+ 
+@@ -1152,20 +1309,28 @@ bool QuerySet::order_by_alias(std::string_view alias, bool desc) {
+   OrderItem o;
+   o.alias = std::string(alias);
+   o.desc = desc;
+-  query_.order_by.push_back(o);
++  q().order_by.push_back(o);
+   return true;
+ }
+ 
+-void QuerySet::set_limit(std::uint64_t n) { query_.limit = n; }
+-void QuerySet::set_offset(std::uint64_t n) { query_.offset = n; }
++void QuerySet::clear_ordering() { q().order_by.clear(); }
++
++void QuerySet::set_limit(std::uint64_t n) { q().limit = n; }
++void QuerySet::set_offset(std::uint64_t n) { q().offset = n; }
+ void QuerySet::clear_limits() {
+-  query_.limit = std::nullopt;
+-  query_.offset = 0;
++  q().limit = std::nullopt;
++  q().offset = 0;
+ }
+-void QuerySet::set_distinct(bool v) { query_.distinct = v; }
++void QuerySet::set_distinct(bool v) { q().distinct = v; }
+ 
+ CompiledSql QuerySet::compile(const SchemaRegistry& reg) const {
+-  return compile_query(query_, reg);
++  const auto generation = reg.generation();
++  if (!state_->compiled || state_->compiled_schema_generation != generation) {
++    state_->compiled = compile_query(q(), reg);
++    state_->compiled_schema_generation = generation;
++    ++state_->compile_runs;
++  }
++  return *state_->compiled;
+ }
+ 
+ }  // namespace django::orm
+diff --git a/cpp/orm_engine/queryset.hpp b/cpp/orm_engine/queryset.hpp
+index c0b2927a8a..335fc8c0a9 100644
+--- a/cpp/orm_engine/queryset.hpp
++++ b/cpp/orm_engine/queryset.hpp
+@@ -6,6 +6,7 @@
+ #include "orm_engine/schema.hpp"
+ 
+ #include <optional>
++#include <memory>
+ #include <string>
+ #include <string_view>
+ #include <unordered_map>
+@@ -26,14 +27,80 @@ struct QNode {
+   int rhs_op = 0;  // CmpOp
+ };
+ 
++// Compact, Python-object-free replay state for QuerySet operations that the
++// native data plane owns. The Python QuerySet wrapper treats this as an
++// immutable value: every ``with_*`` operation returns a new tail, allowing
++// cloned Python QuerySets to share earlier nodes without mutating them.
++class QueryPlan {
++ public:
++  enum class OperationKind { Filter, OrderBy, Values };
++
++  struct Operation {
++    OperationKind kind = OperationKind::Filter;
++    QNode filter;
++    std::vector<std::string> names;
++    bool simple_filter = false;
++    std::string lookup_field;
++    bool lookup_in = false;
++  };
++
++  struct SimpleValuesShape {
++    std::vector<std::string> fields;
++    std::vector<std::string> ordering;
++    std::string lookup_field;
++    bool lookup_in = false;
++    const std::vector<ParamValue>* lookup_values = nullptr;
++  };
++
++  struct SimpleUpdateShape {
++    std::string lookup_field;
++    const ParamValue* lookup_value = nullptr;
++  };
++
++  QueryPlan() = default;
++  explicit QueryPlan(ModelId model);
++
++  [[nodiscard]] bool is_model_bound() const { return model_.has_value(); }
++  [[nodiscard]] bool matches_model(ModelId model) const;
++  [[nodiscard]] std::optional<ModelId> model_id() const { return model_; }
++
++  [[nodiscard]] QueryPlan with_filter(QNode filter) const;
++  [[nodiscard]] QueryPlan with_simple_filter(
++      std::string lookup_field, bool lookup_in,
++      std::vector<ParamValue> lookup_values) const;
++  [[nodiscard]] QueryPlan with_ordering(
++      std::vector<std::string> field_names) const;
++  [[nodiscard]] QueryPlan with_values(
++      std::vector<std::string> field_names) const;
++
++  [[nodiscard]] bool has_only_projection() const;
++  [[nodiscard]] bool has_simple_filter() const;
++  [[nodiscard]] std::optional<SimpleValuesShape> simple_values_shape() const;
++  [[nodiscard]] std::optional<SimpleUpdateShape> simple_update_shape() const;
++  // Materialized only for the compatibility replay path.
++  [[nodiscard]] std::vector<Operation> operations() const;
++
++ private:
++  struct Node {
++    Operation operation;
++    std::shared_ptr<const Node> previous;
++  };
++
++  std::shared_ptr<const Node> tail_;
++  std::optional<ModelId> model_;
++  std::uint64_t schema_generation_ = 0;
++
++  [[nodiscard]] QueryPlan append(Operation operation) const;
++};
++
+ class QuerySet {
+  public:
+-  QuerySet() = default;
++  QuerySet();
+   explicit QuerySet(ModelId model, DialectId dialect = DialectId::Postgres);
+ 
+-  [[nodiscard]] ModelId model_id() const { return query_.model; }
+-  [[nodiscard]] const Query& query() const { return query_; }
+-  Query& query_mut() { return query_; }
++  [[nodiscard]] ModelId model_id() const { return q().model; }
++  [[nodiscard]] const Query& query() const { return q(); }
++  Query& query_mut() { return q(); }
+ 
+   bool filter_eq(std::string_view field_name, ParamValue value);
+   bool filter_in(std::string_view field_name, std::vector<ParamValue> values);
+@@ -123,6 +190,7 @@ class QuerySet {
+ 
+   bool order_by(std::string_view field_name, bool desc);
+   bool order_by_alias(std::string_view alias, bool desc);
++  void clear_ordering();
+ 
+   void set_limit(std::uint64_t n);
+   void set_offset(std::uint64_t n);
+@@ -134,13 +202,13 @@ class QuerySet {
+ 
+   // Materialize helpers for Python
+   [[nodiscard]] std::vector<std::string> base_attnames() const {
+-    return query_.base_attnames;
++    return q().base_attnames;
+   }
+   [[nodiscard]] const std::vector<RelatedSelect>& related_selects() const {
+-    return query_.related_selects;
++    return q().related_selects;
+   }
+   [[nodiscard]] const std::vector<PrefetchSpec>& prefetches() const {
+-    return query_.prefetches;
++    return q().prefetches;
+   }
+   // Annotation aliases with select-list offsets for setattr on instances.
+   struct AnnotationSelect {
+@@ -150,11 +218,30 @@ class QuerySet {
+   [[nodiscard]] std::vector<AnnotationSelect> annotation_selects() const;
+ 
+   [[nodiscard]] QuerySet clone() const;
++  [[nodiscard]] bool shares_state_with(const QuerySet& other) const {
++    return state_ == other.state_;
++  }
++  [[nodiscard]] std::uint64_t compile_runs() const {
++    return state_->compile_runs;
++  }
+ 
+  private:
+-  Query query_{};
+-  std::uint32_t join_counter_ = 0;
+-  std::unordered_map<std::string, std::string> join_aliases_;
++  struct State {
++    Query query{};
++    std::uint32_t join_counter = 0;
++    std::unordered_map<std::string, std::string> join_aliases;
++    mutable std::optional<CompiledSql> compiled;
++    mutable std::uint64_t compiled_schema_generation = 0;
++    mutable std::uint64_t compile_runs = 0;
++  };
++
++  std::shared_ptr<State> state_;
++
++  void detach();
++  State& s();
++  [[nodiscard]] const State& s() const { return *state_; }
++  Query& q() { return s().query; }
++  [[nodiscard]] const Query& q() const { return s().query; }
+ 
+   [[nodiscard]] std::optional<FieldId> resolve_field(std::string_view name) const;
+   bool append_pred(Pred p);
+diff --git a/cpp/orm_engine/schema.cpp b/cpp/orm_engine/schema.cpp
+index 3246d7777d..fbb5b0d16b 100644
+--- a/cpp/orm_engine/schema.cpp
++++ b/cpp/orm_engine/schema.cpp
+@@ -31,6 +31,7 @@ SchemaRegistry& SchemaRegistry::instance() {
+ 
+ ModelId SchemaRegistry::register_model(ModelSchema schema) {
+   index_fields(schema);
++  ++generation_;
+   if (auto it = by_label_.find(schema.label); it != by_label_.end()) {
+     ModelId id = it->second;
+     schema.id = id;
+@@ -70,6 +71,7 @@ std::optional<ModelId> SchemaRegistry::find_id(std::string_view label) const {
+ void SchemaRegistry::clear() {
+   models_.clear();
+   by_label_.clear();
++  ++generation_;
+ }
+ 
+ FieldType field_type_from_class_name(std::string_view class_name) {
+@@ -79,11 +81,11 @@ FieldType field_type_from_class_name(std::string_view class_name) {
+   if (class_name == "BigAutoField") {
+     return FieldType::BigAuto;
+   }
+-  if (class_name == "IntegerField" || class_name == "PositiveIntegerField" ||
+-      class_name == "PositiveSmallIntegerField") {
++  if (class_name == "IntegerField" || class_name == "PositiveIntegerField") {
+     return FieldType::Integer;
+   }
+-  if (class_name == "SmallIntegerField") {
++  if (class_name == "SmallIntegerField" ||
++      class_name == "PositiveSmallIntegerField") {
+     return FieldType::SmallInteger;
+   }
+   if (class_name == "BigIntegerField" || class_name == "PositiveBigIntegerField") {
+@@ -142,4 +144,21 @@ RelKind rel_kind_from_string(std::string_view s) {
+   return RelKind::None;
+ }
+ 
++bool field_type_has_direct_primitive_prep(FieldType type) {
++  switch (type) {
++    case FieldType::Integer:
++    case FieldType::BigInteger:
++    case FieldType::SmallInteger:
++    case FieldType::Auto:
++    case FieldType::BigAuto:
++    case FieldType::Float:
++    case FieldType::Boolean:
++    case FieldType::Text:
++    case FieldType::Char:
++      return true;
++    default:
++      return false;
++  }
++}
++
+ }  // namespace django::orm
+diff --git a/cpp/orm_engine/schema.hpp b/cpp/orm_engine/schema.hpp
+index ecbeed07bc..127d9d0267 100644
+--- a/cpp/orm_engine/schema.hpp
++++ b/cpp/orm_engine/schema.hpp
+@@ -50,6 +50,11 @@ struct FieldSchema {
+   FieldType type = FieldType::Other;
+   bool primary_key = false;
+   bool nullable = false;
++  // True only when Django's exact built-in field class has identity/simple
++  // primitive preparation semantics. Custom subclasses deliberately remain
++  // false even when get_internal_type() reports a built-in type.
++  bool native_direct = false;
++  bool generated = false;
+ 
+   RelKind rel = RelKind::None;
+   std::string remote_table;
+@@ -63,6 +68,9 @@ struct FieldSchema {
+   std::string m2m_reverse_column;  // through col → remote model
+ 
+   [[nodiscard]] bool is_relation() const { return rel != RelKind::None; }
++  [[nodiscard]] bool is_native_scalar() const {
++    return native_direct && !generated && !is_relation() && !column.empty();
++  }
+ };
+ 
+ struct ModelSchema {
+@@ -84,15 +92,19 @@ class SchemaRegistry {
+   [[nodiscard]] const ModelSchema* get_by_label(std::string_view label) const;
+   [[nodiscard]] std::optional<ModelId> find_id(std::string_view label) const;
+ 
++  [[nodiscard]] std::uint64_t generation() const { return generation_; }
++
+   void clear();
+ 
+  private:
+   SchemaRegistry() = default;
+   std::vector<ModelSchema> models_;
+   std::unordered_map<std::string, ModelId> by_label_;
++  std::uint64_t generation_ = 0;
+ };
+ 
+ [[nodiscard]] FieldType field_type_from_class_name(std::string_view class_name);
+ [[nodiscard]] RelKind rel_kind_from_string(std::string_view s);
++[[nodiscard]] bool field_type_has_direct_primitive_prep(FieldType type);
+ 
+ }  // namespace django::orm
+diff --git a/django/apps/registry.py b/django/apps/registry.py
+index 7579fca758..df567e3004 100644
+--- a/django/apps/registry.py
++++ b/django/apps/registry.py
+@@ -124,6 +124,20 @@ class Apps:
+                 app_config.ready()
+ 
+             self.ready = True
++            # Native ORM schema export is a cold startup operation. Keeping it
++            # here avoids walking model._meta and rebuilding C++ schemas on
++            # every query. Unsupported/dynamic models still register lazily.
++            try:
++                from django.native._loader import AVAILABLE as native_available
++
++                if native_available:
++                    from django.native.orm import initialize_schema_registry
++
++                    initialize_schema_registry(self)
++            except Exception:
++                # Schema export is an optimization; never make app population
++                # fail when a third-party model exposes unusual metadata.
++                pass
+             self.ready_event.set()
+ 
+     def check_apps_ready(self):
+diff --git a/django/db/models/query.py b/django/db/models/query.py
+index fedb61ed5d..7c934a6271 100644
+--- a/django/db/models/query.py
++++ b/django/db/models/query.py
+@@ -4,7 +4,6 @@ The main QuerySet implementation. This provides the public API for the ORM.
+ 
+ import copy
+ import operator
+-import sys
+ import warnings
+ from contextlib import nullcontext
+ from functools import reduce
+@@ -35,6 +34,7 @@ from django.db.models.utils import (
+     create_namedtuple_class,
+     resolve_callables,
+ )
++from django.native._loader import AVAILABLE as _NATIVE_AVAILABLE
+ from django.utils import timezone
+ from django.utils.deprecation import RemovedInDjango70Warning
+ from django.utils.functional import cached_property
+@@ -47,13 +47,39 @@ REPR_OUTPUT_SIZE = 20
+ 
+ PROHIBITED_FILTER_KWARGS = frozenset(["_connector", "_negated"])
+ 
+-# Tier 1+: process-local SQL templates for simple SELECT/UPDATE fast paths.
+-# Keys vary by shape (eq/all/in/upd); values are interned SQL strings.
+-# Write-once per key after first use (reduces post-fork COW churn).
++# SQL templates used by the model-save fast path in django.db.models.base.
++# QuerySet terminal shapes use the generation-aware native cache instead.
+ _SIMPLE_SQL_CACHE = {}
+ _FAST_PATH_MISS = object()
+ 
+ 
++def _q_from_native_tree(node):
++    """Rebuild an equivalent Django Q object from a C++ QueryPlan node."""
++    kind = node["kind"]
++    if kind == "atom":
++        values = node.get("values", ())
++        key = node["key"]
++        if key.rsplit(LOOKUP_SEP, 1)[-1] == "in":
++            value = list(values)
++        elif len(values) == 1:
++            value = values[0]
++        else:
++            value = list(values)
++        return Q((key, value))
++
++    children = [_q_from_native_tree(child) for child in node.get("children", ())]
++    if kind == "not":
++        if len(children) != 1:
++            raise ValueError("native NOT plan must have exactly one child")
++        return ~children[0]
++    connector = Q.AND
++    if kind == "or":
++        connector = Q.OR
++    elif kind == "xor":
++        connector = Q.XOR
++    return Q(*children, _connector=connector)
++
++
+ class BaseIterable:
+     def __init__(
+         self, queryset, chunked_fetch=False, chunk_size=GET_ITERATOR_CHUNK_SIZE
+@@ -294,7 +320,15 @@ class QuerySet(AltersData):
+         self.model = model
+         self._db = using
+         self._hints = hints or {}
+-        self._query = query or sql.Query(self.model)
++        # Native-supported chains don't need Django's mutable Query graph.
++        # Leave it unallocated until introspection or a fallback operation
++        # actually needs it. The pure-Python configuration remains eager.
++        if query is not None:
++            self._query = query
++        elif _NATIVE_AVAILABLE:
++            self._query = None
++        else:
++            self._query = sql.Query(self.model)
+         self._result_cache = None
+         self._sticky_filter = False
+         self._for_write = False
+@@ -308,21 +342,33 @@ class QuerySet(AltersData):
+         # C++ ORM data-plane handle (optional). Poisoned via _native_disabled.
+         self._native_qs = None
+         self._native_disabled = False
++        # Supported native chains keep C++ as the authoritative query graph.
++        # QueryPlan owns replay strings and values without retaining Python
++        # dicts, tuples, Q objects, or Field objects.
++        self._native_authoritative = False
++        self._native_plan = None
+ 
+     @property
+     def query(self):
++        if self._native_authoritative:
++            self._native_materialize_python_query()
++        if self._query is None:
++            self._query = sql.Query(self.model)
+         if self._deferred_filter:
+             negate, args, kwargs = self._deferred_filter
+             self._filter_or_exclude_inplace(negate, args, kwargs)
+-            self._native_track_filter(negate, args, kwargs)
++            self._native_disabled = True
++            self._native_qs = None
+             self._deferred_filter = None
+         return self._query
+ 
+     @query.setter
+     def query(self, value):
+-        if value.values_select:
++        if value is not None and value.values_select:
+             self._iterable_class = ValuesIterable
+         self._query = value
++        self._native_authoritative = False
++        self._native_plan = None
+ 
+     def as_manager(cls):
+         # Address the circular dependency between `Queryset` and `Manager`.
+@@ -345,6 +391,9 @@ class QuerySet(AltersData):
+         for k, v in self.__dict__.items():
+             if k == "_result_cache":
+                 obj.__dict__[k] = None
++            elif k in {"_native_plan", "_native_qs"}:
++                # Both native wrappers use functional copy-on-write updates.
++                obj.__dict__[k] = v
+             else:
+                 obj.__dict__[k] = copy.deepcopy(v, memo)
+         return obj
+@@ -352,6 +401,10 @@ class QuerySet(AltersData):
+     def __getstate__(self):
+         # Force the cache to be fully populated.
+         self._fetch_all()
++        # Nanobind wrappers aren't part of Django's pickle contract. Replay
++        # the compact plan once and pickle the equivalent Python Query.
++        if self._native_authoritative:
++            self.query
+         return {**self.__dict__, DJANGO_VERSION_PICKLE_KEY: django.__version__}
+ 
+     def __setstate__(self, state):
+@@ -694,36 +747,48 @@ class QuerySet(AltersData):
+         return await sync_to_async(self.aggregate)(*args, **kwargs)
+ 
+     def _native_terminal_update(self, kwargs):
+-        handle = self._native_handle_for_sql()
+-        if handle is None or not kwargs:
++        if not kwargs:
+             return _FAST_PATH_MISS
+-        try:
+-            from django.native import orm as native_orm
++        connection = connections[self.db]
++        for name, value in kwargs.items():
++            if LOOKUP_SEP in name or hasattr(value, "resolve_expression"):
++                return _FAST_PATH_MISS
++        if self._native_qs is None and self._native_authoritative:
++            try:
++                from django.native import orm as native_orm
+ 
+-            connection = connections[self.db]
+-            qs = handle.clone()
+-            for name, value in kwargs.items():
+-                if LOOKUP_SEP in name or hasattr(value, "resolve_expression"):
+-                    return _FAST_PATH_MISS
+-                try:
+-                    field = self.model._meta.get_field(name)
+-                    prep = field.get_db_prep_save(value, connection)
+-                except Exception:
+-                    return _FAST_PATH_MISS
+-                if not qs.add_update(name, prep):
+-                    return _FAST_PATH_MISS
+-            sql, params = qs.compile_sql()
+-            if not sql:
++                compiled = native_orm.compile_query_plan_update(
++                    self.model,
++                    connection,
++                    self._native_plan,
++                    updates=kwargs,
++                )
++            except Exception:
++                return _FAST_PATH_MISS
++        else:
++            handle = self._native_handle_for_sql()
++            if handle is None:
+                 return _FAST_PATH_MISS
+-            with transaction.mark_for_rollback_on_error(using=self.db):
+-                with connection.cursor() as cursor:
+-                    cursor.execute(sql, params)
+-                    rowcount = cursor.rowcount
+-            if rowcount is None or rowcount < 0:
++            try:
++                compiled = handle.compile_update_kwargs(
++                    kwargs, native_orm._parameter_types_for_connection(connection)
++                )
++            except Exception:
+                 return _FAST_PATH_MISS
+-            return rowcount
+-        except Exception:
++        if compiled is None:
++            return _FAST_PATH_MISS
++        sql, params = compiled
++        if not sql:
++            return _FAST_PATH_MISS
++        # Once execution starts, propagate database errors. Retrying the stock
++        # compiler after an error can leave the surrounding transaction broken.
++        with transaction.mark_for_rollback_on_error(using=self.db):
++            with connection.cursor() as cursor:
++                cursor.execute(sql, params)
++                rowcount = cursor.rowcount
++        if rowcount is None or rowcount < 0:
+             return _FAST_PATH_MISS
++        return rowcount
+ 
+     def _native_terminal_aggregate(self, kwargs):
+         """
+@@ -764,12 +829,12 @@ class QuerySet(AltersData):
+                         field_name = name
+                     else:
+                         return _FAST_PATH_MISS
+-                if not qs.annotate_aggregate(
+-                    alias, func, field_name, distinct, star
+-                ):
++                if not qs.annotate_aggregate(alias, func, field_name, distinct, star):
+                     return _FAST_PATH_MISS
+                 aliases.append(alias)
+-            sql, params = qs.compile_sql()
++            sql, params = qs.compile_sql(
++                native_orm._parameter_types_for_connection(connection)
++            )
+             if not sql:
+                 return _FAST_PATH_MISS
+             row = native_orm.execute_fetchall(connection, sql, params)
+@@ -809,10 +874,15 @@ class QuerySet(AltersData):
+         Perform the query and return a single object matching the given
+         keyword arguments.
+         """
+-        if self.query.combinator and (args or kwargs):
++        if self._deferred_filter:
++            # Related-manager core filters must be part of eligibility checks
++            # and cannot be skipped by a native terminal.
++            self.query
++        combinator = self._query.combinator if self._query is not None else None
++        if combinator and (args or kwargs):
+             raise NotSupportedError(
+                 "Calling QuerySet.get(...) with filters after %s() is not "
+-                "supported." % self.query.combinator
++                "supported." % combinator
+             )
+         # Tier 1+ fast paths: simple values_list/model get without full compiler.
+         if not args and kwargs:
+@@ -862,6 +932,9 @@ class QuerySet(AltersData):
+             from django.native import orm as native_orm
+ 
+             connection = connections[self.db]
++            handle = handle.clone()
++            if not handle.set_ordering([]):
++                return _FAST_PATH_MISS
+             result = native_orm.materialize_models(
+                 self.model, connection, handle, limit=MAX_GET_RESULTS
+             )
+@@ -911,9 +984,10 @@ class QuerySet(AltersData):
+ 
+             connection = connections[self.db]
+             h = handle.clone()
+-            if self.query.is_sliced:
+-                low = self.query.low_mark or 0
+-                high = self.query.high_mark
++            query = self._query
++            if query is not None and query.is_sliced:
++                low = query.low_mark or 0
++                high = query.high_mark
+                 if high is not None:
+                     h.set_limit(int(high - low))
+                 if low:
+@@ -932,16 +1006,27 @@ class QuerySet(AltersData):
+ 
+     def _simple_base_eligible(self, *, require_empty_where=True):
+         """Shared guards for simple single-table SELECT fast paths."""
+-        query = self.query
++        if self._native_authoritative and not self._native_has_only_projection():
++            return False
++        if self.model._meta.parents or self.model._meta.ordering:
++            return False
++        query = self._query
++        if query is None:
++            return True
+         if (
+             query.combinator
+             or query.is_sliced
++            or query.is_empty()
+             or query.distinct
+             or query.distinct_fields
+             or query.select_for_update
++            or query.select_related
+             or query.group_by
+             or query.annotations
+             or query.extra
++            or query.extra_order_by
++            or query.deferred_loading != (frozenset(), True)
++            or query._filtered_relations
+             or len(query.alias_map) > 1
+         ):
+             return False
+@@ -960,8 +1045,15 @@ class QuerySet(AltersData):
+ 
+     def _resolve_select_columns(self, field_names):
+         """Return list of DB column names or None if any field is ineligible."""
++        fields = self._resolve_select_fields(field_names)
++        if fields is None:
++            return None
++        return [field.column for field in fields]
++
++    def _resolve_select_fields(self, field_names):
++        """Return concrete fields for a simple projection, or None."""
+         opts = self.model._meta
+-        cols = []
++        resolved = []
+         for name in field_names:
+             if not isinstance(name, str) or LOOKUP_SEP in name:
+                 return None
+@@ -971,8 +1063,8 @@ class QuerySet(AltersData):
+                 return None
+             if not getattr(f, "concrete", False) or not f.column:
+                 return None
+-            cols.append(f.column)
+-        return cols
++            resolved.append(f)
++        return tuple(resolved)
+ 
+     def _concrete_field_ok(self, field):
+         if field is None:
+@@ -983,18 +1075,6 @@ class QuerySet(AltersData):
+             return False
+         return bool(field.column)
+ 
+-    def _cached_simple_sql(self, cache_key, builder):
+-        sql = _SIMPLE_SQL_CACHE.get(cache_key)
+-        if sql is not None:
+-            return sql
+-        sql = builder()
+-        try:
+-            sql = sys.intern(sql)
+-        except TypeError:
+-            pass
+-        # setdefault: first writer wins; avoids duplicate dict entries under race.
+-        return _SIMPLE_SQL_CACHE.setdefault(cache_key, sql)
+-
+     def _fast_path_simple_get(self, kwargs):
+         """
+         Fast path for::
+@@ -1004,37 +1084,39 @@ class QuerySet(AltersData):
+ 
+         when the queryset has no prior filters/joins/annotations.
+         """
+-        if len(kwargs) != 1 or not self._simple_base_eligible():
++        simple_projection = (
++            self._native_authoritative
++            and self._native_qs is None
++            and self._native_has_only_projection()
++        )
++        if len(kwargs) != 1 or (
++            not simple_projection and not self._simple_base_eligible()
++        ):
+             return _FAST_PATH_MISS
+         lookup_name, value = next(iter(kwargs.items()))
+         if not isinstance(lookup_name, str) or LOOKUP_SEP in lookup_name:
+             return _FAST_PATH_MISS
+-        lookup_field = self._resolve_lookup_field(lookup_name)
+-        if not self._concrete_field_ok(lookup_field):
+-            return _FAST_PATH_MISS
+ 
+         # --- values_list / values tuple path ---
+         if self._fields is not None and self._iterable_class in (
+             ValuesListIterable,
+             FlatValuesListIterable,
+         ):
+-            select_columns = self._resolve_select_columns(self._fields)
+-            if not select_columns:
++            if not self._fields:
+                 return _FAST_PATH_MISS
+             return self._execute_simple_eq_get(
+-                select_columns, lookup_field, value, as_model=False
++                self._fields, lookup_name, value, as_model=False
+             )
+ 
+         # --- model instance path ---
+         if self._fields is None and issubclass(self._iterable_class, ModelIterable):
+             opts = self.model._meta
+-            select_columns = [f.column for f in opts.concrete_fields if f.column]
+             field_names = [f.attname for f in opts.concrete_fields if f.column]
+-            if not select_columns:
++            if not field_names:
+                 return _FAST_PATH_MISS
+             return self._execute_simple_eq_get(
+-                select_columns,
+-                lookup_field,
++                field_names,
++                lookup_name,
+                 value,
+                 as_model=True,
+                 model_field_names=field_names,
+@@ -1042,48 +1124,24 @@ class QuerySet(AltersData):
+         return _FAST_PATH_MISS
+ 
+     def _execute_simple_eq_get(
+-        self, select_columns, lookup_field, value, *, as_model, model_field_names=None
++        self, field_names, lookup_name, value, *, as_model, model_field_names=None
+     ):
+         db = self.db
+         connection = connections[db]
+         limit = MAX_GET_RESULTS
+-        try:
+-            param = lookup_field.get_db_prep_value(value, connection, prepared=False)
+-        except Exception:
+-            return _FAST_PATH_MISS
+-
+-        lookup_key = (
+-            "pk"
+-            if getattr(lookup_field, "primary_key", False)
+-            else lookup_field.attname
+-        )
+-        field_names = (
+-            list(self._fields)
+-            if self._fields is not None
+-            else list(model_field_names or [])
+-        )
+-
+         sql = None
+-        params = (param,)
++        params = ()
+         try:
+             from django.native import orm as native_orm
+ 
+-            if field_names:
+-                compiled = native_orm.compile_values_list_get(
+-                    self.model,
+-                    field_names=field_names,
+-                    lookup_field=lookup_key,
+-                    lookup_value=param,
+-                    limit=limit,
+-                    connection=connection,
+-                )
+-            else:
+-                compiled = native_orm.compile_select(
+-                    self.model,
+-                    connection,
+-                    kwargs={lookup_key: param},
+-                    limit=limit,
+-                )
++            compiled = native_orm.compile_values_list_get(
++                self.model,
++                field_names=field_names,
++                lookup_field=lookup_name,
++                lookup_value=value,
++                limit=limit,
++                connection=connection,
++            )
+             if compiled is not None:
+                 sql, param_list = compiled
+                 params = tuple(param_list)
+@@ -1116,6 +1174,20 @@ class QuerySet(AltersData):
+             return row[0]
+         return row
+ 
++    def _native_compile_deferred_simple_values(self, connection):
++        if (
++            self._native_plan is None
++            or self._native_qs is not None
++            or not self._native_authoritative
++            or self._fields is None
++        ):
++            return None
++        from django.native import orm as native_orm
++
++        return native_orm.compile_query_plan_values(
++            self.model, connection, self._native_plan
++        )
++
+     def _fast_path_simple_values_fetch(self):
+         """
+         Fast path for values()/values_list() via C++ data plane.
+@@ -1131,7 +1203,9 @@ class QuerySet(AltersData):
+             FlatValuesListIterable,
+         ):
+             return _FAST_PATH_MISS
+-        if not self._resolve_select_columns(self._fields):
++        if not self._native_authoritative and not self._resolve_select_columns(
++            self._fields
++        ):
+             return _FAST_PATH_MISS
+ 
+         db = self.db
+@@ -1139,33 +1213,38 @@ class QuerySet(AltersData):
+         try:
+             from django.native import orm as native_orm
+ 
+-            handle = self._native_handle_for_sql()
+-            if handle is not None:
+-                qs = handle.clone()
+-                flat = self._iterable_class is FlatValuesListIterable
+-                if not qs.values_list(list(self._fields), flat):
+-                    return _FAST_PATH_MISS
+-                if self.query.is_sliced:
+-                    # Respect high/low marks when set.
+-                    low = self.query.low_mark or 0
+-                    high = self.query.high_mark
+-                    if high is not None:
+-                        qs.set_limit(int(high - low))
+-                    if low:
+-                        qs.set_offset(int(low))
+-                sql, params = qs.compile_sql()
+-            elif self._simple_base_eligible():
+-                compiled = native_orm.compile_select(
+-                    self.model,
+-                    connection,
+-                    field_names=list(self._fields),
+-                    kwargs=None,
+-                )
+-                if compiled is None:
+-                    return _FAST_PATH_MISS
++            compiled = self._native_compile_deferred_simple_values(connection)
++            if compiled is not None:
+                 sql, params = compiled
+             else:
+-                return _FAST_PATH_MISS
++                handle = self._native_handle_for_sql()
++                if handle is not None:
++                    qs = handle
++                    query = self._query
++                    if query is not None and query.is_sliced:
++                        # Respect high/low marks when set.
++                        qs = handle.clone()
++                        low = query.low_mark or 0
++                        high = query.high_mark
++                        if high is not None:
++                            qs.set_limit(int(high - low))
++                        if low:
++                            qs.set_offset(int(low))
++                    sql, params = qs.compile_sql(
++                        native_orm._parameter_types_for_connection(connection)
++                    )
++                elif self._simple_base_eligible():
++                    compiled = native_orm.compile_select(
++                        self.model,
++                        connection,
++                        field_names=list(self._fields),
++                        kwargs=None,
++                    )
++                    if compiled is None:
++                        return _FAST_PATH_MISS
++                    sql, params = compiled
++                else:
++                    return _FAST_PATH_MISS
+             if not sql:
+                 return _FAST_PATH_MISS
+             rows = native_orm.execute_fetchall(connection, sql, params)
+@@ -1288,11 +1367,7 @@ class QuerySet(AltersData):
+                 lookup_field.get_db_prep_value(v, connection, prepared=False)
+                 for v in id_list
+             ]
+-            key = (
+-                "pk"
+-                if lookup_field.primary_key
+-                else lookup_field.attname
+-            ) + "__in"
++            key = ("pk" if lookup_field.primary_key else lookup_field.attname) + "__in"
+             from django.native import orm as native_orm
+ 
+             compiled = native_orm.compile_select(
+@@ -1701,7 +1776,9 @@ class QuerySet(AltersData):
+                 len(objs),
+             )
+         else:
+-            batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
++            batch_size = (
++                min(batch_size, max_batch_size) if batch_size else max_batch_size
++            )
+         requires_casting = connection.features.requires_casted_case_in_updates
+         if _native.AVAILABLE:
+             batches = (
+@@ -1709,7 +1786,9 @@ class QuerySet(AltersData):
+                 for start, end in _native.in_bulk_batch_ranges(len(objs), batch_size)
+             )
+         else:
+-            batches = (objs[i : i + batch_size] for i in range(0, len(objs), batch_size))
++            batches = (
++                objs[i : i + batch_size] for i in range(0, len(objs), batch_size)
++            )
+         updates = []
+         for batch_objs in batches:
+             update_kwargs = {}
+@@ -2180,34 +2259,22 @@ class QuerySet(AltersData):
+         Update all elements in the current QuerySet, setting all the given
+         fields to the appropriate values.
+         """
+-        from django import native as _native
+-
+-        if _native.AVAILABLE:
+-            code = _native.queryset_write_guard(
+-                bool(self.query.combinator),
+-                self.query.is_sliced,
+-                False,
+-                False,
+-            )
+-            if code == 1:
+-                self._not_support_combined_queries("update")
+-            elif code == 2:
+-                raise TypeError("Cannot update a query once a slice has been taken.")
+-        else:
++        query_state = self._query
++        if query_state is not None and query_state.combinator:
+             self._not_support_combined_queries("update")
+-            if self.query.is_sliced:
+-                raise TypeError("Cannot update a query once a slice has been taken.")
++        if query_state is not None and query_state.is_sliced:
++            raise TypeError("Cannot update a query once a slice has been taken.")
+         self._for_write = True
+-        # Single-row exact-lookup UPDATE without SQLCompiler when eligible.
+-        fast = self._fast_path_simple_filter_update(kwargs)
+-        if fast is not _FAST_PATH_MISS:
+-            self._result_cache = None
+-            return fast
+-        # Live native handle (filter/exclude wired) → full UPDATE compile.
++        # An authoritative native filter compiles all assignments in one hop.
+         native_upd = self._native_terminal_update(kwargs)
+         if native_upd is not _FAST_PATH_MISS:
+             self._result_cache = None
+             return native_upd
++        # Legacy mirrored single-row exact-lookup fast path.
++        fast = self._fast_path_simple_filter_update(kwargs)
++        if fast is not _FAST_PATH_MISS:
++            self._result_cache = None
++            return fast
+         query = self.query.chain(sql.UpdateQuery)
+         query.add_update_values(kwargs)
+ 
+@@ -2276,9 +2343,7 @@ class QuerySet(AltersData):
+         if self._result_cache is None:
+             return self.query.has_results(using=self.db)
+         if _native.AVAILABLE:
+-            return _native.queryset_exists_from_cache(
+-                True, bool(self._result_cache)
+-            )
++            return _native.queryset_exists_from_cache(True, bool(self._result_cache))
+         return bool(self._result_cache)
+ 
+     async def aexists(self):
+@@ -2381,13 +2446,62 @@ class QuerySet(AltersData):
+         clone.query.set_values(fields)
+         return clone
+ 
++    def _native_simple_values_projection(self, fields, iterable_class):
++        """Keep a concrete-field projection in the authoritative native plan."""
++        from django import native as _native
++
++        if (
++            not _native.AVAILABLE
++            or not fields
++            or not all(isinstance(field, str) for field in fields)
++            or len(set(fields)) != len(fields)
++        ):
++            return None
++        if not self._native_authoritative and not self._simple_base_eligible():
++            return None
++
++        clone = self._chain()
++        plan = clone._native_plan_candidate("values", fields)
++        if plan is None:
++            return None
++        clone._native_store_plan(plan)
++        clone._fields = tuple(fields)
++        handle = clone._native_qs
++        if handle is not None:
++            try:
++                if iterable_class is ValuesIterable:
++                    projected = handle.with_values(list(fields))
++                else:
++                    projected = handle.with_values_list(
++                        list(fields), iterable_class is FlatValuesListIterable
++                    )
++            except Exception:
++                projected = None
++            if projected is None:
++                clone._native_materialize_python_query()
++                clone._native_disabled = True
++                clone._native_qs = None
++                clone.query.set_values(fields)
++                clone._iterable_class = iterable_class
++                return clone
++            clone._native_qs = projected
++
++        clone._iterable_class = iterable_class
++        return clone
++
+     def values(self, *fields, **expressions):
++        if not expressions and fields:
++            native = self._native_simple_values_projection(fields, ValuesIterable)
++            if native is not None:
++                return native
+         fields += tuple(expressions)
+         clone = self._values(*fields, **expressions)
+         clone._iterable_class = ValuesIterable
+         return clone
+ 
+     def values_list(self, *fields, flat=False, named=False):
++        from django import native as _native
++
+         # Keep validation in pure Python (native hop was net-negative on hot paths).
+         if flat and named:
+             raise TypeError("'flat' and 'named' can't be used together.")
+@@ -2399,6 +2513,12 @@ class QuerySet(AltersData):
+         if flat and not fields:
+             fields = [self.model._meta.concrete_fields[0].attname]
+ 
++        if not named and fields and all(isinstance(field, str) for field in fields):
++            iterable_class = FlatValuesListIterable if flat else ValuesListIterable
++            native = self._native_simple_values_projection(fields, iterable_class)
++            if native is not None:
++                return native
++
+         field_names = {f: False for f in fields if not hasattr(f, "resolve_expression")}
+         _fields = []
+         expressions = {}
+@@ -2429,7 +2549,9 @@ class QuerySet(AltersData):
+                     if suffix.isdigit():
+                         counter = int(suffix) + 1
+                 else:
+-                    while (field_name := f"{field_name_prefix}{counter}") in field_names:
++                    while (
++                        field_name := f"{field_name_prefix}{counter}"
++                    ) in field_names:
+                         counter += 1
+             if expression is not None:
+                 expressions[field_name] = expression
+@@ -2566,45 +2688,49 @@ class QuerySet(AltersData):
+         return self._filter_or_exclude(True, args, kwargs)
+ 
+     def _filter_or_exclude(self, negate, args, kwargs):
+-        from django import native as _native
+-
+-        if _native.AVAILABLE:
+-            if _native.filter_after_slice_error(
+-                bool(args or kwargs), self.query.is_sliced
+-            ):
+-                raise TypeError("Cannot filter a query once a slice has been taken.")
+-        elif (args or kwargs) and self.query.is_sliced:
++        if (
++            (args or kwargs)
++            and self._query is not None
++            and self._query.is_sliced
++        ):
+             raise TypeError("Cannot filter a query once a slice has been taken.")
+         clone = self._chain()
+         if self._defer_next_filter:
+             self._defer_next_filter = False
+             clone._deferred_filter = negate, args, kwargs
+         else:
+-            clone._filter_or_exclude_inplace(negate, args, kwargs)
+-            clone._native_track_filter(negate, args, kwargs)
+-        return clone
+-
+-    def _filter_or_exclude_inplace(self, negate, args, kwargs):
+-        from django import native as _native
+-
+-        if _native.AVAILABLE:
+-            invalid_kwargs = _native.prohibited_filter_kwargs(list(kwargs.keys()))
++            invalid_kwargs = PROHIBITED_FILTER_KWARGS.intersection(kwargs)
+             if invalid_kwargs:
+-                invalid_kwargs_str = ", ".join(f"'{k}'" for k in invalid_kwargs)
++                invalid_kwargs_str = ", ".join(f"'{k}'" for k in sorted(invalid_kwargs))
+                 raise TypeError(
+                     f"The following kwargs are invalid: {invalid_kwargs_str}"
+                 )
+-        elif invalid_kwargs := PROHIBITED_FILTER_KWARGS.intersection(kwargs):
++            if not clone._native_defer_simple_filter(
++                negate, args, kwargs
++            ) and not clone._native_apply_filter(negate, args, kwargs):
++                clone._native_materialize_python_query()
++                clone._filter_or_exclude_inplace(negate, args, kwargs)
++                clone._native_disabled = True
++                clone._native_qs = None
++        return clone
++
++    def _filter_or_exclude_inplace(self, negate, args, kwargs):
++        if invalid_kwargs := PROHIBITED_FILTER_KWARGS.intersection(kwargs):
+             invalid_kwargs_str = ", ".join(f"'{k}'" for k in sorted(invalid_kwargs))
+             raise TypeError(f"The following kwargs are invalid: {invalid_kwargs_str}")
++        query = self._query
++        if query is None:
++            query = self._query = sql.Query(self.model)
+         if negate:
+-            self._query.add_q(~Q(*args, **kwargs))
++            query.add_q(~Q(*args, **kwargs))
+         else:
+-            self._query.add_q(Q(*args, **kwargs))
++            query.add_q(Q(*args, **kwargs))
+ 
+     def _native_eligible_for_dataplane(self):
+         """Query shapes the C++ data plane can still own."""
+-        query = self.query
++        query = self._query
++        if query is None:
++            return True
+         # Annotations/select_related may be owned by the native handle itself.
+         if (
+             query.combinator
+@@ -2615,52 +2741,213 @@ class QuerySet(AltersData):
+             return False
+         return True
+ 
+-    def _native_track_filter(self, negate, args, kwargs):
+-        """
+-        Mirror filter/exclude onto a C++ QuerySet handle when possible.
++    def _native_store_plan(self, plan):
++        if plan is None:
++            return False
++        self._native_plan = plan
++        self._native_authoritative = True
++        return True
+ 
+-        On miss, poison the handle so we never mix partial native state.
+-        """
+-        if getattr(self, "_native_disabled", False):
++    def _native_plan_candidate(self, operation, payload):
++        """Validate one operation against the registered C++ model schema."""
++        from django.native import orm as native_orm
++
++        orm = native_orm._orm()
++        if orm is None:
++            return None
++        plan = self._native_plan
++        if plan is not None:
++            if operation == "q":
++                return plan.with_q(payload)
++            if operation == "ordering":
++                return plan.with_ordering(payload)
++            if operation == "values":
++                return plan.with_values(payload)
++            return None
++        mid = native_orm.register_model_from_meta(self.model)
++        if mid is None:
++            return None
++        if operation == "q":
++            return orm.QueryPlan.for_q(int(mid), payload)
++        if operation == "ordering":
++            return orm.QueryPlan.for_ordering(int(mid), payload)
++        if operation == "values":
++            return orm.QueryPlan.for_values(int(mid), payload)
++        return None
++
++    def _native_plan_with_q(self, tree):
++        return self._native_store_plan(self._native_plan_candidate("q", tree))
++
++    def _native_plan_with_ordering(self, field_names):
++        return self._native_store_plan(
++            self._native_plan_candidate("ordering", field_names)
++        )
++
++    def _native_plan_with_values(self, fields):
++        return self._native_store_plan(
++            self._native_plan_candidate("values", fields)
++        )
++
++    def _native_materialize_python_query(self):
++        """Replay the compact native plan into a Python Query on demand."""
++        if not self._native_authoritative:
+             return
++        query = (
++            self._query.chain()
++            if self._query is not None
++            else sql.Query(self.model)
++        )
++        replay = self._native_plan.replay() if self._native_plan is not None else ()
++        for operation in replay:
++            kind = operation[0]
++            if kind == "filter":
++                query.add_q(_q_from_native_tree(operation[1]))
++            elif kind == "order_by":
++                query.clear_ordering(force=True, clear_default=False)
++                query.add_ordering(*operation[1])
++            elif kind == "values":
++                query.set_values(operation[1])
++        self._query = query
++        self._native_authoritative = False
++        self._native_plan = None
++        self._native_disabled = True
++        self._native_qs = None
++
++    def _native_has_only_projection(self):
++        return (
++            self._native_authoritative
++            and self._native_plan is not None
++            and self._native_plan.has_only_projection()
++        )
++
++    def _native_plan_has_simple_filter(self):
++        return (
++            self._native_authoritative
++            and self._native_plan is not None
++            and self._native_plan.has_simple_filter()
++        )
++
++    def _native_ordering_is_safe(self, field_names):
++        if self.model._meta.parents:
++            return False
++        for item in field_names:
++            if not isinstance(item, str) or item == "?":
++                return False
++            name = item.removeprefix("-")
++            if not name or LOOKUP_SEP in name:
++                return False
++        return True
++
++    def _native_defer_simple_filter(self, negate, args, kwargs):
++        """Keep one safe primitive exact/IN filter for a fused terminal call."""
++        if (
++            negate
++            or args
++            or len(kwargs) != 1
++            or self._native_authoritative
++            or self._native_qs is not None
++            or self._native_disabled
++            or self.model._meta.parents
++            or self.model._meta.ordering
++            or not self._simple_base_eligible()
++        ):
++            return False
++        try:
++            from django.native import orm as native_orm
++
++            orm = native_orm._orm()
++            if orm is None:
++                return False
++            key, value = next(iter(kwargs.items()))
++            if not isinstance(key, str):
++                return False
++            parts = key.split(LOOKUP_SEP)
++            lookup_in = len(parts) == 2 and parts[1] == "in"
++            if len(parts) != (2 if lookup_in else 1):
++                return False
++            if lookup_in:
++                if not isinstance(value, (list, tuple)) or not value:
++                    return False
++                values = tuple(value)
++            else:
++                values = (value,)
++            mid = native_orm.register_model_from_meta(self.model)
++            if mid is None:
++                return False
++            plan = orm.QueryPlan.for_simple_filter(
++                int(mid), parts[0], lookup_in, values
++            )
++            return self._native_store_plan(plan)
++        except Exception:
++            return False
++
++    def _native_apply_filter(self, negate, args, kwargs):
++        """Apply a filter to the authoritative C++ graph without Python Query."""
+         if not args and not kwargs:
+-            return
++            return True
++        if getattr(self, "_native_disabled", False):
++            return False
+         try:
+             from django.native import orm as native_orm
+ 
+-            if native_orm._orm() is None:
+-                self._native_disabled = True
+-                return
+-            if not self._native_eligible_for_dataplane():
+-                self._native_disabled = True
+-                self._native_qs = None
+-                return
++            orm = native_orm._orm()
++            if orm is None or not self._native_eligible_for_dataplane():
++                return False
++            if not self._native_authoritative and not self._simple_base_eligible():
++                return False
+             q_obj = Q(*args, **kwargs)
+             if negate:
+                 q_obj = ~q_obj
++            if self.model._meta.ordering:
++                return False
++            tree = native_orm.q_to_tree(q_obj)
++            if tree is None:
++                return False
++            plan = self._native_plan_candidate("q", tree)
++            if plan is None:
++                return False
+             handle = getattr(self, "_native_qs", None)
++            # A deferred simple filter has no C++ handle yet. Starting a new
++            # handle from only this Q object would silently omit that first
++            # predicate, so let the caller replay both filters into Python.
++            if handle is None and self._native_plan_has_simple_filter():
++                return False
+             if handle is None:
+-                handle = native_orm.build_queryset(
+-                    self.model, connections[self.db], q=q_obj
++                mid = native_orm.register_model_from_meta(self.model)
++                dialect = native_orm.dialect_for_connection(connections[self.db])
++                if mid is None or dialect is None:
++                    return False
++                handle = orm.QuerySet.create_from_native_q(
++                    int(mid), int(dialect), tree
+                 )
+                 if handle is None:
+-                    self._native_disabled = True
+-                    self._native_qs = None
+-                    return
++                    return False
++                # values()/values_list() may precede filter().
++                if self._fields is not None:
++                    if self._iterable_class is ValuesIterable:
++                        if not handle.values(list(self._fields)):
++                            return False
++                    elif self._iterable_class in (
++                        ValuesListIterable,
++                        FlatValuesListIterable,
++                    ):
++                        if not handle.values_list(
++                            list(self._fields),
++                            self._iterable_class is FlatValuesListIterable,
++                        ):
++                            return False
+                 self._native_qs = handle
+             else:
+-                cloned = handle.clone()
+-                if not native_orm.apply_q(cloned, q_obj):
+-                    self._native_disabled = True
+-                    self._native_qs = None
+-                    return
+-                self._native_qs = cloned
++                handle = handle.with_native_q(tree)
++                if handle is None:
++                    return False
++                self._native_qs = handle
++            return self._native_store_plan(plan)
+         except Exception:
+-            self._native_disabled = True
+-            self._native_qs = None
++            return False
+ 
+     def _native_handle_for_sql(self):
+-        if getattr(self, "_native_disabled", False):
++        if getattr(self, "_native_disabled", False) or not self._native_authoritative:
+             return None
+         handle = getattr(self, "_native_qs", None)
+         if handle is None:
+@@ -2801,16 +3088,10 @@ class QuerySet(AltersData):
+         obj = self._chain()
+         if fields == (None,):
+             obj.query.select_related = False
+-            if getattr(obj, "_native_qs", None) is not None:
+-                # Cannot clear joins easily; poison native for this branch.
+-                obj._native_disabled = True
+-                obj._native_qs = None
+         elif fields:
+             obj.query.add_select_related(fields)
+-            obj._native_track_select_related(fields)
+         else:
+             obj.query.select_related = True
+-            obj._native_track_select_related_all()
+         return obj
+ 
+     def _native_ensure_handle(self):
+@@ -2826,9 +3107,7 @@ class QuerySet(AltersData):
+             if handle is None:
+                 if not self._native_eligible_for_dataplane():
+                     return None
+-                handle = native_orm.build_queryset(
+-                    self.model, connections[self.db]
+-                )
++                handle = native_orm.build_queryset(self.model, connections[self.db])
+                 if handle is None:
+                     return None
+                 self._native_qs = handle
+@@ -2922,9 +3201,10 @@ class QuerySet(AltersData):
+                 elif isinstance(expr, Subquery):
+                     # Prefer fully native nested QuerySet when possible.
+                     sub_qs = getattr(expr, "queryset", None)
+-                    if sub_qs is not None and getattr(
+-                        sub_qs, "_native_qs", None
+-                    ) is not None:
++                    if (
++                        sub_qs is not None
++                        and getattr(sub_qs, "_native_qs", None) is not None
++                    ):
+                         if not h.annotate_subquery_qs(alias, sub_qs._native_qs):
+                             self._native_disabled = True
+                             self._native_qs = None
+@@ -3012,9 +3292,7 @@ class QuerySet(AltersData):
+                     lhs, rhs = expr.lhs, expr.rhs
+                     connector = expr.connector  # '+', '-', etc.
+                     if isinstance(lhs, F) and isinstance(rhs, Value):
+-                        ok = h.annotate_binop(
+-                            alias, lhs.name, connector, rhs.value
+-                        )
++                        ok = h.annotate_binop(alias, lhs.name, connector, rhs.value)
+                     elif isinstance(lhs, F) and isinstance(rhs, F):
+                         ok = h.annotate_binop_fields(
+                             alias, lhs.name, connector, rhs.name
+@@ -3045,55 +3323,22 @@ class QuerySet(AltersData):
+         When prefetch_related() is called more than once, append to the list of
+         prefetch lookups. If prefetch_related(None) is called, clear the list.
+         """
+-        from django import native as _native
+-
+         self._not_support_combined_queries("prefetch_related")
+         clone = self._chain()
+-        clear = (
+-            _native.clear_none_arg(lookups == (None,))
+-            if _native.AVAILABLE
+-            else lookups == (None,)
+-        )
+-        if clear:
++        if lookups == (None,):
+             clone._prefetch_related_lookups = ()
+-            if getattr(clone, "_native_qs", None) is not None:
+-                # Prefetch list cleared; leave handle otherwise intact.
+-                pass
+         else:
+             for lookup in lookups:
+                 if isinstance(lookup, Prefetch):
+                     lookup = lookup.prefetch_to
+-                if _native.AVAILABLE:
+-                    lookup = _native.lookup_head(str(lookup))
+-                else:
+-                    lookup = lookup.split(LOOKUP_SEP, 1)[0]
++                lookup = lookup.split(LOOKUP_SEP, 1)[0]
+                 if lookup in self.query._filtered_relations:
+                     raise ValueError(
+                         "prefetch_related() is not supported with FilteredRelation."
+                     )
+             clone._prefetch_related_lookups = clone._prefetch_related_lookups + lookups
+-            clone._native_track_prefetch(lookups)
+         return clone
+ 
+-    def _native_track_prefetch(self, lookups):
+-        if getattr(self, "_native_disabled", False):
+-            return
+-        try:
+-            h = self._native_ensure_handle()
+-            if h is None:
+-                return
+-            for lookup in lookups:
+-                if isinstance(lookup, Prefetch):
+-                    path = lookup.prefetch_to
+-                else:
+-                    path = str(lookup)
+-                # Full multi-hop path: C++ emits one PrefetchSpec per hop.
+-                if not h.add_prefetch(path):
+-                    # Leave Django prefetch list intact for fallback
+-                    continue
+-        except Exception:
+-            pass
+-
+     def annotate(self, *args, **kwargs):
+         """
+         Return a query set in which the returned objects have been annotated
+@@ -3132,7 +3377,6 @@ class QuerySet(AltersData):
+         annotations.update(kwargs)
+ 
+         clone = self._chain()
+-        clone._native_track_annotate(annotations, select=select)
+         names = self._fields
+         if names is None:
+             names = set(
+@@ -3180,12 +3424,50 @@ class QuerySet(AltersData):
+         """Return a new QuerySet instance with the ordering changed."""
+         from django import native as _native
+ 
+-        if _native.AVAILABLE:
+-            if _native.queryset_sliced_error(self.query.is_sliced):
+-                raise TypeError("Cannot reorder a query once a slice has been taken.")
+-        elif self.query.is_sliced:
++        if self._query is not None and self._query.is_sliced:
+             raise TypeError("Cannot reorder a query once a slice has been taken.")
+         obj = self._chain()
++        if _native.AVAILABLE and obj._native_ordering_is_safe(field_names):
++            if (
++                obj._native_qs is None
++                and obj._native_authoritative
++                and obj._native_plan_has_simple_filter()
++            ):
++                if obj._native_plan_with_ordering(field_names):
++                    return obj
++            try:
++                from django.native import orm as native_orm
++
++                handle = obj._native_qs
++                if handle is not None and not obj._native_authoritative:
++                    handle = None
++                if handle is None and obj._simple_base_eligible():
++                    handle = native_orm.build_queryset(obj.model, connections[obj.db])
++                    if handle is not None and obj._fields is not None:
++                        if obj._iterable_class is ValuesIterable:
++                            projected = handle.values(list(obj._fields))
++                        else:
++                            projected = handle.values_list(
++                                list(obj._fields),
++                                obj._iterable_class is FlatValuesListIterable,
++                            )
++                        if not projected:
++                            handle = None
++                ordered = (
++                    handle.with_ordering(list(field_names))
++                    if handle is not None
++                    else None
++                )
++                if ordered is not None:
++                    obj._native_qs = ordered
++                    if obj._native_plan_with_ordering(field_names):
++                        return obj
++            except Exception:
++                pass
++
++        obj._native_materialize_python_query()
++        obj._native_disabled = True
++        obj._native_qs = None
+         obj.query.clear_ordering(force=True, clear_default=False)
+         obj.query.add_ordering(*field_names)
+         return obj
+@@ -3265,9 +3547,7 @@ class QuerySet(AltersData):
+                 False, False, False, self._fields is not None
+             )
+             if code == 4:
+-                raise TypeError(
+-                    "Cannot call defer() after .values() or .values_list()"
+-                )
++                raise TypeError("Cannot call defer() after .values() or .values_list()")
+         elif self._fields is not None:
+             raise TypeError("Cannot call defer() after .values() or .values_list()")
+         clone = self._chain()
+@@ -3296,16 +3576,12 @@ class QuerySet(AltersData):
+                 False, False, False, self._fields is not None
+             )
+             if code == 4:
+-                raise TypeError(
+-                    "Cannot call only() after .values() or .values_list()"
+-                )
++                raise TypeError("Cannot call only() after .values() or .values_list()")
+             if _native.only_none_arg_error(fields == (None,)):
+                 raise TypeError("Cannot pass None as an argument to only().")
+         else:
+             if self._fields is not None:
+-                raise TypeError(
+-                    "Cannot call only() after .values() or .values_list()"
+-                )
++                raise TypeError("Cannot call only() after .values() or .values_list()")
+             if fields == (None,):
+                 # Can only pass None to defer(), not only(), as the rest option.
+                 # That won't stop people trying to do this, so let's be explicit.
+@@ -3476,14 +3752,8 @@ class QuerySet(AltersData):
+         Return a copy of the current QuerySet that's ready for another
+         operation.
+         """
+-        from django import native as _native
+-
+         obj = self._clone()
+-        if _native.AVAILABLE:
+-            if _native.sticky_filter_active(obj._sticky_filter):
+-                obj.query.filter_is_sticky = True
+-                obj._sticky_filter = False
+-        elif obj._sticky_filter:
++        if obj._sticky_filter:
+             obj.query.filter_is_sticky = True
+             obj._sticky_filter = False
+         return obj
+@@ -3493,11 +3763,20 @@ class QuerySet(AltersData):
+         Return a copy of the current QuerySet. A lightweight alternative
+         to deepcopy().
+         """
++        native_authoritative = getattr(self, "_native_authoritative", False)
++        if self._deferred_filter:
++            # Related managers deliberately defer their core filter until the
++            # Query is cloned. Preserve Django's property-access semantics.
++            query = self.query.chain()
++            native_authoritative = False
++        else:
++            query = (
++                self._query
++                if native_authoritative or self._query is None
++                else self.query.chain()
++            )
+         c = self.__class__(
+-            model=self.model,
+-            query=self.query.chain(),
+-            using=self._db,
+-            hints=self._hints,
++            model=self.model, query=query, using=self._db, hints=self._hints
+         )
+         c._sticky_filter = self._sticky_filter
+         c._for_write = self._for_write
+@@ -3505,19 +3784,17 @@ class QuerySet(AltersData):
+         c._known_related_objects = self._known_related_objects
+         c._iterable_class = self._iterable_class
+         c._fields = self._fields
+-        # Native data-plane handle (cloned; mutations must not alias parent).
++        # Native mutations are functional COW operations, so cloning the
++        # Python QuerySet can share this wrapper without a native crossing.
+         parent_native = getattr(self, "_native_qs", None)
+         if parent_native is not None:
+-            try:
+-                c._native_qs = parent_native.clone()
+-            except Exception:
+-                c._native_qs = None
+-                c._native_disabled = True
+-            else:
+-                c._native_disabled = getattr(self, "_native_disabled", False)
++            c._native_qs = parent_native
++            c._native_disabled = getattr(self, "_native_disabled", False)
+         else:
+             c._native_qs = None
+             c._native_disabled = getattr(self, "_native_disabled", False)
++        c._native_authoritative = native_authoritative
++        c._native_plan = getattr(self, "_native_plan", None)
+         return c
+ 
+     def _fetch_all(self):
+@@ -3606,10 +3883,11 @@ class QuerySet(AltersData):
+             )
+ 
+     def _not_support_combined_queries(self, operation_name):
+-        if self.query.combinator:
++        combinator = self._query.combinator if self._query is not None else None
++        if combinator:
+             raise NotSupportedError(
+                 "Calling QuerySet.%s() after %s() is not supported."
+-                % (operation_name, self.query.combinator)
++                % (operation_name, combinator)
+             )
+ 
+     def _check_operator_queryset(self, other, operator_):
+diff --git a/django/native/orm.py b/django/native/orm.py
+index 48c8748d61..b6c5909749 100644
+--- a/django/native/orm.py
++++ b/django/native/orm.py
+@@ -8,6 +8,7 @@ runs execute/materialize in few crossings.
+ 
+ from __future__ import annotations
+ 
++import threading
+ from typing import Any
+ 
+ from django.native._loader import AVAILABLE, get_native_module
+@@ -18,29 +19,79 @@ __all__ = [
+     "build_queryset",
+     "clear_schema",
+     "compile_delete",
++    "compile_query_plan_update",
++    "compile_query_plan_values",
+     "compile_select",
++    "compile_simple_update",
++    "compile_simple_values_filter",
+     "compile_update",
+     "compile_values_list_get",
+     "execute_fetchall",
+     "execute_fetchone_pair",
+     "export_model",
++    "initialize_schema_registry",
+     "model_id",
+     "q_to_tree",
+     "register_model_from_meta",
+ ]
+ 
+ 
++_IMPL = get_native_module()
++_ORM = getattr(_IMPL, "orm", None) if _IMPL is not None else None
++_MODEL_CACHE_ATTR = "_django_native_orm_model_id"
++_schema_generation = 0
++_schema_lock = threading.RLock()
++_dialect_cache: dict[str, int] = {}
++_ADAPTER_TYPES_UNSET = object()
++_postgresql_integer_types = _ADAPTER_TYPES_UNSET
++
++# These exact Django classes have preparation semantics that can be reproduced
++# by the native primitive binder without calling a Python Field hook. Class
++# identity is intentional: a custom IntegerField subclass may override
++# get_prep_value(), get_db_prep_value(), or from_db_value().
++_DIRECT_FIELD_CLASS_NAMES = frozenset(
++    {
++        "AutoField",
++        "BigAutoField",
++        "SmallAutoField",
++        "IntegerField",
++        "BigIntegerField",
++        "SmallIntegerField",
++        "PositiveIntegerField",
++        "PositiveBigIntegerField",
++        "PositiveSmallIntegerField",
++        "FloatField",
++        "BooleanField",
++        "CharField",
++        "TextField",
++    }
++)
++
++
++def _field_supports_direct_primitive_prep(field) -> bool:
++    cls = field.__class__
++    return (
++        cls.__module__ == "django.db.models.fields"
++        and cls.__name__ in _DIRECT_FIELD_CLASS_NAMES
++        and not field.is_relation
++        and not field.generated
++    )
++
++
+ def _orm():
+-    impl = get_native_module()
+-    if impl is None:
+-        return None
+-    return getattr(impl, "orm", None)
++    return _ORM
+ 
+ 
+ def clear_schema() -> None:
++    global _postgresql_integer_types, _schema_generation
++
+     orm = _orm()
+     if orm is not None:
+-        orm.clear_schema()
++        with _schema_lock:
++            orm.clear_schema()
++            _schema_generation += 1
++            _dialect_cache.clear()
++            _postgresql_integer_types = _ADAPTER_TYPES_UNSET
+ 
+ 
+ def model_id(label: str) -> int | None:
+@@ -65,6 +116,8 @@ def _field_row(
+     m2m_column="",
+     m2m_reverse="",
+     remote_fk_column="",
++    native_direct=False,
++    generated=False,
+ ):
+     return (
+         name,
+@@ -81,164 +134,226 @@ def _field_row(
+         m2m_column or "",
+         m2m_reverse or "",
+         remote_fk_column or "",
++        bool(native_direct),
++        bool(generated),
+     )
+ 
+ 
+-def register_model_from_meta(model, _seen: set | None = None) -> int | None:
++def register_model_from_meta(
++    model, _seen: set | None = None, *, force: bool = False
++) -> int | None:
+     """
+     Snapshot model._meta into the C++ SchemaRegistry.
+ 
+     Includes forward FK, reverse FK, and M2M relation hops. Recursively
+     exports related models for multi-hop joins.
+     """
++    cached = getattr(model, _MODEL_CACHE_ATTR, None)
++    if not force and cached is not None and cached[0] == _schema_generation:
++        return cached[1]
++
+     orm = _orm()
+     if orm is None:
+         return None
+-    if _seen is None:
+-        _seen = set()
+-    opts = model._meta
+-    label = f"{opts.app_label}.{opts.object_name}"
+-    if label in _seen:
+-        return model_id(label)
+-    _seen.add(label)
+-
+-    fields = []
+-
+-    # Concrete local fields (columns + forward FK).
+-    for f in opts.concrete_fields:
+-        if not f.column:
+-            continue
+-        remote_table = remote_pk = remote_label = rel_kind = ""
+-        if f.is_relation and (f.many_to_one or f.one_to_one):
+-            try:
+-                remote_model = f.remote_field.model
+-                register_model_from_meta(remote_model, _seen)
+-                remote = remote_model._meta
+-                remote_table = remote.db_table
+-                remote_pk = remote.pk.column
+-                remote_label = f"{remote.app_label}.{remote.object_name}"
+-                rel_kind = "fk"
+-            except Exception:
+-                pass
+-        fields.append(
+-            _field_row(
+-                f.name,
+-                f.attname,
+-                f.column,
+-                f.__class__.__name__,
+-                f.primary_key,
+-                f.null,
+-                remote_table,
+-                remote_pk,
+-                remote_label,
+-                rel_kind,
+-            )
+-        )
+-
+-    # Forward M2M (not auto-created reverse side).
+-    for f in opts.many_to_many:
+-        if f.auto_created:
+-            continue
+-        try:
+-            remote_model = f.remote_field.model
+-            register_model_from_meta(remote_model, _seen)
+-            remote = remote_model._meta
+-            through = f.remote_field.through._meta
+-            # Columns on through pointing to each side.
+-            m2m_column = f.m2m_column_name()
+-            m2m_reverse = f.m2m_reverse_name()
++    with _schema_lock:
++        cached = getattr(model, _MODEL_CACHE_ATTR, None)
++        if not force and cached is not None and cached[0] == _schema_generation:
++            return cached[1]
++        if _seen is None:
++            _seen = set()
++        opts = model._meta
++        label = f"{opts.app_label}.{opts.object_name}"
++        if label in _seen:
++            return model_id(label)
++        _seen.add(label)
++
++        fields = []
++
++        # Concrete local fields (columns + forward FK).
++        for f in opts.concrete_fields:
++            if not f.column:
++                continue
++            remote_table = remote_pk = remote_label = rel_kind = ""
++            if f.is_relation and (f.many_to_one or f.one_to_one):
++                try:
++                    remote_model = f.remote_field.model
++                    register_model_from_meta(remote_model, _seen, force=force)
++                    remote = remote_model._meta
++                    remote_table = remote.db_table
++                    remote_pk = remote.pk.column
++                    remote_label = f"{remote.app_label}.{remote.object_name}"
++                    rel_kind = "fk"
++                except Exception:
++                    pass
+             fields.append(
+                 _field_row(
+                     f.name,
+-                    f.name,
+-                    "",
+-                    "ManyToManyField",
+-                    False,
+-                    True,
+-                    remote.db_table,
+-                    remote.pk.column,
+-                    f"{remote.app_label}.{remote.object_name}",
+-                    "m2m",
+-                    through.db_table,
+-                    m2m_column,
+-                    m2m_reverse,
+-                    "",
++                    f.attname,
++                    f.column,
++                    f.__class__.__name__,
++                    f.primary_key,
++                    f.null,
++                    remote_table,
++                    remote_pk,
++                    remote_label,
++                    rel_kind,
++                    native_direct=_field_supports_direct_primitive_prep(f),
++                    generated=f.generated,
+                 )
+             )
+-        except Exception:
+-            continue
+ 
+-    # Reverse relations (reverse FK and reverse M2M).
+-    for rel in opts.related_objects:
+-        accessor = rel.get_accessor_name()
+-        if not accessor:
+-            continue
+-        try:
+-            remote_model = rel.related_model
+-            register_model_from_meta(remote_model, _seen)
+-            remote = remote_model._meta
+-            remote_label = f"{remote.app_label}.{remote.object_name}"
+-            if rel.many_to_many:
+-                # Reverse M2M: through from the field on the other side.
+-                field = rel.field
+-                through = field.remote_field.through._meta
+-                # From this model, through column to us is m2m_reverse_name on
+-                # the forward field, and to remote is m2m_column_name.
+-                m2m_column = field.m2m_reverse_name()
+-                m2m_reverse = field.m2m_column_name()
++        # Forward M2M (not auto-created reverse side).
++        for f in opts.many_to_many:
++            if f.auto_created:
++                continue
++            try:
++                remote_model = f.remote_field.model
++                register_model_from_meta(remote_model, _seen, force=force)
++                remote = remote_model._meta
++                through = f.remote_field.through._meta
++                # Columns on through pointing to each side.
++                m2m_column = f.m2m_column_name()
++                m2m_reverse = f.m2m_reverse_name()
+                 fields.append(
+                     _field_row(
+-                        accessor,
+-                        accessor,
++                        f.name,
++                        f.name,
+                         "",
+-                        "ManyToManyRel",
++                        "ManyToManyField",
+                         False,
+                         True,
+                         remote.db_table,
+                         remote.pk.column,
+-                        remote_label,
+-                        "rev_m2m",
++                        f"{remote.app_label}.{remote.object_name}",
++                        "m2m",
+                         through.db_table,
+                         m2m_column,
+                         m2m_reverse,
+                         "",
+                     )
+                 )
+-            else:
+-                # Reverse FK / O2O
+-                fields.append(
+-                    _field_row(
+-                        accessor,
+-                        accessor,
+-                        "",
+-                        "ManyToOneRel",
+-                        False,
+-                        True,
+-                        remote.db_table,
+-                        remote.pk.column,
+-                        remote_label,
+-                        "rev_fk",
+-                        "",
+-                        "",
+-                        "",
+-                        rel.field.column,
++            except Exception:
++                continue
++
++        # Reverse relations (reverse FK and reverse M2M).
++        for rel in opts.related_objects:
++            accessor = rel.get_accessor_name()
++            if not accessor:
++                continue
++            try:
++                remote_model = rel.related_model
++                register_model_from_meta(remote_model, _seen, force=force)
++                remote = remote_model._meta
++                remote_label = f"{remote.app_label}.{remote.object_name}"
++                if rel.many_to_many:
++                    # Reverse M2M: through from the field on the other side.
++                    field = rel.field
++                    through = field.remote_field.through._meta
++                    # From this model, through column to us is
++                    # m2m_reverse_name on the forward field, and to remote is
++                    # m2m_column_name.
++                    m2m_column = field.m2m_reverse_name()
++                    m2m_reverse = field.m2m_column_name()
++                    fields.append(
++                        _field_row(
++                            accessor,
++                            accessor,
++                            "",
++                            "ManyToManyRel",
++                            False,
++                            True,
++                            remote.db_table,
++                            remote.pk.column,
++                            remote_label,
++                            "rev_m2m",
++                            through.db_table,
++                            m2m_column,
++                            m2m_reverse,
++                            "",
++                        )
+                     )
+-                )
+-        except Exception:
+-            continue
++                else:
++                    # Reverse FK / O2O.
++                    fields.append(
++                        _field_row(
++                            accessor,
++                            accessor,
++                            "",
++                            "ManyToOneRel",
++                            False,
++                            True,
++                            remote.db_table,
++                            remote.pk.column,
++                            remote_label,
++                            "rev_fk",
++                            "",
++                            "",
++                            "",
++                            rel.field.column,
++                        )
++                    )
++            except Exception:
++                continue
+ 
+-    return orm.register_model(label, opts.db_table, fields)
++        mid = orm.register_model(label, opts.db_table, fields)
++        setattr(model, _MODEL_CACHE_ATTR, (_schema_generation, int(mid)))
++        return int(mid)
+ 
+ 
+ def export_model(model) -> int | None:
+     return register_model_from_meta(model)
+ 
+ 
++def initialize_schema_registry(apps_registry=None) -> None:
++    """Export installed models once after the app registry is ready."""
++    if _orm() is None:
++        return
++    if apps_registry is None:
++        from django.apps import apps as apps_registry
++
++    for model in apps_registry.get_models(include_auto_created=True):
++        register_model_from_meta(model)
++
++
+ def dialect_for_connection(connection) -> int | None:
+     orm = _orm()
+     if orm is None:
+         return None
+-    return int(orm.dialect_from_vendor(connection.vendor))
++    vendor = connection.vendor
++    dialect = _dialect_cache.get(vendor)
++    if dialect is not None:
++        return dialect
++    if vendor in ("postgresql", "postgres"):
++        dialect = int(orm.DIALECT_POSTGRES)
++    elif vendor in ("mysql", "mariadb"):
++        dialect = int(orm.DIALECT_MYSQL)
++    else:
++        dialect = int(orm.DIALECT_SQLITE)
++    _dialect_cache[vendor] = dialect
++    return dialect
++
++
++def _parameter_types_for_connection(connection):
++    """Return cached psycopg integer wrapper types for native parameter output."""
++    if connection.vendor not in ("postgresql", "postgres"):
++        return None
++    global _postgresql_integer_types
++    if _postgresql_integer_types is _ADAPTER_TYPES_UNSET:
++        type_map = getattr(connection.ops, "integerfield_type_map", None)
++        if type_map is None:
++            # psycopg2 and nonstandard PostgreSQL backends don't use the
++            # psycopg 3 integer wrapper classes.
++            _postgresql_integer_types = None
++        else:
++            try:
++                _postgresql_integer_types = (
++                    type_map["SmallIntegerField"],
++                    type_map["IntegerField"],
++                    type_map["BigIntegerField"],
++                )
++            except (KeyError, TypeError):
++                _postgresql_integer_types = None
++    return _postgresql_integer_types
+ 
+ 
+ def q_to_tree(node) -> dict | None:
+@@ -313,10 +428,15 @@ def build_queryset(
+     dialect = dialect_for_connection(connection)
+     if dialect is None:
+         return None
+-    qs = orm.QuerySet.create(int(mid), int(dialect))
+     if q is not None:
+-        if not apply_q(qs, q):
++        tree = q_to_tree(q)
++        if tree is None:
++            return None
++        qs = orm.QuerySet.create_from_q(int(mid), int(dialect), tree)
++        if qs is None:
+             return None
++    else:
++        qs = orm.QuerySet.create(int(mid), int(dialect))
+     if kwargs:
+         payload = {}
+         for k, v in kwargs.items():
+@@ -337,16 +457,137 @@ def compile_values_list_get(
+     limit: int,
+     connection,
+ ) -> tuple[str, list] | None:
+-    qs = build_queryset(model, connection, kwargs={lookup_field: lookup_value})
+-    if qs is None:
++    orm = _orm()
++    if orm is None:
+         return None
+-    if field_names and not qs.values_list(list(field_names), False):
++    mid = register_model_from_meta(model)
++    dialect = dialect_for_connection(connection)
++    if mid is None or dialect is None or not field_names:
+         return None
+-    qs.set_limit(int(limit))
+-    sql, params = qs.compile_sql()
+-    if not sql:
++    compiled = orm.compile_simple_values_get(
++        int(mid),
++        int(dialect),
++        field_names,
++        lookup_field,
++        lookup_value,
++        int(limit),
++        _parameter_types_for_connection(connection),
++    )
++    if compiled is None:
+         return None
+-    return sql, list(params)
++    return compiled
++
++
++def compile_simple_values_filter(
++    model,
++    connection,
++    *,
++    field_names,
++    lookup_field: str,
++    lookup_values,
++    lookup_in: bool,
++    ordering_names=(),
++    limit: int = 0,
++    offset: int = 0,
++) -> tuple[str, list] | None:
++    """Compile a single-table exact/IN projection in one native call."""
++    orm = _orm()
++    if orm is None or not field_names or not lookup_values:
++        return None
++    mid = register_model_from_meta(model)
++    dialect = dialect_for_connection(connection)
++    if mid is None or dialect is None:
++        return None
++    return orm.compile_simple_values_filter(
++        int(mid),
++        int(dialect),
++        field_names,
++        lookup_field,
++        bool(lookup_in),
++        lookup_values,
++        ordering_names,
++        int(limit),
++        int(offset),
++        _parameter_types_for_connection(connection),
++    )
++
++
++def compile_simple_update(
++    model,
++    connection,
++    *,
++    lookup_field: str,
++    lookup_value,
++    update_names,
++    update_values,
++) -> tuple[str, list] | None:
++    """Compile one exact filter and all assignments in one native call."""
++    orm = _orm()
++    if orm is None or not update_names:
++        return None
++    mid = register_model_from_meta(model)
++    dialect = dialect_for_connection(connection)
++    if mid is None or dialect is None:
++        return None
++    return orm.compile_simple_update(
++        int(mid),
++        int(dialect),
++        lookup_field,
++        lookup_value,
++        update_names,
++        update_values,
++        _parameter_types_for_connection(connection),
++    )
++
++
++def compile_query_plan_values(
++    model,
++    connection,
++    plan,
++    *,
++    limit: int = 0,
++    offset: int = 0,
++) -> tuple[str, list] | None:
++    """Compile a compact C++ exact/IN projection plan in one crossing."""
++    orm = _orm()
++    if orm is None or plan is None:
++        return None
++    mid = register_model_from_meta(model)
++    dialect = dialect_for_connection(connection)
++    if mid is None or dialect is None:
++        return None
++    return orm.compile_simple_values_plan(
++        int(mid),
++        int(dialect),
++        plan,
++        int(limit),
++        int(offset),
++        _parameter_types_for_connection(connection),
++    )
++
++
++def compile_query_plan_update(
++    model,
++    connection,
++    plan,
++    *,
++    updates,
++) -> tuple[str, list] | None:
++    """Compile a compact C++ exact-filter update plan in one crossing."""
++    orm = _orm()
++    if orm is None or plan is None or not updates:
++        return None
++    mid = register_model_from_meta(model)
++    dialect = dialect_for_connection(connection)
++    if mid is None or dialect is None:
++        return None
++    return orm.compile_simple_update_plan(
++        int(mid),
++        int(dialect),
++        plan,
++        updates,
++        _parameter_types_for_connection(connection),
++    )
+ 
+ 
+ def compile_select(
+@@ -359,6 +600,18 @@ def compile_select(
+     limit: int | None = None,
+     flat: bool = False,
+ ) -> tuple[str, list] | None:
++    if field_names and not kwargs and q is None and (limit is None or limit > 0):
++        orm = _orm()
++        if orm is None:
++            return None
++        mid = register_model_from_meta(model)
++        dialect = dialect_for_connection(connection)
++        if mid is None or dialect is None:
++            return None
++        compiled = orm.compile_simple_values_select(
++            int(mid), int(dialect), field_names, (), int(limit or 0), 0
++        )
++        return compiled
+     qs = build_queryset(model, connection, kwargs=kwargs or None, q=q)
+     if qs is None:
+         return None
+@@ -367,7 +620,7 @@ def compile_select(
+             return None
+     if limit is not None:
+         qs.set_limit(int(limit))
+-    sql, params = qs.compile_sql()
++    sql, params = qs.compile_sql(_parameter_types_for_connection(connection))
+     if not sql:
+         return None
+     return sql, list(params)
+@@ -384,10 +637,12 @@ def compile_update(
+     qs = build_queryset(model, connection, kwargs=filter_kwargs or None, q=q)
+     if qs is None or not update_kwargs:
+         return None
+-    for name, value in update_kwargs.items():
+-        if not qs.add_update(name, value):
+-            return None
+-    sql, params = qs.compile_sql()
++    compiled = qs.compile_update_kwargs(
++        update_kwargs, _parameter_types_for_connection(connection)
++    )
++    if compiled is None:
++        return None
++    sql, params = compiled
+     if not sql:
+         return None
+     return sql, list(params)
+@@ -404,7 +659,7 @@ def compile_delete(
+     if qs is None:
+         return None
+     qs.set_delete()
+-    sql, params = qs.compile_sql()
++    sql, params = qs.compile_sql(_parameter_types_for_connection(connection))
+     if not sql:
+         return None
+     return sql, list(params)
+@@ -441,7 +696,7 @@ def materialize_models(model, connection, handle, *, limit=None):
+                 return None
+         if limit is not None:
+             qs.set_limit(int(limit))
+-        sql, params = qs.compile_sql()
++        sql, params = qs.compile_sql(_parameter_types_for_connection(connection))
+         if not sql:
+             return None
+         rows = execute_fetchall(connection, sql, params)
+@@ -620,9 +875,7 @@ def _run_native_prefetch(model, objs, handle, specs, connection):
+                 continue
+ 
+             for row in rows:
+-                rel_obj = rel_model.from_db(
+-                    db, remote_atts, row[: len(remote_atts)]
+-                )
++                rel_obj = rel_model.from_db(db, remote_atts, row[: len(remote_atts)])
+                 parent_id = None
+                 if rel in ("rev_fk", "reverse_fk"):
+                     fk_col = spec.get("remote_fk_column") or ""
+@@ -664,7 +917,7 @@ def _run_native_prefetch(model, objs, handle, specs, connection):
+ def materialize_aggregate(connection, handle):
+     """Run aggregate-style select; return dict alias→value or None."""
+     try:
+-        sql, params = handle.compile_sql()
++        sql, params = handle.compile_sql(_parameter_types_for_connection(connection))
+         if not sql:
+             return None
+         rows = execute_fetchall(connection, sql, params)
+diff --git a/tests/native_orm_dataplane/tests.py b/tests/native_orm_dataplane/tests.py
+index d84abd9def..aa3d47e7cd 100644
+--- a/tests/native_orm_dataplane/tests.py
++++ b/tests/native_orm_dataplane/tests.py
+@@ -1,5 +1,9 @@
+ """Tests for the C++ ORM data plane (schema + QuerySet + compile + DML)."""
+ 
++import copy
++import sys
++from unittest import mock
++
+ from django.db import models
+ from django.test import SimpleTestCase
+ from django.test.utils import isolate_apps
+@@ -68,9 +72,7 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
+             ],
+         )
+         qs = orm.QuerySet.create(mid, orm.DIALECT_SQLITE)
+-        self.assertTrue(
+-            qs.filter_kwargs({"score__gt": 10, "id__in": [1, 2, 3]}, False)
+-        )
++        self.assertTrue(qs.filter_kwargs({"score__gt": 10, "id__in": [1, 2, 3]}, False))
+         sql, params = qs.compile_sql()
+         self.assertIn(">", sql)
+         self.assertIn("IN (%s, %s, %s)", sql)
+@@ -287,9 +289,246 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
+         self.assertIn("`t`", sql)
+         self.assertEqual(list(params), [1])
+ 
++    def test_clone_is_copy_on_write_and_compile_is_cached(self):
++        from django import _native
++
++        orm = _native.orm
++        mid = orm.register_model(
++            "test.Cached",
++            "cached",
++            [
++                _row("id", "id", "id", "AutoField", True, False),
++                _row("value", "value", "value", "IntegerField", False, False),
++            ],
++        )
++        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
++        self.assertTrue(qs.filter_eq("value", 7))
++        clone = qs.clone()
++        self.assertTrue(qs.shares_state_with(clone))
++
++        sql, _ = qs.compile_sql()
++        self.assertEqual(qs.compile_runs(), 1)
++        self.assertEqual(qs.compile_sql()[0], sql)
++        self.assertEqual(qs.compile_runs(), 1)
++
++        self.assertTrue(clone.set_ordering(["-id"]))
++        self.assertFalse(qs.shares_state_with(clone))
++        clone_sql, _ = clone.compile_sql()
++        self.assertIn('ORDER BY "cached"."id" DESC', clone_sql)
++        self.assertNotIn("ORDER BY", qs.compile_sql()[0])
++
++    def test_simple_terminal_sql_shape_cache(self):
++        from django import _native
++
++        orm = _native.orm
++        mid = orm.register_model(
++            "test.Shape",
++            "shape",
++            [
++                _row("id", "id", "id", "AutoField", True, False),
++                _row("value", "value", "value", "IntegerField", False, False),
++            ],
++        )
++        orm.clear_simple_compile_cache()
++        first = orm.compile_simple_values_get(
++            mid, orm.DIALECT_POSTGRES, ["id", "value"], "id", 1, 21
++        )
++        second = orm.compile_simple_values_get(
++            mid, orm.DIALECT_POSTGRES, ["id", "value"], "id", 2, 21
++        )
++        self.assertEqual(first[0], second[0])
++        self.assertEqual(list(first[1]), [1])
++        self.assertEqual(list(second[1]), [2])
++        info = orm.simple_compile_cache_info()
++        self.assertEqual(info["size"], 1)
++        self.assertEqual(info["misses"], 1)
++        self.assertEqual(info["hits"], 1)
++
++    def test_fused_filtered_values_and_update_compile(self):
++        from django import _native
++
++        orm = _native.orm
++        mid = orm.register_model(
++            "test.Fused",
++            "fused",
++            [
++                _row("id", "id", "id", "AutoField", True, False),
++                _row("value", "value", "value", "IntegerField", False, False),
++            ],
++        )
++        selected = orm.compile_simple_values_filter(
++            mid,
++            orm.DIALECT_POSTGRES,
++            ["id", "value"],
++            "id",
++            True,
++            [3, 1, 2],
++            ["-id"],
++            0,
++            0,
++        )
++        self.assertIn(" IN (%s, %s, %s)", selected[0])
++        self.assertIn('ORDER BY "fused"."id" DESC', selected[0])
++        self.assertEqual(list(selected[1]), [3, 1, 2])
++
++        updated = orm.compile_simple_update(
++            mid, orm.DIALECT_POSTGRES, "id", 7, ["value"], [99]
++        )
++        self.assertEqual(
++            updated[0], 'UPDATE "fused" SET "value" = %s WHERE "fused"."id" = %s'
++        )
++        self.assertEqual(list(updated[1]), [99, 7])
++
+ 
+ @isolate_apps("native_orm_dataplane")
+ class OrmDataPlaneFacadeTests(SimpleTestCase):
++    def test_model_schema_export_is_cached(self):
++        from django.native import orm
++
++        class CachedModel(models.Model):
++            value = models.IntegerField()
++
++            class Meta:
++                app_label = "native_orm_dataplane"
++
++        orm.clear_schema()
++        model_id = orm.register_model_from_meta(CachedModel)
++        with mock.patch(
++            "django.native.orm._field_row",
++            side_effect=AssertionError("model metadata was exported twice"),
++        ):
++            self.assertEqual(orm.register_model_from_meta(CachedModel), model_id)
++
++    def test_custom_field_subclass_uses_python_fallback(self):
++        from django import native
++        from django.native import orm
++
++        if not native.AVAILABLE:
++            self.skipTest("native extension required")
++
++        class PreparedIntegerField(models.IntegerField):
++            def get_prep_value(self, value):
++                return super().get_prep_value(value) + 100
++
++        class CustomModel(models.Model):
++            value = PreparedIntegerField()
++
++            class Meta:
++                app_label = "native_orm_dataplane_custom_prep"
++
++        class _Conn:
++            vendor = "sqlite"
++
++        orm.clear_schema()
++        orm.register_model_from_meta(CustomModel)
++
++        # A custom subclass reports IntegerField semantics through
++        # get_internal_type(), but its Python preparation hook must still win.
++        self.assertIsNone(
++            orm.compile_values_list_get(
++                CustomModel,
++                field_names=["id", "value"],
++                lookup_field="id",
++                lookup_value=1,
++                limit=21,
++                connection=_Conn(),
++            )
++        )
++        filtered = CustomModel.objects.filter(value=1)
++        self.assertFalse(filtered._native_authoritative)
++        self.assertIsNotNone(filtered._query)
++
++        id_filtered = CustomModel.objects.filter(id=1)
++        self.assertTrue(id_filtered._native_authoritative)
++        self.assertIsNone(
++            orm.compile_query_plan_update(
++                CustomModel,
++                _Conn(),
++                id_filtered._native_plan,
++                updates={"value": 2},
++            )
++        )
++
++    def test_native_terminal_rejects_values_needing_python_coercion(self):
++        from django import native
++        from django.native import orm
++
++        if not native.AVAILABLE:
++            self.skipTest("native extension required")
++
++        class PrimitiveModel(models.Model):
++            value = models.IntegerField()
++
++            class Meta:
++                app_label = "native_orm_dataplane_strict_primitive"
++
++        class _Conn:
++            vendor = "sqlite"
++
++        orm.clear_schema()
++        self.assertIsNone(
++            orm.compile_values_list_get(
++                PrimitiveModel,
++                field_names=["id", "value"],
++                lookup_field="id",
++                lookup_value="1",
++                limit=21,
++                connection=_Conn(),
++            )
++        )
++        # Django accepts and converts this input on the stock fallback path.
++        qs = PrimitiveModel.objects.filter(id="1")
++        self.assertFalse(qs._native_authoritative)
++        self.assertIsNotNone(qs._query)
++
++    def test_postgresql_integer_field_widths_are_bound_natively(self):
++        from django import native
++        from django.native import orm
++
++        if not native.AVAILABLE:
++            self.skipTest("native extension required")
++        try:
++            from psycopg.types import numeric
++        except ImportError:
++            self.skipTest("psycopg 3 required")
++
++        class PrimitiveModel(models.Model):
++            small_value = models.PositiveSmallIntegerField()
++            integer_value = models.IntegerField()
++            big_value = models.BigIntegerField()
++
++            class Meta:
++                app_label = "native_orm_dataplane_postgresql_widths"
++
++        class _Ops:
++            integerfield_type_map = {
++                "SmallIntegerField": numeric.Int2,
++                "IntegerField": numeric.Int4,
++                "BigIntegerField": numeric.Int8,
++            }
++
++        class _Conn:
++            vendor = "postgresql"
++            ops = _Ops()
++
++        orm.clear_schema()
++        compiled = orm.compile_simple_update(
++            PrimitiveModel,
++            _Conn(),
++            lookup_field="id",
++            lookup_value=7,
++            update_names=["small_value", "integer_value", "big_value"],
++            update_values=[1, 2, 3],
++        )
++        self.assertIsNotNone(compiled)
++        params = compiled[1]
++        self.assertIs(type(params[0]), numeric.Int2)
++        self.assertIs(type(params[1]), numeric.Int4)
++        self.assertIs(type(params[2]), numeric.Int8)
++        # AutoField values remain plain ints, matching Django's backend prep.
++        self.assertIs(type(params[3]), int)
++        self.assertEqual(params, [1, 2, 3, 7])
++
+     def test_compile_values_list_get_from_model(self):
+         from django.native import orm
+ 
+@@ -315,6 +554,15 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
+         self.assertIn("randomnumber", sql)
+         self.assertEqual(params, [2])
+ 
++        empty_select = orm.compile_select(
++            World,
++            _Conn(),
++            field_names=["id", "randomnumber"],
++            limit=0,
++        )
++        self.assertIsNotNone(empty_select)
++        self.assertIn("LIMIT 0", empty_select[0])
++
+         compiled2 = orm.compile_update(
+             World,
+             _Conn(),
+@@ -540,6 +788,125 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
+         qs3 = World.objects.filter(Q(randomnumber=1) ^ Q(randomnumber=2))
+         self.assertIsNotNone(qs3._native_qs)
+ 
++    def test_supported_chain_keeps_native_graph_authoritative(self):
++        class World(models.Model):
++            randomnumber = models.IntegerField()
++
++            class Meta:
++                app_label = "native_orm_dataplane_authoritative"
++
++        filtered = World.objects.filter(id__in=[3, 1, 2])
++        shared = filtered.all()
++        self.assertIsNone(filtered._native_qs)
++        self.assertIsNone(filtered._query)
++        self.assertEqual(
++            filtered._native_plan.simple_filter(), ("id", True, [3, 1, 2])
++        )
++        self.assertIs(shared._native_plan, filtered._native_plan)
++
++        ordered = filtered.order_by("id")
++        self.assertIsNone(ordered._native_qs)
++
++        qs = ordered.values_list("id", "randomnumber")
++        self.assertTrue(qs._native_authoritative)
++        self.assertIsNone(qs._query)
++
++        class _Conn:
++            vendor = "postgresql"
++
++        native_sql, params = qs._native_compile_deferred_simple_values(_Conn())
++        self.assertIn(" IN (", native_sql)
++        self.assertIn("ORDER BY", native_sql)
++        self.assertEqual(list(params), [3, 1, 2])
++
++        query = qs.query
++        self.assertFalse(qs._native_authoritative)
++        self.assertIsNone(qs._native_plan)
++        self.assertTrue(query.where.children)
++        self.assertEqual(query.order_by, ("id",))
++        self.assertEqual(query.values_select, ("id", "randomnumber"))
++
++    def test_native_queryset_defers_python_query_until_fallback(self):
++        class World(models.Model):
++            randomnumber = models.IntegerField()
++
++            class Meta:
++                app_label = "native_orm_dataplane_lazy_query"
++
++        base = World.objects.all()
++        clone = base.all()
++        self.assertIsNone(base._query)
++        self.assertIsNone(clone._query)
++        self.assertIsNone(clone._native_plan)
++
++        python_query = clone.query
++        self.assertIsNotNone(python_query)
++        self.assertIs(clone._query, python_query)
++        self.assertIsNone(base._query)
++
++    def test_cpp_plan_replays_nested_q_and_deepcopy_shares_plan(self):
++        from django.db.models import Q
++
++        class World(models.Model):
++            randomnumber = models.IntegerField()
++
++            class Meta:
++                app_label = "native_orm_dataplane_cpp_plan_replay"
++
++        qs = World.objects.filter(
++            Q(randomnumber=1) | ~Q(randomnumber__gte=9)
++        ).values_list("id", "randomnumber")
++        copied = copy.deepcopy(qs)
++        self.assertIsNone(qs._query)
++        self.assertIs(copied._native_plan, qs._native_plan)
++
++        query = copied.query
++        sql, params = query.sql_with_params()
++        self.assertIn(" OR ", sql)
++        self.assertIn("NOT", sql)
++        self.assertEqual(params, (1, 9))
++        self.assertTrue(qs._native_authoritative)
++        self.assertIsNone(qs._query)
++
++    def test_cpp_plan_does_not_retain_python_filter_values(self):
++        class Item(models.Model):
++            name = models.CharField(max_length=100)
++
++            class Meta:
++                app_label = "native_orm_dataplane_cpp_plan_refs"
++
++        value = "".join(("native-plan-", str(id(self)), "-payload"))
++        references = sys.getrefcount(value)
++        qs = Item.objects.filter(name=value)
++
++        self.assertTrue(qs._native_authoritative)
++        self.assertIsNone(qs._query)
++        self.assertEqual(sys.getrefcount(value), references)
++        self.assertEqual(qs.query.where.children[0].rhs, value)
++
++    def test_deferred_simple_filter_freezes_input_and_replays_before_fallback(self):
++        class World(models.Model):
++            randomnumber = models.IntegerField()
++
++            class Meta:
++                app_label = "native_orm_dataplane_deferred_fallback"
++
++        ids = [3, 1, 2]
++        first = World.objects.filter(id__in=ids)
++        ids.append(99)
++        self.assertEqual(
++            first._native_plan.simple_filter(), ("id", True, [3, 1, 2])
++        )
++
++        chained = first.filter(randomnumber=7)
++        self.assertFalse(chained._native_authoritative)
++        self.assertIsNone(chained._native_qs)
++        self.assertEqual(len(chained._query.where.children), 2)
++        sql, params = chained.query.sql_with_params()
++        self.assertIn('"id" IN (%s, %s, %s)', sql)
++        self.assertIn('"randomnumber" = %s', sql)
++        self.assertEqual(params, (3, 1, 2, 7))
++
+     def test_annotate_aggregate_and_subquery_compile(self):
+         from django import _native
+ 
+@@ -561,16 +928,12 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
+ 
+         qs2 = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+         qs2.filter_eq("id", 1)
+-        self.assertTrue(
+-            qs2.annotate_sql("s", "SELECT 1", [])
+-        )
++        self.assertTrue(qs2.annotate_sql("s", "SELECT 1", []))
+         sql2, _ = qs2.compile_sql()
+         self.assertIn("(SELECT 1)", sql2)
+ 
+         qs3 = orm.QuerySet.create(mid, orm.DIALECT_SQLITE)
+-        self.assertTrue(
+-            qs3.filter_subquery("id", orm.OP_IN, "SELECT %s", [1])
+-        )
++        self.assertTrue(qs3.filter_subquery("id", orm.OP_IN, "SELECT %s", [1]))
+         sql3, p3 = qs3.compile_sql()
+         self.assertIn("IN (SELECT %s)", sql3)
+         self.assertEqual(list(p3), [1])
+@@ -640,9 +1003,7 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
+         qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+         qs.select_model_columns()
+         when = {"kind": "atom", "key": "n__gt", "values": [10]}
+-        self.assertTrue(
+-            qs.annotate_case("bucket", [(when, "hi")], "lo")
+-        )
++        self.assertTrue(qs.annotate_case("bucket", [(when, "hi")], "lo"))
+         sql, params = qs.compile_sql()
+         self.assertIn("CASE", sql)
+         self.assertIn("WHEN", sql)
+@@ -663,7 +1024,7 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
+         qs3.select_model_columns()
+         self.assertTrue(qs3.annotate_subquery_qs("sid", sub))
+         sql3, _ = qs3.compile_sql()
+-        self.assertIn("AS \"sid\"", sql3)
++        self.assertIn('AS "sid"', sql3)
+ 
+     def test_prefetch_secondary_sql(self):
+         from django import _native
+diff --git a/tests/native_orm_fastpath/tests.py b/tests/native_orm_fastpath/tests.py
+index cd18e092f3..3f578b60df 100644
+--- a/tests/native_orm_fastpath/tests.py
++++ b/tests/native_orm_fastpath/tests.py
+@@ -20,9 +20,7 @@ class SimpleSQLHelpersTests(SimpleTestCase):
+         from django import native
+ 
+         sql = native.simple_update_eq_sql('"world"', ['"randomnumber"'], '"id"')
+-        self.assertEqual(
+-            sql, 'UPDATE "world" SET "randomnumber" = %s WHERE "id" = %s'
+-        )
++        self.assertEqual(sql, 'UPDATE "world" SET "randomnumber" = %s WHERE "id" = %s')
+ 
+     def test_render_fortune_page_escapes_and_structure(self):
+         from django import native
+@@ -96,6 +94,28 @@ class OrmFastPathDBTests(TestCase):
+         rows = list(FastFortune.objects.values_list("id", "message"))
+         self.assertEqual(len(rows), 3)
+ 
++    def test_filtered_values_list_preserves_ordering(self):
++        rows = list(
++            FastWorld.objects.filter(id__in=[1, 3, 2])
++            .order_by("-id")
++            .values_list("id", flat=True)
++        )
++        self.assertEqual(rows, [3, 2, 1])
++
++    def test_exact_filtered_values_list(self):
++        rows = list(
++            FastWorld.objects.filter(id=8).values_list("id", "randomnumber")
++        )
++        self.assertEqual(rows, [(8, 80)])
++
++    def test_deferred_filter_then_second_filter_preserves_both_predicates(self):
++        rows = list(
++            FastWorld.objects.filter(id__in=[1, 2, 3])
++            .filter(randomnumber=20)
++            .values_list("id", "randomnumber")
++        )
++        self.assertEqual(rows, [(2, 20)])
++
+     def test_in_bulk(self):
+         d = FastWorld.objects.in_bulk([1, 2, 3])
+         self.assertEqual(set(d), {1, 2, 3})
+@@ -120,6 +140,40 @@ class OrmFastPathDBTests(TestCase):
+         self.assertEqual(n, 1)
+         self.assertEqual(FastWorld.objects.get(pk=1).randomnumber, 11)
+ 
++    def test_native_primitive_terminals_skip_python_field_prep(self):
++        from django import native
++        from django.native import orm
++
++        if not native.AVAILABLE:
++            self.skipTest("native extension required")
++        # Export before installing spies so schema setup itself isn't part of
++        # the terminal assertion.
++        orm.register_model_from_meta(FastWorld)
++        id_field = FastWorld._meta.get_field("id")
++        value_field = FastWorld._meta.get_field("randomnumber")
++        with (
++            mock.patch.object(
++                id_field,
++                "get_db_prep_value",
++                side_effect=AssertionError("point lookup used Python prep"),
++            ) as lookup_prep,
++            mock.patch.object(
++                value_field,
++                "get_db_prep_save",
++                side_effect=AssertionError("update used Python prep"),
++            ) as update_prep,
++        ):
++            self.assertEqual(
++                FastWorld.objects.values_list("id", "randomnumber").get(id=2),
++                (2, 20),
++            )
++            self.assertEqual(
++                FastWorld.objects.filter(id=2).update(randomnumber=202), 1
++            )
++        lookup_prep.assert_not_called()
++        update_prep.assert_not_called()
++        self.assertEqual(FastWorld.objects.get(id=2).randomnumber, 202)
++
+     def test_annotated_get_projects_attrs(self):
+         from django.db.models import Value
+ 
+@@ -169,4 +223,3 @@ class OrmFastPathNativeOffTests(TestCase):
+                 self.assertEqual(n, 1)
+                 obj = FastWorld.objects.get(pk=2)
+                 self.assertEqual(obj.randomnumber, 99)
+-

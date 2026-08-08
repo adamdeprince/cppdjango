@@ -4,7 +4,6 @@ The main QuerySet implementation. This provides the public API for the ORM.
 
 import copy
 import operator
-import sys
 import warnings
 from contextlib import nullcontext
 from functools import reduce
@@ -35,6 +34,7 @@ from django.db.models.utils import (
     create_namedtuple_class,
     resolve_callables,
 )
+from django.native._loader import AVAILABLE as _NATIVE_AVAILABLE
 from django.utils import timezone
 from django.utils.deprecation import RemovedInDjango70Warning
 from django.utils.functional import cached_property
@@ -47,11 +47,37 @@ REPR_OUTPUT_SIZE = 20
 
 PROHIBITED_FILTER_KWARGS = frozenset(["_connector", "_negated"])
 
-# Tier 1+: process-local SQL templates for simple SELECT/UPDATE fast paths.
-# Keys vary by shape (eq/all/in/upd); values are interned SQL strings.
-# Write-once per key after first use (reduces post-fork COW churn).
+# SQL templates used by the model-save fast path in django.db.models.base.
+# QuerySet terminal shapes use the generation-aware native cache instead.
 _SIMPLE_SQL_CACHE = {}
 _FAST_PATH_MISS = object()
+
+
+def _q_from_native_tree(node):
+    """Rebuild an equivalent Django Q object from a C++ QueryPlan node."""
+    kind = node["kind"]
+    if kind == "atom":
+        values = node.get("values", ())
+        key = node["key"]
+        if key.rsplit(LOOKUP_SEP, 1)[-1] == "in":
+            value = list(values)
+        elif len(values) == 1:
+            value = values[0]
+        else:
+            value = list(values)
+        return Q((key, value))
+
+    children = [_q_from_native_tree(child) for child in node.get("children", ())]
+    if kind == "not":
+        if len(children) != 1:
+            raise ValueError("native NOT plan must have exactly one child")
+        return ~children[0]
+    connector = Q.AND
+    if kind == "or":
+        connector = Q.OR
+    elif kind == "xor":
+        connector = Q.XOR
+    return Q(*children, _connector=connector)
 
 
 class BaseIterable:
@@ -294,7 +320,15 @@ class QuerySet(AltersData):
         self.model = model
         self._db = using
         self._hints = hints or {}
-        self._query = query or sql.Query(self.model)
+        # Native-supported chains don't need Django's mutable Query graph.
+        # Leave it unallocated until introspection or a fallback operation
+        # actually needs it. The pure-Python configuration remains eager.
+        if query is not None:
+            self._query = query
+        elif _NATIVE_AVAILABLE:
+            self._query = None
+        else:
+            self._query = sql.Query(self.model)
         self._result_cache = None
         self._sticky_filter = False
         self._for_write = False
@@ -308,21 +342,33 @@ class QuerySet(AltersData):
         # C++ ORM data-plane handle (optional). Poisoned via _native_disabled.
         self._native_qs = None
         self._native_disabled = False
+        # Supported native chains keep C++ as the authoritative query graph.
+        # QueryPlan owns replay strings and values without retaining Python
+        # dicts, tuples, Q objects, or Field objects.
+        self._native_authoritative = False
+        self._native_plan = None
 
     @property
     def query(self):
+        if self._native_authoritative:
+            self._native_materialize_python_query()
+        if self._query is None:
+            self._query = sql.Query(self.model)
         if self._deferred_filter:
             negate, args, kwargs = self._deferred_filter
             self._filter_or_exclude_inplace(negate, args, kwargs)
-            self._native_track_filter(negate, args, kwargs)
+            self._native_disabled = True
+            self._native_qs = None
             self._deferred_filter = None
         return self._query
 
     @query.setter
     def query(self, value):
-        if value.values_select:
+        if value is not None and value.values_select:
             self._iterable_class = ValuesIterable
         self._query = value
+        self._native_authoritative = False
+        self._native_plan = None
 
     def as_manager(cls):
         # Address the circular dependency between `Queryset` and `Manager`.
@@ -345,6 +391,9 @@ class QuerySet(AltersData):
         for k, v in self.__dict__.items():
             if k == "_result_cache":
                 obj.__dict__[k] = None
+            elif k in {"_native_plan", "_native_qs"}:
+                # Both native wrappers use functional copy-on-write updates.
+                obj.__dict__[k] = v
             else:
                 obj.__dict__[k] = copy.deepcopy(v, memo)
         return obj
@@ -352,6 +401,10 @@ class QuerySet(AltersData):
     def __getstate__(self):
         # Force the cache to be fully populated.
         self._fetch_all()
+        # Nanobind wrappers aren't part of Django's pickle contract. Replay
+        # the compact plan once and pickle the equivalent Python Query.
+        if self._native_authoritative:
+            self.query
         return {**self.__dict__, DJANGO_VERSION_PICKLE_KEY: django.__version__}
 
     def __setstate__(self, state):
@@ -694,36 +747,48 @@ class QuerySet(AltersData):
         return await sync_to_async(self.aggregate)(*args, **kwargs)
 
     def _native_terminal_update(self, kwargs):
-        handle = self._native_handle_for_sql()
-        if handle is None or not kwargs:
+        if not kwargs:
             return _FAST_PATH_MISS
-        try:
-            from django.native import orm as native_orm
+        connection = connections[self.db]
+        for name, value in kwargs.items():
+            if LOOKUP_SEP in name or hasattr(value, "resolve_expression"):
+                return _FAST_PATH_MISS
+        if self._native_qs is None and self._native_authoritative:
+            try:
+                from django.native import orm as native_orm
 
-            connection = connections[self.db]
-            qs = handle.clone()
-            for name, value in kwargs.items():
-                if LOOKUP_SEP in name or hasattr(value, "resolve_expression"):
-                    return _FAST_PATH_MISS
-                try:
-                    field = self.model._meta.get_field(name)
-                    prep = field.get_db_prep_save(value, connection)
-                except Exception:
-                    return _FAST_PATH_MISS
-                if not qs.add_update(name, prep):
-                    return _FAST_PATH_MISS
-            sql, params = qs.compile_sql()
-            if not sql:
+                compiled = native_orm.compile_query_plan_update(
+                    self.model,
+                    connection,
+                    self._native_plan,
+                    updates=kwargs,
+                )
+            except Exception:
                 return _FAST_PATH_MISS
-            with transaction.mark_for_rollback_on_error(using=self.db):
-                with connection.cursor() as cursor:
-                    cursor.execute(sql, params)
-                    rowcount = cursor.rowcount
-            if rowcount is None or rowcount < 0:
+        else:
+            handle = self._native_handle_for_sql()
+            if handle is None:
                 return _FAST_PATH_MISS
-            return rowcount
-        except Exception:
+            try:
+                compiled = handle.compile_update_kwargs(
+                    kwargs, native_orm._parameter_types_for_connection(connection)
+                )
+            except Exception:
+                return _FAST_PATH_MISS
+        if compiled is None:
             return _FAST_PATH_MISS
+        sql, params = compiled
+        if not sql:
+            return _FAST_PATH_MISS
+        # Once execution starts, propagate database errors. Retrying the stock
+        # compiler after an error can leave the surrounding transaction broken.
+        with transaction.mark_for_rollback_on_error(using=self.db):
+            with connection.cursor() as cursor:
+                cursor.execute(sql, params)
+                rowcount = cursor.rowcount
+        if rowcount is None or rowcount < 0:
+            return _FAST_PATH_MISS
+        return rowcount
 
     def _native_terminal_aggregate(self, kwargs):
         """
@@ -764,12 +829,12 @@ class QuerySet(AltersData):
                         field_name = name
                     else:
                         return _FAST_PATH_MISS
-                if not qs.annotate_aggregate(
-                    alias, func, field_name, distinct, star
-                ):
+                if not qs.annotate_aggregate(alias, func, field_name, distinct, star):
                     return _FAST_PATH_MISS
                 aliases.append(alias)
-            sql, params = qs.compile_sql()
+            sql, params = qs.compile_sql(
+                native_orm._parameter_types_for_connection(connection)
+            )
             if not sql:
                 return _FAST_PATH_MISS
             row = native_orm.execute_fetchall(connection, sql, params)
@@ -809,10 +874,15 @@ class QuerySet(AltersData):
         Perform the query and return a single object matching the given
         keyword arguments.
         """
-        if self.query.combinator and (args or kwargs):
+        if self._deferred_filter:
+            # Related-manager core filters must be part of eligibility checks
+            # and cannot be skipped by a native terminal.
+            self.query
+        combinator = self._query.combinator if self._query is not None else None
+        if combinator and (args or kwargs):
             raise NotSupportedError(
                 "Calling QuerySet.get(...) with filters after %s() is not "
-                "supported." % self.query.combinator
+                "supported." % combinator
             )
         # Tier 1+ fast paths: simple values_list/model get without full compiler.
         if not args and kwargs:
@@ -862,6 +932,9 @@ class QuerySet(AltersData):
             from django.native import orm as native_orm
 
             connection = connections[self.db]
+            handle = handle.clone()
+            if not handle.set_ordering([]):
+                return _FAST_PATH_MISS
             result = native_orm.materialize_models(
                 self.model, connection, handle, limit=MAX_GET_RESULTS
             )
@@ -911,9 +984,10 @@ class QuerySet(AltersData):
 
             connection = connections[self.db]
             h = handle.clone()
-            if self.query.is_sliced:
-                low = self.query.low_mark or 0
-                high = self.query.high_mark
+            query = self._query
+            if query is not None and query.is_sliced:
+                low = query.low_mark or 0
+                high = query.high_mark
                 if high is not None:
                     h.set_limit(int(high - low))
                 if low:
@@ -932,16 +1006,27 @@ class QuerySet(AltersData):
 
     def _simple_base_eligible(self, *, require_empty_where=True):
         """Shared guards for simple single-table SELECT fast paths."""
-        query = self.query
+        if self._native_authoritative and not self._native_has_only_projection():
+            return False
+        if self.model._meta.parents or self.model._meta.ordering:
+            return False
+        query = self._query
+        if query is None:
+            return True
         if (
             query.combinator
             or query.is_sliced
+            or query.is_empty()
             or query.distinct
             or query.distinct_fields
             or query.select_for_update
+            or query.select_related
             or query.group_by
             or query.annotations
             or query.extra
+            or query.extra_order_by
+            or query.deferred_loading != (frozenset(), True)
+            or query._filtered_relations
             or len(query.alias_map) > 1
         ):
             return False
@@ -960,8 +1045,15 @@ class QuerySet(AltersData):
 
     def _resolve_select_columns(self, field_names):
         """Return list of DB column names or None if any field is ineligible."""
+        fields = self._resolve_select_fields(field_names)
+        if fields is None:
+            return None
+        return [field.column for field in fields]
+
+    def _resolve_select_fields(self, field_names):
+        """Return concrete fields for a simple projection, or None."""
         opts = self.model._meta
-        cols = []
+        resolved = []
         for name in field_names:
             if not isinstance(name, str) or LOOKUP_SEP in name:
                 return None
@@ -971,8 +1063,8 @@ class QuerySet(AltersData):
                 return None
             if not getattr(f, "concrete", False) or not f.column:
                 return None
-            cols.append(f.column)
-        return cols
+            resolved.append(f)
+        return tuple(resolved)
 
     def _concrete_field_ok(self, field):
         if field is None:
@@ -983,18 +1075,6 @@ class QuerySet(AltersData):
             return False
         return bool(field.column)
 
-    def _cached_simple_sql(self, cache_key, builder):
-        sql = _SIMPLE_SQL_CACHE.get(cache_key)
-        if sql is not None:
-            return sql
-        sql = builder()
-        try:
-            sql = sys.intern(sql)
-        except TypeError:
-            pass
-        # setdefault: first writer wins; avoids duplicate dict entries under race.
-        return _SIMPLE_SQL_CACHE.setdefault(cache_key, sql)
-
     def _fast_path_simple_get(self, kwargs):
         """
         Fast path for::
@@ -1004,13 +1084,17 @@ class QuerySet(AltersData):
 
         when the queryset has no prior filters/joins/annotations.
         """
-        if len(kwargs) != 1 or not self._simple_base_eligible():
+        simple_projection = (
+            self._native_authoritative
+            and self._native_qs is None
+            and self._native_has_only_projection()
+        )
+        if len(kwargs) != 1 or (
+            not simple_projection and not self._simple_base_eligible()
+        ):
             return _FAST_PATH_MISS
         lookup_name, value = next(iter(kwargs.items()))
         if not isinstance(lookup_name, str) or LOOKUP_SEP in lookup_name:
-            return _FAST_PATH_MISS
-        lookup_field = self._resolve_lookup_field(lookup_name)
-        if not self._concrete_field_ok(lookup_field):
             return _FAST_PATH_MISS
 
         # --- values_list / values tuple path ---
@@ -1018,23 +1102,21 @@ class QuerySet(AltersData):
             ValuesListIterable,
             FlatValuesListIterable,
         ):
-            select_columns = self._resolve_select_columns(self._fields)
-            if not select_columns:
+            if not self._fields:
                 return _FAST_PATH_MISS
             return self._execute_simple_eq_get(
-                select_columns, lookup_field, value, as_model=False
+                self._fields, lookup_name, value, as_model=False
             )
 
         # --- model instance path ---
         if self._fields is None and issubclass(self._iterable_class, ModelIterable):
             opts = self.model._meta
-            select_columns = [f.column for f in opts.concrete_fields if f.column]
             field_names = [f.attname for f in opts.concrete_fields if f.column]
-            if not select_columns:
+            if not field_names:
                 return _FAST_PATH_MISS
             return self._execute_simple_eq_get(
-                select_columns,
-                lookup_field,
+                field_names,
+                lookup_name,
                 value,
                 as_model=True,
                 model_field_names=field_names,
@@ -1042,48 +1124,24 @@ class QuerySet(AltersData):
         return _FAST_PATH_MISS
 
     def _execute_simple_eq_get(
-        self, select_columns, lookup_field, value, *, as_model, model_field_names=None
+        self, field_names, lookup_name, value, *, as_model, model_field_names=None
     ):
         db = self.db
         connection = connections[db]
         limit = MAX_GET_RESULTS
-        try:
-            param = lookup_field.get_db_prep_value(value, connection, prepared=False)
-        except Exception:
-            return _FAST_PATH_MISS
-
-        lookup_key = (
-            "pk"
-            if getattr(lookup_field, "primary_key", False)
-            else lookup_field.attname
-        )
-        field_names = (
-            list(self._fields)
-            if self._fields is not None
-            else list(model_field_names or [])
-        )
-
         sql = None
-        params = (param,)
+        params = ()
         try:
             from django.native import orm as native_orm
 
-            if field_names:
-                compiled = native_orm.compile_values_list_get(
-                    self.model,
-                    field_names=field_names,
-                    lookup_field=lookup_key,
-                    lookup_value=param,
-                    limit=limit,
-                    connection=connection,
-                )
-            else:
-                compiled = native_orm.compile_select(
-                    self.model,
-                    connection,
-                    kwargs={lookup_key: param},
-                    limit=limit,
-                )
+            compiled = native_orm.compile_values_list_get(
+                self.model,
+                field_names=field_names,
+                lookup_field=lookup_name,
+                lookup_value=value,
+                limit=limit,
+                connection=connection,
+            )
             if compiled is not None:
                 sql, param_list = compiled
                 params = tuple(param_list)
@@ -1116,6 +1174,20 @@ class QuerySet(AltersData):
             return row[0]
         return row
 
+    def _native_compile_deferred_simple_values(self, connection):
+        if (
+            self._native_plan is None
+            or self._native_qs is not None
+            or not self._native_authoritative
+            or self._fields is None
+        ):
+            return None
+        from django.native import orm as native_orm
+
+        return native_orm.compile_query_plan_values(
+            self.model, connection, self._native_plan
+        )
+
     def _fast_path_simple_values_fetch(self):
         """
         Fast path for values()/values_list() via C++ data plane.
@@ -1131,7 +1203,9 @@ class QuerySet(AltersData):
             FlatValuesListIterable,
         ):
             return _FAST_PATH_MISS
-        if not self._resolve_select_columns(self._fields):
+        if not self._native_authoritative and not self._resolve_select_columns(
+            self._fields
+        ):
             return _FAST_PATH_MISS
 
         db = self.db
@@ -1139,33 +1213,38 @@ class QuerySet(AltersData):
         try:
             from django.native import orm as native_orm
 
-            handle = self._native_handle_for_sql()
-            if handle is not None:
-                qs = handle.clone()
-                flat = self._iterable_class is FlatValuesListIterable
-                if not qs.values_list(list(self._fields), flat):
-                    return _FAST_PATH_MISS
-                if self.query.is_sliced:
-                    # Respect high/low marks when set.
-                    low = self.query.low_mark or 0
-                    high = self.query.high_mark
-                    if high is not None:
-                        qs.set_limit(int(high - low))
-                    if low:
-                        qs.set_offset(int(low))
-                sql, params = qs.compile_sql()
-            elif self._simple_base_eligible():
-                compiled = native_orm.compile_select(
-                    self.model,
-                    connection,
-                    field_names=list(self._fields),
-                    kwargs=None,
-                )
-                if compiled is None:
-                    return _FAST_PATH_MISS
+            compiled = self._native_compile_deferred_simple_values(connection)
+            if compiled is not None:
                 sql, params = compiled
             else:
-                return _FAST_PATH_MISS
+                handle = self._native_handle_for_sql()
+                if handle is not None:
+                    qs = handle
+                    query = self._query
+                    if query is not None and query.is_sliced:
+                        # Respect high/low marks when set.
+                        qs = handle.clone()
+                        low = query.low_mark or 0
+                        high = query.high_mark
+                        if high is not None:
+                            qs.set_limit(int(high - low))
+                        if low:
+                            qs.set_offset(int(low))
+                    sql, params = qs.compile_sql(
+                        native_orm._parameter_types_for_connection(connection)
+                    )
+                elif self._simple_base_eligible():
+                    compiled = native_orm.compile_select(
+                        self.model,
+                        connection,
+                        field_names=list(self._fields),
+                        kwargs=None,
+                    )
+                    if compiled is None:
+                        return _FAST_PATH_MISS
+                    sql, params = compiled
+                else:
+                    return _FAST_PATH_MISS
             if not sql:
                 return _FAST_PATH_MISS
             rows = native_orm.execute_fetchall(connection, sql, params)
@@ -1288,11 +1367,7 @@ class QuerySet(AltersData):
                 lookup_field.get_db_prep_value(v, connection, prepared=False)
                 for v in id_list
             ]
-            key = (
-                "pk"
-                if lookup_field.primary_key
-                else lookup_field.attname
-            ) + "__in"
+            key = ("pk" if lookup_field.primary_key else lookup_field.attname) + "__in"
             from django.native import orm as native_orm
 
             compiled = native_orm.compile_select(
@@ -1701,7 +1776,9 @@ class QuerySet(AltersData):
                 len(objs),
             )
         else:
-            batch_size = min(batch_size, max_batch_size) if batch_size else max_batch_size
+            batch_size = (
+                min(batch_size, max_batch_size) if batch_size else max_batch_size
+            )
         requires_casting = connection.features.requires_casted_case_in_updates
         if _native.AVAILABLE:
             batches = (
@@ -1709,7 +1786,9 @@ class QuerySet(AltersData):
                 for start, end in _native.in_bulk_batch_ranges(len(objs), batch_size)
             )
         else:
-            batches = (objs[i : i + batch_size] for i in range(0, len(objs), batch_size))
+            batches = (
+                objs[i : i + batch_size] for i in range(0, len(objs), batch_size)
+            )
         updates = []
         for batch_objs in batches:
             update_kwargs = {}
@@ -2180,34 +2259,22 @@ class QuerySet(AltersData):
         Update all elements in the current QuerySet, setting all the given
         fields to the appropriate values.
         """
-        from django import native as _native
-
-        if _native.AVAILABLE:
-            code = _native.queryset_write_guard(
-                bool(self.query.combinator),
-                self.query.is_sliced,
-                False,
-                False,
-            )
-            if code == 1:
-                self._not_support_combined_queries("update")
-            elif code == 2:
-                raise TypeError("Cannot update a query once a slice has been taken.")
-        else:
+        query_state = self._query
+        if query_state is not None and query_state.combinator:
             self._not_support_combined_queries("update")
-            if self.query.is_sliced:
-                raise TypeError("Cannot update a query once a slice has been taken.")
+        if query_state is not None and query_state.is_sliced:
+            raise TypeError("Cannot update a query once a slice has been taken.")
         self._for_write = True
-        # Single-row exact-lookup UPDATE without SQLCompiler when eligible.
-        fast = self._fast_path_simple_filter_update(kwargs)
-        if fast is not _FAST_PATH_MISS:
-            self._result_cache = None
-            return fast
-        # Live native handle (filter/exclude wired) → full UPDATE compile.
+        # An authoritative native filter compiles all assignments in one hop.
         native_upd = self._native_terminal_update(kwargs)
         if native_upd is not _FAST_PATH_MISS:
             self._result_cache = None
             return native_upd
+        # Legacy mirrored single-row exact-lookup fast path.
+        fast = self._fast_path_simple_filter_update(kwargs)
+        if fast is not _FAST_PATH_MISS:
+            self._result_cache = None
+            return fast
         query = self.query.chain(sql.UpdateQuery)
         query.add_update_values(kwargs)
 
@@ -2276,9 +2343,7 @@ class QuerySet(AltersData):
         if self._result_cache is None:
             return self.query.has_results(using=self.db)
         if _native.AVAILABLE:
-            return _native.queryset_exists_from_cache(
-                True, bool(self._result_cache)
-            )
+            return _native.queryset_exists_from_cache(True, bool(self._result_cache))
         return bool(self._result_cache)
 
     async def aexists(self):
@@ -2381,13 +2446,62 @@ class QuerySet(AltersData):
         clone.query.set_values(fields)
         return clone
 
+    def _native_simple_values_projection(self, fields, iterable_class):
+        """Keep a concrete-field projection in the authoritative native plan."""
+        from django import native as _native
+
+        if (
+            not _native.AVAILABLE
+            or not fields
+            or not all(isinstance(field, str) for field in fields)
+            or len(set(fields)) != len(fields)
+        ):
+            return None
+        if not self._native_authoritative and not self._simple_base_eligible():
+            return None
+
+        clone = self._chain()
+        plan = clone._native_plan_candidate("values", fields)
+        if plan is None:
+            return None
+        clone._native_store_plan(plan)
+        clone._fields = tuple(fields)
+        handle = clone._native_qs
+        if handle is not None:
+            try:
+                if iterable_class is ValuesIterable:
+                    projected = handle.with_values(list(fields))
+                else:
+                    projected = handle.with_values_list(
+                        list(fields), iterable_class is FlatValuesListIterable
+                    )
+            except Exception:
+                projected = None
+            if projected is None:
+                clone._native_materialize_python_query()
+                clone._native_disabled = True
+                clone._native_qs = None
+                clone.query.set_values(fields)
+                clone._iterable_class = iterable_class
+                return clone
+            clone._native_qs = projected
+
+        clone._iterable_class = iterable_class
+        return clone
+
     def values(self, *fields, **expressions):
+        if not expressions and fields:
+            native = self._native_simple_values_projection(fields, ValuesIterable)
+            if native is not None:
+                return native
         fields += tuple(expressions)
         clone = self._values(*fields, **expressions)
         clone._iterable_class = ValuesIterable
         return clone
 
     def values_list(self, *fields, flat=False, named=False):
+        from django import native as _native
+
         # Keep validation in pure Python (native hop was net-negative on hot paths).
         if flat and named:
             raise TypeError("'flat' and 'named' can't be used together.")
@@ -2398,6 +2512,12 @@ class QuerySet(AltersData):
             )
         if flat and not fields:
             fields = [self.model._meta.concrete_fields[0].attname]
+
+        if not named and fields and all(isinstance(field, str) for field in fields):
+            iterable_class = FlatValuesListIterable if flat else ValuesListIterable
+            native = self._native_simple_values_projection(fields, iterable_class)
+            if native is not None:
+                return native
 
         field_names = {f: False for f in fields if not hasattr(f, "resolve_expression")}
         _fields = []
@@ -2429,7 +2549,9 @@ class QuerySet(AltersData):
                     if suffix.isdigit():
                         counter = int(suffix) + 1
                 else:
-                    while (field_name := f"{field_name_prefix}{counter}") in field_names:
+                    while (
+                        field_name := f"{field_name_prefix}{counter}"
+                    ) in field_names:
                         counter += 1
             if expression is not None:
                 expressions[field_name] = expression
@@ -2566,45 +2688,49 @@ class QuerySet(AltersData):
         return self._filter_or_exclude(True, args, kwargs)
 
     def _filter_or_exclude(self, negate, args, kwargs):
-        from django import native as _native
-
-        if _native.AVAILABLE:
-            if _native.filter_after_slice_error(
-                bool(args or kwargs), self.query.is_sliced
-            ):
-                raise TypeError("Cannot filter a query once a slice has been taken.")
-        elif (args or kwargs) and self.query.is_sliced:
+        if (
+            (args or kwargs)
+            and self._query is not None
+            and self._query.is_sliced
+        ):
             raise TypeError("Cannot filter a query once a slice has been taken.")
         clone = self._chain()
         if self._defer_next_filter:
             self._defer_next_filter = False
             clone._deferred_filter = negate, args, kwargs
         else:
-            clone._filter_or_exclude_inplace(negate, args, kwargs)
-            clone._native_track_filter(negate, args, kwargs)
-        return clone
-
-    def _filter_or_exclude_inplace(self, negate, args, kwargs):
-        from django import native as _native
-
-        if _native.AVAILABLE:
-            invalid_kwargs = _native.prohibited_filter_kwargs(list(kwargs.keys()))
+            invalid_kwargs = PROHIBITED_FILTER_KWARGS.intersection(kwargs)
             if invalid_kwargs:
-                invalid_kwargs_str = ", ".join(f"'{k}'" for k in invalid_kwargs)
+                invalid_kwargs_str = ", ".join(f"'{k}'" for k in sorted(invalid_kwargs))
                 raise TypeError(
                     f"The following kwargs are invalid: {invalid_kwargs_str}"
                 )
-        elif invalid_kwargs := PROHIBITED_FILTER_KWARGS.intersection(kwargs):
+            if not clone._native_defer_simple_filter(
+                negate, args, kwargs
+            ) and not clone._native_apply_filter(negate, args, kwargs):
+                clone._native_materialize_python_query()
+                clone._filter_or_exclude_inplace(negate, args, kwargs)
+                clone._native_disabled = True
+                clone._native_qs = None
+        return clone
+
+    def _filter_or_exclude_inplace(self, negate, args, kwargs):
+        if invalid_kwargs := PROHIBITED_FILTER_KWARGS.intersection(kwargs):
             invalid_kwargs_str = ", ".join(f"'{k}'" for k in sorted(invalid_kwargs))
             raise TypeError(f"The following kwargs are invalid: {invalid_kwargs_str}")
+        query = self._query
+        if query is None:
+            query = self._query = sql.Query(self.model)
         if negate:
-            self._query.add_q(~Q(*args, **kwargs))
+            query.add_q(~Q(*args, **kwargs))
         else:
-            self._query.add_q(Q(*args, **kwargs))
+            query.add_q(Q(*args, **kwargs))
 
     def _native_eligible_for_dataplane(self):
         """Query shapes the C++ data plane can still own."""
-        query = self.query
+        query = self._query
+        if query is None:
+            return True
         # Annotations/select_related may be owned by the native handle itself.
         if (
             query.combinator
@@ -2615,52 +2741,213 @@ class QuerySet(AltersData):
             return False
         return True
 
-    def _native_track_filter(self, negate, args, kwargs):
-        """
-        Mirror filter/exclude onto a C++ QuerySet handle when possible.
+    def _native_store_plan(self, plan):
+        if plan is None:
+            return False
+        self._native_plan = plan
+        self._native_authoritative = True
+        return True
 
-        On miss, poison the handle so we never mix partial native state.
-        """
-        if getattr(self, "_native_disabled", False):
+    def _native_plan_candidate(self, operation, payload):
+        """Validate one operation against the registered C++ model schema."""
+        from django.native import orm as native_orm
+
+        orm = native_orm._orm()
+        if orm is None:
+            return None
+        plan = self._native_plan
+        if plan is not None:
+            if operation == "q":
+                return plan.with_q(payload)
+            if operation == "ordering":
+                return plan.with_ordering(payload)
+            if operation == "values":
+                return plan.with_values(payload)
+            return None
+        mid = native_orm.register_model_from_meta(self.model)
+        if mid is None:
+            return None
+        if operation == "q":
+            return orm.QueryPlan.for_q(int(mid), payload)
+        if operation == "ordering":
+            return orm.QueryPlan.for_ordering(int(mid), payload)
+        if operation == "values":
+            return orm.QueryPlan.for_values(int(mid), payload)
+        return None
+
+    def _native_plan_with_q(self, tree):
+        return self._native_store_plan(self._native_plan_candidate("q", tree))
+
+    def _native_plan_with_ordering(self, field_names):
+        return self._native_store_plan(
+            self._native_plan_candidate("ordering", field_names)
+        )
+
+    def _native_plan_with_values(self, fields):
+        return self._native_store_plan(
+            self._native_plan_candidate("values", fields)
+        )
+
+    def _native_materialize_python_query(self):
+        """Replay the compact native plan into a Python Query on demand."""
+        if not self._native_authoritative:
             return
-        if not args and not kwargs:
-            return
+        query = (
+            self._query.chain()
+            if self._query is not None
+            else sql.Query(self.model)
+        )
+        replay = self._native_plan.replay() if self._native_plan is not None else ()
+        for operation in replay:
+            kind = operation[0]
+            if kind == "filter":
+                query.add_q(_q_from_native_tree(operation[1]))
+            elif kind == "order_by":
+                query.clear_ordering(force=True, clear_default=False)
+                query.add_ordering(*operation[1])
+            elif kind == "values":
+                query.set_values(operation[1])
+        self._query = query
+        self._native_authoritative = False
+        self._native_plan = None
+        self._native_disabled = True
+        self._native_qs = None
+
+    def _native_has_only_projection(self):
+        return (
+            self._native_authoritative
+            and self._native_plan is not None
+            and self._native_plan.has_only_projection()
+        )
+
+    def _native_plan_has_simple_filter(self):
+        return (
+            self._native_authoritative
+            and self._native_plan is not None
+            and self._native_plan.has_simple_filter()
+        )
+
+    def _native_ordering_is_safe(self, field_names):
+        if self.model._meta.parents:
+            return False
+        for item in field_names:
+            if not isinstance(item, str) or item == "?":
+                return False
+            name = item.removeprefix("-")
+            if not name or LOOKUP_SEP in name:
+                return False
+        return True
+
+    def _native_defer_simple_filter(self, negate, args, kwargs):
+        """Keep one safe primitive exact/IN filter for a fused terminal call."""
+        if (
+            negate
+            or args
+            or len(kwargs) != 1
+            or self._native_authoritative
+            or self._native_qs is not None
+            or self._native_disabled
+            or self.model._meta.parents
+            or self.model._meta.ordering
+            or not self._simple_base_eligible()
+        ):
+            return False
         try:
             from django.native import orm as native_orm
 
-            if native_orm._orm() is None:
-                self._native_disabled = True
-                return
-            if not self._native_eligible_for_dataplane():
-                self._native_disabled = True
-                self._native_qs = None
-                return
+            orm = native_orm._orm()
+            if orm is None:
+                return False
+            key, value = next(iter(kwargs.items()))
+            if not isinstance(key, str):
+                return False
+            parts = key.split(LOOKUP_SEP)
+            lookup_in = len(parts) == 2 and parts[1] == "in"
+            if len(parts) != (2 if lookup_in else 1):
+                return False
+            if lookup_in:
+                if not isinstance(value, (list, tuple)) or not value:
+                    return False
+                values = tuple(value)
+            else:
+                values = (value,)
+            mid = native_orm.register_model_from_meta(self.model)
+            if mid is None:
+                return False
+            plan = orm.QueryPlan.for_simple_filter(
+                int(mid), parts[0], lookup_in, values
+            )
+            return self._native_store_plan(plan)
+        except Exception:
+            return False
+
+    def _native_apply_filter(self, negate, args, kwargs):
+        """Apply a filter to the authoritative C++ graph without Python Query."""
+        if not args and not kwargs:
+            return True
+        if getattr(self, "_native_disabled", False):
+            return False
+        try:
+            from django.native import orm as native_orm
+
+            orm = native_orm._orm()
+            if orm is None or not self._native_eligible_for_dataplane():
+                return False
+            if not self._native_authoritative and not self._simple_base_eligible():
+                return False
             q_obj = Q(*args, **kwargs)
             if negate:
                 q_obj = ~q_obj
+            if self.model._meta.ordering:
+                return False
+            tree = native_orm.q_to_tree(q_obj)
+            if tree is None:
+                return False
+            plan = self._native_plan_candidate("q", tree)
+            if plan is None:
+                return False
             handle = getattr(self, "_native_qs", None)
+            # A deferred simple filter has no C++ handle yet. Starting a new
+            # handle from only this Q object would silently omit that first
+            # predicate, so let the caller replay both filters into Python.
+            if handle is None and self._native_plan_has_simple_filter():
+                return False
             if handle is None:
-                handle = native_orm.build_queryset(
-                    self.model, connections[self.db], q=q_obj
+                mid = native_orm.register_model_from_meta(self.model)
+                dialect = native_orm.dialect_for_connection(connections[self.db])
+                if mid is None or dialect is None:
+                    return False
+                handle = orm.QuerySet.create_from_native_q(
+                    int(mid), int(dialect), tree
                 )
                 if handle is None:
-                    self._native_disabled = True
-                    self._native_qs = None
-                    return
+                    return False
+                # values()/values_list() may precede filter().
+                if self._fields is not None:
+                    if self._iterable_class is ValuesIterable:
+                        if not handle.values(list(self._fields)):
+                            return False
+                    elif self._iterable_class in (
+                        ValuesListIterable,
+                        FlatValuesListIterable,
+                    ):
+                        if not handle.values_list(
+                            list(self._fields),
+                            self._iterable_class is FlatValuesListIterable,
+                        ):
+                            return False
                 self._native_qs = handle
             else:
-                cloned = handle.clone()
-                if not native_orm.apply_q(cloned, q_obj):
-                    self._native_disabled = True
-                    self._native_qs = None
-                    return
-                self._native_qs = cloned
+                handle = handle.with_native_q(tree)
+                if handle is None:
+                    return False
+                self._native_qs = handle
+            return self._native_store_plan(plan)
         except Exception:
-            self._native_disabled = True
-            self._native_qs = None
+            return False
 
     def _native_handle_for_sql(self):
-        if getattr(self, "_native_disabled", False):
+        if getattr(self, "_native_disabled", False) or not self._native_authoritative:
             return None
         handle = getattr(self, "_native_qs", None)
         if handle is None:
@@ -2801,16 +3088,10 @@ class QuerySet(AltersData):
         obj = self._chain()
         if fields == (None,):
             obj.query.select_related = False
-            if getattr(obj, "_native_qs", None) is not None:
-                # Cannot clear joins easily; poison native for this branch.
-                obj._native_disabled = True
-                obj._native_qs = None
         elif fields:
             obj.query.add_select_related(fields)
-            obj._native_track_select_related(fields)
         else:
             obj.query.select_related = True
-            obj._native_track_select_related_all()
         return obj
 
     def _native_ensure_handle(self):
@@ -2826,9 +3107,7 @@ class QuerySet(AltersData):
             if handle is None:
                 if not self._native_eligible_for_dataplane():
                     return None
-                handle = native_orm.build_queryset(
-                    self.model, connections[self.db]
-                )
+                handle = native_orm.build_queryset(self.model, connections[self.db])
                 if handle is None:
                     return None
                 self._native_qs = handle
@@ -2922,9 +3201,10 @@ class QuerySet(AltersData):
                 elif isinstance(expr, Subquery):
                     # Prefer fully native nested QuerySet when possible.
                     sub_qs = getattr(expr, "queryset", None)
-                    if sub_qs is not None and getattr(
-                        sub_qs, "_native_qs", None
-                    ) is not None:
+                    if (
+                        sub_qs is not None
+                        and getattr(sub_qs, "_native_qs", None) is not None
+                    ):
                         if not h.annotate_subquery_qs(alias, sub_qs._native_qs):
                             self._native_disabled = True
                             self._native_qs = None
@@ -3012,9 +3292,7 @@ class QuerySet(AltersData):
                     lhs, rhs = expr.lhs, expr.rhs
                     connector = expr.connector  # '+', '-', etc.
                     if isinstance(lhs, F) and isinstance(rhs, Value):
-                        ok = h.annotate_binop(
-                            alias, lhs.name, connector, rhs.value
-                        )
+                        ok = h.annotate_binop(alias, lhs.name, connector, rhs.value)
                     elif isinstance(lhs, F) and isinstance(rhs, F):
                         ok = h.annotate_binop_fields(
                             alias, lhs.name, connector, rhs.name
@@ -3045,54 +3323,21 @@ class QuerySet(AltersData):
         When prefetch_related() is called more than once, append to the list of
         prefetch lookups. If prefetch_related(None) is called, clear the list.
         """
-        from django import native as _native
-
         self._not_support_combined_queries("prefetch_related")
         clone = self._chain()
-        clear = (
-            _native.clear_none_arg(lookups == (None,))
-            if _native.AVAILABLE
-            else lookups == (None,)
-        )
-        if clear:
+        if lookups == (None,):
             clone._prefetch_related_lookups = ()
-            if getattr(clone, "_native_qs", None) is not None:
-                # Prefetch list cleared; leave handle otherwise intact.
-                pass
         else:
             for lookup in lookups:
                 if isinstance(lookup, Prefetch):
                     lookup = lookup.prefetch_to
-                if _native.AVAILABLE:
-                    lookup = _native.lookup_head(str(lookup))
-                else:
-                    lookup = lookup.split(LOOKUP_SEP, 1)[0]
+                lookup = lookup.split(LOOKUP_SEP, 1)[0]
                 if lookup in self.query._filtered_relations:
                     raise ValueError(
                         "prefetch_related() is not supported with FilteredRelation."
                     )
             clone._prefetch_related_lookups = clone._prefetch_related_lookups + lookups
-            clone._native_track_prefetch(lookups)
         return clone
-
-    def _native_track_prefetch(self, lookups):
-        if getattr(self, "_native_disabled", False):
-            return
-        try:
-            h = self._native_ensure_handle()
-            if h is None:
-                return
-            for lookup in lookups:
-                if isinstance(lookup, Prefetch):
-                    path = lookup.prefetch_to
-                else:
-                    path = str(lookup)
-                # Full multi-hop path: C++ emits one PrefetchSpec per hop.
-                if not h.add_prefetch(path):
-                    # Leave Django prefetch list intact for fallback
-                    continue
-        except Exception:
-            pass
 
     def annotate(self, *args, **kwargs):
         """
@@ -3132,7 +3377,6 @@ class QuerySet(AltersData):
         annotations.update(kwargs)
 
         clone = self._chain()
-        clone._native_track_annotate(annotations, select=select)
         names = self._fields
         if names is None:
             names = set(
@@ -3180,12 +3424,50 @@ class QuerySet(AltersData):
         """Return a new QuerySet instance with the ordering changed."""
         from django import native as _native
 
-        if _native.AVAILABLE:
-            if _native.queryset_sliced_error(self.query.is_sliced):
-                raise TypeError("Cannot reorder a query once a slice has been taken.")
-        elif self.query.is_sliced:
+        if self._query is not None and self._query.is_sliced:
             raise TypeError("Cannot reorder a query once a slice has been taken.")
         obj = self._chain()
+        if _native.AVAILABLE and obj._native_ordering_is_safe(field_names):
+            if (
+                obj._native_qs is None
+                and obj._native_authoritative
+                and obj._native_plan_has_simple_filter()
+            ):
+                if obj._native_plan_with_ordering(field_names):
+                    return obj
+            try:
+                from django.native import orm as native_orm
+
+                handle = obj._native_qs
+                if handle is not None and not obj._native_authoritative:
+                    handle = None
+                if handle is None and obj._simple_base_eligible():
+                    handle = native_orm.build_queryset(obj.model, connections[obj.db])
+                    if handle is not None and obj._fields is not None:
+                        if obj._iterable_class is ValuesIterable:
+                            projected = handle.values(list(obj._fields))
+                        else:
+                            projected = handle.values_list(
+                                list(obj._fields),
+                                obj._iterable_class is FlatValuesListIterable,
+                            )
+                        if not projected:
+                            handle = None
+                ordered = (
+                    handle.with_ordering(list(field_names))
+                    if handle is not None
+                    else None
+                )
+                if ordered is not None:
+                    obj._native_qs = ordered
+                    if obj._native_plan_with_ordering(field_names):
+                        return obj
+            except Exception:
+                pass
+
+        obj._native_materialize_python_query()
+        obj._native_disabled = True
+        obj._native_qs = None
         obj.query.clear_ordering(force=True, clear_default=False)
         obj.query.add_ordering(*field_names)
         return obj
@@ -3265,9 +3547,7 @@ class QuerySet(AltersData):
                 False, False, False, self._fields is not None
             )
             if code == 4:
-                raise TypeError(
-                    "Cannot call defer() after .values() or .values_list()"
-                )
+                raise TypeError("Cannot call defer() after .values() or .values_list()")
         elif self._fields is not None:
             raise TypeError("Cannot call defer() after .values() or .values_list()")
         clone = self._chain()
@@ -3296,16 +3576,12 @@ class QuerySet(AltersData):
                 False, False, False, self._fields is not None
             )
             if code == 4:
-                raise TypeError(
-                    "Cannot call only() after .values() or .values_list()"
-                )
+                raise TypeError("Cannot call only() after .values() or .values_list()")
             if _native.only_none_arg_error(fields == (None,)):
                 raise TypeError("Cannot pass None as an argument to only().")
         else:
             if self._fields is not None:
-                raise TypeError(
-                    "Cannot call only() after .values() or .values_list()"
-                )
+                raise TypeError("Cannot call only() after .values() or .values_list()")
             if fields == (None,):
                 # Can only pass None to defer(), not only(), as the rest option.
                 # That won't stop people trying to do this, so let's be explicit.
@@ -3476,14 +3752,8 @@ class QuerySet(AltersData):
         Return a copy of the current QuerySet that's ready for another
         operation.
         """
-        from django import native as _native
-
         obj = self._clone()
-        if _native.AVAILABLE:
-            if _native.sticky_filter_active(obj._sticky_filter):
-                obj.query.filter_is_sticky = True
-                obj._sticky_filter = False
-        elif obj._sticky_filter:
+        if obj._sticky_filter:
             obj.query.filter_is_sticky = True
             obj._sticky_filter = False
         return obj
@@ -3493,11 +3763,20 @@ class QuerySet(AltersData):
         Return a copy of the current QuerySet. A lightweight alternative
         to deepcopy().
         """
+        native_authoritative = getattr(self, "_native_authoritative", False)
+        if self._deferred_filter:
+            # Related managers deliberately defer their core filter until the
+            # Query is cloned. Preserve Django's property-access semantics.
+            query = self.query.chain()
+            native_authoritative = False
+        else:
+            query = (
+                self._query
+                if native_authoritative or self._query is None
+                else self.query.chain()
+            )
         c = self.__class__(
-            model=self.model,
-            query=self.query.chain(),
-            using=self._db,
-            hints=self._hints,
+            model=self.model, query=query, using=self._db, hints=self._hints
         )
         c._sticky_filter = self._sticky_filter
         c._for_write = self._for_write
@@ -3505,19 +3784,17 @@ class QuerySet(AltersData):
         c._known_related_objects = self._known_related_objects
         c._iterable_class = self._iterable_class
         c._fields = self._fields
-        # Native data-plane handle (cloned; mutations must not alias parent).
+        # Native mutations are functional COW operations, so cloning the
+        # Python QuerySet can share this wrapper without a native crossing.
         parent_native = getattr(self, "_native_qs", None)
         if parent_native is not None:
-            try:
-                c._native_qs = parent_native.clone()
-            except Exception:
-                c._native_qs = None
-                c._native_disabled = True
-            else:
-                c._native_disabled = getattr(self, "_native_disabled", False)
+            c._native_qs = parent_native
+            c._native_disabled = getattr(self, "_native_disabled", False)
         else:
             c._native_qs = None
             c._native_disabled = getattr(self, "_native_disabled", False)
+        c._native_authoritative = native_authoritative
+        c._native_plan = getattr(self, "_native_plan", None)
         return c
 
     def _fetch_all(self):
@@ -3606,10 +3883,11 @@ class QuerySet(AltersData):
             )
 
     def _not_support_combined_queries(self, operation_name):
-        if self.query.combinator:
+        combinator = self._query.combinator if self._query is not None else None
+        if combinator:
             raise NotSupportedError(
                 "Calling QuerySet.%s() after %s() is not supported."
-                % (operation_name, self.query.combinator)
+                % (operation_name, combinator)
             )
 
     def _check_operator_queryset(self, other, operator_):

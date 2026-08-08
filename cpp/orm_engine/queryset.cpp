@@ -1,5 +1,7 @@
 #include "orm_engine/queryset.hpp"
 
+#include <algorithm>
+
 namespace django::orm {
 namespace {
 
@@ -21,13 +23,168 @@ std::vector<std::string> split_lookup_sep(std::string_view key) {
 
 }  // namespace
 
-QuerySet::QuerySet(ModelId model, DialectId dialect) {
-  query_.model = model;
-  query_.dialect = dialect;
+QueryPlan::QueryPlan(ModelId model)
+    : model_(model),
+      schema_generation_(SchemaRegistry::instance().generation()) {}
+
+bool QueryPlan::matches_model(ModelId model) const {
+  return model_ && *model_ == model &&
+         schema_generation_ == SchemaRegistry::instance().generation() &&
+         SchemaRegistry::instance().get(model) != nullptr;
+}
+
+QueryPlan QueryPlan::with_filter(QNode filter) const {
+  Operation operation;
+  operation.kind = OperationKind::Filter;
+  operation.filter = std::move(filter);
+  return append(std::move(operation));
+}
+
+QueryPlan QueryPlan::with_simple_filter(
+    std::string lookup_field, bool lookup_in,
+    std::vector<ParamValue> lookup_values) const {
+  Operation operation;
+  operation.kind = OperationKind::Filter;
+  operation.simple_filter = true;
+  operation.lookup_field = std::move(lookup_field);
+  operation.lookup_in = lookup_in;
+  operation.filter.kind = 3;
+  operation.filter.key = operation.lookup_field;
+  if (lookup_in) {
+    operation.filter.key += "__in";
+  }
+  operation.filter.values = std::move(lookup_values);
+  return append(std::move(operation));
+}
+
+QueryPlan QueryPlan::with_ordering(
+    std::vector<std::string> field_names) const {
+  Operation operation;
+  operation.kind = OperationKind::OrderBy;
+  operation.names = std::move(field_names);
+  return append(std::move(operation));
+}
+
+QueryPlan QueryPlan::with_values(
+    std::vector<std::string> field_names) const {
+  Operation operation;
+  operation.kind = OperationKind::Values;
+  operation.names = std::move(field_names);
+  return append(std::move(operation));
+}
+
+QueryPlan QueryPlan::append(Operation operation) const {
+  QueryPlan out;
+  out.tail_ = std::make_shared<Node>(Node{std::move(operation), tail_});
+  out.model_ = model_;
+  out.schema_generation_ = schema_generation_;
+  return out;
+}
+
+std::vector<QueryPlan::Operation> QueryPlan::operations() const {
+  std::vector<Operation> out;
+  for (auto node = tail_; node; node = node->previous) {
+    out.push_back(node->operation);
+  }
+  std::reverse(out.begin(), out.end());
+  return out;
+}
+
+bool QueryPlan::has_only_projection() const {
+  if (!tail_) {
+    return false;
+  }
+  for (auto node = tail_; node; node = node->previous) {
+    if (node->operation.kind != OperationKind::Values) {
+      return false;
+    }
+  }
+  return true;
+}
+
+bool QueryPlan::has_simple_filter() const {
+  for (auto node = tail_; node; node = node->previous) {
+    if (node->operation.kind == OperationKind::Filter &&
+        node->operation.simple_filter) {
+      return true;
+    }
+  }
+  return false;
+}
+
+std::optional<QueryPlan::SimpleValuesShape> QueryPlan::simple_values_shape()
+    const {
+  SimpleValuesShape shape;
+  std::size_t filter_count = 0;
+  std::size_t projection_count = 0;
+  bool found_ordering = false;
+  for (auto node = tail_; node; node = node->previous) {
+    const auto& operation = node->operation;
+    switch (operation.kind) {
+      case OperationKind::Filter:
+        if (!operation.simple_filter) {
+          return std::nullopt;
+        }
+        ++filter_count;
+        shape.lookup_field = operation.lookup_field;
+        shape.lookup_in = operation.lookup_in;
+        shape.lookup_values = &operation.filter.values;
+        break;
+      case OperationKind::OrderBy:
+        // Traversal is newest to oldest; Django's latest order_by() wins.
+        if (!found_ordering) {
+          shape.ordering = operation.names;
+          found_ordering = true;
+        }
+        break;
+      case OperationKind::Values:
+        ++projection_count;
+        shape.fields = operation.names;
+        break;
+    }
+  }
+  if (filter_count != 1 || projection_count != 1 || shape.fields.empty() ||
+      shape.lookup_values == nullptr || shape.lookup_values->empty()) {
+    return std::nullopt;
+  }
+  return shape;
+}
+
+std::optional<QueryPlan::SimpleUpdateShape> QueryPlan::simple_update_shape()
+    const {
+  if (!tail_ || tail_->previous) {
+    return std::nullopt;
+  }
+  const auto& operation = tail_->operation;
+  if (operation.kind != OperationKind::Filter || !operation.simple_filter ||
+      operation.lookup_in || operation.filter.values.size() != 1) {
+    return std::nullopt;
+  }
+  return SimpleUpdateShape{operation.lookup_field,
+                           &operation.filter.values.front()};
+}
+
+QuerySet::QuerySet() : state_(std::make_shared<State>()) {}
+
+QuerySet::QuerySet(ModelId model, DialectId dialect) : QuerySet() {
+  q().model = model;
+  q().dialect = dialect;
   const ModelSchema* m = SchemaRegistry::instance().get(model);
   if (m) {
-    query_.base_alias = m->db_table;
+    q().base_alias = m->db_table;
   }
+}
+
+void QuerySet::detach() {
+  if (state_.use_count() != 1) {
+    state_ = std::make_shared<State>(*state_);
+  }
+}
+
+QuerySet::State& QuerySet::s() {
+  detach();
+  state_->compiled.reset();
+  return *state_;
 }
 
 QuerySet QuerySet::clone() const {
@@ -36,7 +193,7 @@ QuerySet QuerySet::clone() const {
 }
 
 std::optional<FieldId> QuerySet::resolve_field(std::string_view name) const {
-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
   if (!m) {
     return std::nullopt;
   }
@@ -49,11 +206,11 @@ std::optional<FieldId> QuerySet::resolve_field(std::string_view name) const {
 
 bool QuerySet::append_pred(Pred p) {
   BoolExpr atom = bool_atom(std::move(p));
-  if (!query_.has_where) {
-    query_.where = std::move(atom);
-    query_.has_where = true;
+  if (!q().has_where) {
+    q().where = std::move(atom);
+    q().has_where = true;
   } else {
-    bool_and_append(query_.where, std::move(atom));
+    bool_and_append(q().where, std::move(atom));
   }
   return true;
 }
@@ -93,7 +250,7 @@ bool QuerySet::filter_cmp(std::string_view field_name, CmpOp op, ParamValue valu
   Pred p;
   p.op = op;
   p.lhs = col;
-  p.param_idxs.push_back(query_.add_param(std::move(value)));
+  p.param_idxs.push_back(q().add_param(std::move(value)));
   return append_pred(std::move(p));
 }
 
@@ -138,7 +295,7 @@ bool QuerySet::filter_in(std::string_view field_name,
   p.op = CmpOp::In;
   p.lhs = col;
   for (auto& v : values) {
-    p.param_idxs.push_back(query_.add_param(std::move(v)));
+    p.param_idxs.push_back(q().add_param(std::move(v)));
   }
   return append_pred(std::move(p));
 }
@@ -167,7 +324,7 @@ bool QuerySet::filter_subquery(std::string_view field_name, CmpOp op,
     p.rhs_sql = std::move(subquery_sql);
   }
   for (auto& v : subquery_params) {
-    p.rhs_sql_param_idxs.push_back(query_.add_param(std::move(v)));
+    p.rhs_sql_param_idxs.push_back(q().add_param(std::move(v)));
   }
   return append_pred(std::move(p));
 }
@@ -186,7 +343,7 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
     return {};
   }
   std::string prefix(path_prefix);
-  if (auto jt = join_aliases_.find(prefix); jt != join_aliases_.end()) {
+  if (auto jt = s().join_aliases.find(prefix); jt != s().join_aliases.end()) {
     return jt->second;
   }
 
@@ -203,8 +360,8 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
     if (rel.m2m_table.empty()) {
       return {};
     }
-    std::string through_alias = "T" + std::to_string(++join_counter_);
-    std::string remote_alias = "J" + std::to_string(++join_counter_);
+    std::string through_alias = "T" + std::to_string(++s().join_counter);
+    std::string remote_alias = "J" + std::to_string(++s().join_counter);
     JoinEdge through;
     through.type = join_type;
     through.alias = through_alias;
@@ -222,13 +379,13 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
                               ? std::string("to_id")
                               : rel.m2m_reverse_column;
     remote.remote_column = remote_pk;
-    query_.joins.push_back(std::move(through));
-    query_.joins.push_back(std::move(remote));
-    join_aliases_[prefix] = remote_alias;
+    q().joins.push_back(std::move(through));
+    q().joins.push_back(std::move(remote));
+    s().join_aliases[prefix] = remote_alias;
     return remote_alias;
   }
 
-  std::string alias = "J" + std::to_string(++join_counter_);
+  std::string alias = "J" + std::to_string(++s().join_counter);
   JoinEdge edge;
   edge.type = join_type;
   edge.alias = alias;
@@ -243,8 +400,8 @@ std::string QuerySet::ensure_join(const ModelSchema& local_model,
     edge.local_column = rel.column;
     edge.remote_column = remote_pk;
   }
-  query_.joins.push_back(std::move(edge));
-  join_aliases_[prefix] = alias;
+  q().joins.push_back(std::move(edge));
+  s().join_aliases[prefix] = alias;
   return alias;
 }
 
@@ -255,12 +412,12 @@ std::string QuerySet::ensure_path_joins(std::string_view path, JoinType join_typ
     return {};
   }
   const SchemaRegistry& reg = SchemaRegistry::instance();
-  const ModelSchema* current = reg.get(query_.model);
+  const ModelSchema* current = reg.get(q().model);
   if (!current) {
     return {};
   }
   std::string current_alias =
-      query_.base_alias.empty() ? current->db_table : query_.base_alias;
+      q().base_alias.empty() ? current->db_table : q().base_alias;
   std::string path_prefix;
   for (std::size_t i = 0; i < parts.size(); ++i) {
     if (!path_prefix.empty()) {
@@ -318,12 +475,12 @@ bool QuerySet::resolve_lookup_key(std::string_view key, ColumnRef& col, CmpOp& o
   }
 
   const SchemaRegistry& reg = SchemaRegistry::instance();
-  const ModelSchema* current = reg.get(query_.model);
+  const ModelSchema* current = reg.get(q().model);
   if (!current) {
     return false;
   }
   std::string current_alias =
-      query_.base_alias.empty() ? current->db_table : query_.base_alias;
+      q().base_alias.empty() ? current->db_table : q().base_alias;
   std::string path_prefix;
 
   for (std::size_t i = 0; i + 1 < path.size(); ++i) {
@@ -410,7 +567,7 @@ std::optional<Pred> QuerySet::pred_from_key_values(
     }
     p.op = CmpOp::In;
     for (const auto& v : values) {
-      p.param_idxs.push_back(query_.add_param(v));
+      p.param_idxs.push_back(q().add_param(v));
     }
     return p;
   }
@@ -418,7 +575,7 @@ std::optional<Pred> QuerySet::pred_from_key_values(
     return std::nullopt;
   }
   p.op = op;
-  p.param_idxs.push_back(query_.add_param(values[0]));
+  p.param_idxs.push_back(q().add_param(values[0]));
   return p;
 }
 
@@ -443,7 +600,7 @@ std::optional<Pred> QuerySet::pred_from_q_atom(const QNode& node) {
       p.rhs_sql = "(" + node.rhs_sql + ")";
     }
     for (const auto& v : node.rhs_params) {
-      p.rhs_sql_param_idxs.push_back(query_.add_param(v));
+      p.rhs_sql_param_idxs.push_back(q().add_param(v));
     }
     return p;
   }
@@ -466,13 +623,13 @@ bool QuerySet::filter_kwargs(
   }
   BoolExpr combined =
       disjunctive ? bool_or(std::move(atoms)) : bool_and(std::move(atoms));
-  if (!query_.has_where) {
-    query_.where = std::move(combined);
-    query_.has_where = true;
+  if (!q().has_where) {
+    q().where = std::move(combined);
+    q().has_where = true;
   } else if (disjunctive) {
-    bool_or_append(query_.where, std::move(combined));
+    bool_or_append(q().where, std::move(combined));
   } else {
-    bool_and_append(query_.where, std::move(combined));
+    bool_and_append(q().where, std::move(combined));
   }
   return true;
 }
@@ -531,26 +688,26 @@ bool QuerySet::apply_q(const QNode& node) {
       node.kind == 0) {
     return true;
   }
-  if (!query_.has_where) {
-    query_.where = std::move(*expr);
-    query_.has_where = true;
+  if (!q().has_where) {
+    q().where = std::move(*expr);
+    q().has_where = true;
   } else {
-    bool_and_append(query_.where, std::move(*expr));
+    bool_and_append(q().where, std::move(*expr));
   }
   return true;
 }
 
 bool QuerySet::values(const std::vector<std::string>& field_names, bool out_aliases,
                       ResultMode mode) {
-  query_.select.clear();
-  query_.related_selects.clear();
-  query_.base_attnames.clear();
-  query_.result_mode = mode;
-  query_.kind = StmtKind::Select;
+  q().select.clear();
+  q().related_selects.clear();
+  q().base_attnames.clear();
+  q().result_mode = mode;
+  q().kind = StmtKind::Select;
   for (const auto& name : field_names) {
     auto fid = resolve_field(name);
     if (!fid) {
-      query_.select.clear();
+      q().select.clear();
       return false;
     }
     SelectItem it;
@@ -558,39 +715,39 @@ bool QuerySet::values(const std::vector<std::string>& field_names, bool out_alia
     if (out_aliases) {
       it.out_alias = name;
     }
-    query_.select.push_back(std::move(it));
-    query_.base_attnames.push_back(name);
+    q().select.push_back(std::move(it));
+    q().base_attnames.push_back(name);
   }
-  query_.base_select_count = static_cast<int>(query_.select.size());
+  q().base_select_count = static_cast<int>(q().select.size());
   return true;
 }
 
 void QuerySet::clear_select() {
-  query_.select.clear();
-  query_.base_attnames.clear();
-  query_.related_selects.clear();
-  query_.base_select_count = 0;
-  query_.kind = StmtKind::Select;
+  q().select.clear();
+  q().base_attnames.clear();
+  q().related_selects.clear();
+  q().base_select_count = 0;
+  q().kind = StmtKind::Select;
 }
 
 bool QuerySet::select_model_columns() {
-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
   if (!m) {
     return false;
   }
   clear_select();
-  query_.result_mode = ResultMode::Model;
+  q().result_mode = ResultMode::Model;
   for (const auto& f : m->fields) {
     if (f.column.empty()) {
       continue;
     }
     SelectItem it;
     it.col.field = f.id;
-    query_.select.push_back(std::move(it));
-    query_.base_attnames.push_back(f.attname.empty() ? f.name : f.attname);
+    q().select.push_back(std::move(it));
+    q().base_attnames.push_back(f.attname.empty() ? f.name : f.attname);
   }
-  query_.base_select_count = static_cast<int>(query_.select.size());
-  return !query_.select.empty();
+  q().base_select_count = static_cast<int>(q().select.size());
+  return !q().select.empty();
 }
 
 bool QuerySet::annotate_aggregate(std::string alias, std::string func,
@@ -615,7 +772,7 @@ bool QuerySet::annotate_aggregate(std::string alias, std::string func,
     }
     it.col = col;
   }
-  query_.select.push_back(std::move(it));
+  q().select.push_back(std::move(it));
   return true;
 }
 
@@ -630,9 +787,9 @@ bool QuerySet::annotate_sql(std::string alias, std::string sql_fragment,
     it.sql_fragment = std::move(sql_fragment);
   }
   for (auto& p : params) {
-    it.fragment_param_idxs.push_back(query_.add_param(std::move(p)));
+    it.fragment_param_idxs.push_back(q().add_param(std::move(p)));
   }
-  query_.select.push_back(std::move(it));
+  q().select.push_back(std::move(it));
   return true;
 }
 
@@ -648,15 +805,15 @@ bool QuerySet::group_by_fields(const std::vector<std::string>& field_names) {
       }
       col.field = *fid;
     }
-    query_.group_by.push_back(col);
+    q().group_by.push_back(col);
   }
   return true;
 }
 
-void QuerySet::group_by_selected_columns() { query_.group_by_all_selected = true; }
+void QuerySet::group_by_selected_columns() { q().group_by_all_selected = true; }
 
 bool QuerySet::add_select_related(std::string_view path) {
-  if (query_.select.empty()) {
+  if (q().select.empty()) {
     if (!select_model_columns()) {
       return false;
     }
@@ -671,7 +828,7 @@ bool QuerySet::add_select_related(std::string_view path) {
   rs.path = std::string(path);
   rs.join_alias = alias;
   rs.model_id = remote->id;
-  rs.select_offset = static_cast<int>(query_.select.size());
+  rs.select_offset = static_cast<int>(q().select.size());
   for (const auto& f : remote->fields) {
     if (f.column.empty()) {
       continue;
@@ -681,11 +838,11 @@ bool QuerySet::add_select_related(std::string_view path) {
     it.col.table_alias = alias;
     it.col.column_override = f.column;
     it.col.field = 0;
-    query_.select.push_back(std::move(it));
+    q().select.push_back(std::move(it));
     rs.field_attnames.push_back(f.attname.empty() ? f.name : f.attname);
   }
   rs.select_count = static_cast<int>(rs.field_attnames.size());
-  query_.related_selects.push_back(std::move(rs));
+  q().related_selects.push_back(std::move(rs));
   return true;
 }
 
@@ -693,13 +850,13 @@ bool QuerySet::add_select_related_all(int max_depth) {
   if (max_depth < 1) {
     return false;
   }
-  if (query_.select.empty()) {
+  if (q().select.empty()) {
     if (!select_model_columns()) {
       return false;
     }
   }
   const SchemaRegistry& reg = SchemaRegistry::instance();
-  const ModelSchema* base = reg.get(query_.model);
+  const ModelSchema* base = reg.get(q().model);
   if (!base) {
     return false;
   }
@@ -710,7 +867,7 @@ bool QuerySet::add_select_related_all(int max_depth) {
     int depth;
   };
   std::vector<Node> queue;
-  queue.push_back({"", query_.model, 0});
+  queue.push_back({"", q().model, 0});
   std::vector<std::string> paths;
   std::size_t qi = 0;
   while (qi < queue.size()) {
@@ -749,7 +906,7 @@ bool QuerySet::add_select_related_all(int max_depth) {
 
 bool QuerySet::add_prefetch(std::string_view lookup) {
   const SchemaRegistry& reg = SchemaRegistry::instance();
-  const ModelSchema* m = reg.get(query_.model);
+  const ModelSchema* m = reg.get(q().model);
   if (!m) {
     return false;
   }
@@ -790,7 +947,7 @@ bool QuerySet::add_prefetch(std::string_view lookup) {
     if (p.parent_pk_column.empty()) {
       p.parent_pk_column = "id";
     }
-    query_.prefetches.push_back(std::move(p));
+    q().prefetches.push_back(std::move(p));
     any = true;
 
     // Advance to remote model for next hop; parent_path accumulates.
@@ -812,8 +969,8 @@ bool QuerySet::add_prefetch(std::string_view lookup) {
 
 std::vector<QuerySet::AnnotationSelect> QuerySet::annotation_selects() const {
   std::vector<AnnotationSelect> out;
-  for (std::size_t i = 0; i < query_.select.size(); ++i) {
-    const SelectItem& it = query_.select[i];
+  for (std::size_t i = 0; i < q().select.size(); ++i) {
+    const SelectItem& it = q().select[i];
     if (it.out_alias.empty()) {
       continue;
     }
@@ -863,7 +1020,7 @@ bool QuerySet::annotate_subquery_qs(std::string alias, const QuerySet& sub) {
 bool QuerySet::annotate_case(
     std::string alias, const std::vector<std::pair<QNode, ParamValue>>& cases,
     bool has_else, ParamValue else_value) {
-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
   if (!m || cases.empty()) {
     return false;
   }
@@ -875,29 +1032,29 @@ bool QuerySet::annotate_case(
       return false;
     }
     frag += " WHEN ";
-    append_bool_sql(frag, order, query_, *m, *when_expr);
+    append_bool_sql(frag, order, q(), *m, *when_expr);
     frag += " THEN %s";
-    order.push_back(query_.add_param(then_val));
+    order.push_back(q().add_param(then_val));
   }
   if (has_else) {
     frag += " ELSE %s";
-    order.push_back(query_.add_param(std::move(else_value)));
+    order.push_back(q().add_param(std::move(else_value)));
   }
   frag += " END";
   // Convert order (param indices) into fragment_param_idxs — already absolute
-  // indices into query_.params.
+  // indices into q().params.
   SelectItem it;
   it.kind = SelectKind::SqlFragment;
   it.out_alias = std::move(alias);
   it.sql_fragment = std::move(frag);
   it.fragment_param_idxs = std::move(order);
-  query_.select.push_back(std::move(it));
+  q().select.push_back(std::move(it));
   return true;
 }
 
 bool QuerySet::annotate_binop(std::string alias, std::string lhs_field,
                               std::string op, ParamValue rhs) {
-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
   if (!m) {
     return false;
   }
@@ -912,7 +1069,7 @@ bool QuerySet::annotate_binop(std::string alias, std::string lhs_field,
     col.field = *fid;
   }
   std::string frag;
-  append_column_sql(frag, query_.dialect, query_, *m, col);
+  append_column_sql(frag, q().dialect, q(), *m, col);
   frag += ' ';
   frag += op;
   frag += " %s";
@@ -920,14 +1077,14 @@ bool QuerySet::annotate_binop(std::string alias, std::string lhs_field,
   it.kind = SelectKind::SqlFragment;
   it.out_alias = std::move(alias);
   it.sql_fragment = std::move(frag);
-  it.fragment_param_idxs.push_back(query_.add_param(std::move(rhs)));
-  query_.select.push_back(std::move(it));
+  it.fragment_param_idxs.push_back(q().add_param(std::move(rhs)));
+  q().select.push_back(std::move(it));
   return true;
 }
 
 bool QuerySet::annotate_binop_fields(std::string alias, std::string lhs_field,
                                      std::string op, std::string rhs_field) {
-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
   if (!m) {
     return false;
   }
@@ -949,16 +1106,16 @@ bool QuerySet::annotate_binop_fields(std::string alias, std::string lhs_field,
     rcol.field = *fid;
   }
   std::string frag;
-  append_column_sql(frag, query_.dialect, query_, *m, lcol);
+  append_column_sql(frag, q().dialect, q(), *m, lcol);
   frag += ' ';
   frag += op;
   frag += ' ';
-  append_column_sql(frag, query_.dialect, query_, *m, rcol);
+  append_column_sql(frag, q().dialect, q(), *m, rcol);
   SelectItem it;
   it.kind = SelectKind::SqlFragment;
   it.out_alias = std::move(alias);
   it.sql_fragment = std::move(frag);
-  query_.select.push_back(std::move(it));
+  q().select.push_back(std::move(it));
   return true;
 }
 
@@ -967,13 +1124,13 @@ bool QuerySet::annotate_value(std::string alias, ParamValue value) {
   it.kind = SelectKind::SqlFragment;
   it.out_alias = std::move(alias);
   it.sql_fragment = "%s";
-  it.fragment_param_idxs.push_back(query_.add_param(std::move(value)));
-  query_.select.push_back(std::move(it));
+  it.fragment_param_idxs.push_back(q().add_param(std::move(value)));
+  q().select.push_back(std::move(it));
   return true;
 }
 
 bool QuerySet::annotate_f(std::string alias, std::string field_name) {
-  const ModelSchema* m = SchemaRegistry::instance().get(query_.model);
+  const ModelSchema* m = SchemaRegistry::instance().get(q().model);
   if (!m) {
     return false;
   }
@@ -988,12 +1145,12 @@ bool QuerySet::annotate_f(std::string alias, std::string field_name) {
     col.field = *fid;
   }
   std::string frag;
-  append_column_sql(frag, query_.dialect, query_, *m, col);
+  append_column_sql(frag, q().dialect, q(), *m, col);
   SelectItem it;
   it.kind = SelectKind::SqlFragment;
   it.out_alias = std::move(alias);
   it.sql_fragment = std::move(frag);
-  query_.select.push_back(std::move(it));
+  q().select.push_back(std::move(it));
   return true;
 }
 
@@ -1009,7 +1166,7 @@ QuerySet::PrefetchSql QuerySet::compile_prefetch_secondary(
   if (!rid) {
     return out;
   }
-  QuerySet sub(*rid, query_.dialect);
+  QuerySet sub(*rid, q().dialect);
   if (!sub.select_model_columns()) {
     return out;
   }
@@ -1103,11 +1260,11 @@ bool QuerySet::add_update(std::string_view field_name, ParamValue value) {
   if (!fid) {
     return false;
   }
-  query_.kind = StmtKind::Update;
+  q().kind = StmtKind::Update;
   Assignment a;
   a.field = *fid;
-  a.param_idx = query_.add_param(std::move(value));
-  query_.assignments.push_back(a);
+  a.param_idx = q().add_param(std::move(value));
+  q().assignments.push_back(a);
   return true;
 }
 
@@ -1116,15 +1273,15 @@ bool QuerySet::add_update_null(std::string_view field_name) {
   if (!fid) {
     return false;
   }
-  query_.kind = StmtKind::Update;
+  q().kind = StmtKind::Update;
   Assignment a;
   a.field = *fid;
   a.set_null = true;
-  query_.assignments.push_back(a);
+  q().assignments.push_back(a);
   return true;
 }
 
-void QuerySet::set_delete() { query_.kind = StmtKind::Delete; }
+void QuerySet::set_delete() { q().kind = StmtKind::Delete; }
 
 bool QuerySet::order_by(std::string_view field_name, bool desc) {
   auto fid = resolve_field(field_name);
@@ -1138,13 +1295,13 @@ bool QuerySet::order_by(std::string_view field_name, bool desc) {
     OrderItem o;
     o.col = col;
     o.desc = desc;
-    query_.order_by.push_back(o);
+    q().order_by.push_back(o);
     return true;
   }
   OrderItem o;
   o.col.field = *fid;
   o.desc = desc;
-  query_.order_by.push_back(o);
+  q().order_by.push_back(o);
   return true;
 }
 
@@ -1152,20 +1309,28 @@ bool QuerySet::order_by_alias(std::string_view alias, bool desc) {
   OrderItem o;
   o.alias = std::string(alias);
   o.desc = desc;
-  query_.order_by.push_back(o);
+  q().order_by.push_back(o);
   return true;
 }
 
-void QuerySet::set_limit(std::uint64_t n) { query_.limit = n; }
-void QuerySet::set_offset(std::uint64_t n) { query_.offset = n; }
+void QuerySet::clear_ordering() { q().order_by.clear(); }
+
+void QuerySet::set_limit(std::uint64_t n) { q().limit = n; }
+void QuerySet::set_offset(std::uint64_t n) { q().offset = n; }
 void QuerySet::clear_limits() {
-  query_.limit = std::nullopt;
-  query_.offset = 0;
+  q().limit = std::nullopt;
+  q().offset = 0;
 }
-void QuerySet::set_distinct(bool v) { query_.distinct = v; }
+void QuerySet::set_distinct(bool v) { q().distinct = v; }
 
 CompiledSql QuerySet::compile(const SchemaRegistry& reg) const {
-  return compile_query(query_, reg);
+  const auto generation = reg.generation();
+  if (!state_->compiled || state_->compiled_schema_generation != generation) {
+    state_->compiled = compile_query(q(), reg);
+    state_->compiled_schema_generation = generation;
+    ++state_->compile_runs;
+  }
+  return *state_->compiled;
 }
 
 }  // namespace django::orm

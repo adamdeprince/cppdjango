@@ -1,5 +1,9 @@
 """Tests for the C++ ORM data plane (schema + QuerySet + compile + DML)."""
 
+import copy
+import sys
+from unittest import mock
+
 from django.db import models
 from django.test import SimpleTestCase
 from django.test.utils import isolate_apps
@@ -68,9 +72,7 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
             ],
         )
         qs = orm.QuerySet.create(mid, orm.DIALECT_SQLITE)
-        self.assertTrue(
-            qs.filter_kwargs({"score__gt": 10, "id__in": [1, 2, 3]}, False)
-        )
+        self.assertTrue(qs.filter_kwargs({"score__gt": 10, "id__in": [1, 2, 3]}, False))
         sql, params = qs.compile_sql()
         self.assertIn(">", sql)
         self.assertIn("IN (%s, %s, %s)", sql)
@@ -287,9 +289,246 @@ class OrmDataPlaneUnitTests(SimpleTestCase):
         self.assertIn("`t`", sql)
         self.assertEqual(list(params), [1])
 
+    def test_clone_is_copy_on_write_and_compile_is_cached(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "test.Cached",
+            "cached",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("value", "value", "value", "IntegerField", False, False),
+            ],
+        )
+        qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
+        self.assertTrue(qs.filter_eq("value", 7))
+        clone = qs.clone()
+        self.assertTrue(qs.shares_state_with(clone))
+
+        sql, _ = qs.compile_sql()
+        self.assertEqual(qs.compile_runs(), 1)
+        self.assertEqual(qs.compile_sql()[0], sql)
+        self.assertEqual(qs.compile_runs(), 1)
+
+        self.assertTrue(clone.set_ordering(["-id"]))
+        self.assertFalse(qs.shares_state_with(clone))
+        clone_sql, _ = clone.compile_sql()
+        self.assertIn('ORDER BY "cached"."id" DESC', clone_sql)
+        self.assertNotIn("ORDER BY", qs.compile_sql()[0])
+
+    def test_simple_terminal_sql_shape_cache(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "test.Shape",
+            "shape",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("value", "value", "value", "IntegerField", False, False),
+            ],
+        )
+        orm.clear_simple_compile_cache()
+        first = orm.compile_simple_values_get(
+            mid, orm.DIALECT_POSTGRES, ["id", "value"], "id", 1, 21
+        )
+        second = orm.compile_simple_values_get(
+            mid, orm.DIALECT_POSTGRES, ["id", "value"], "id", 2, 21
+        )
+        self.assertEqual(first[0], second[0])
+        self.assertEqual(list(first[1]), [1])
+        self.assertEqual(list(second[1]), [2])
+        info = orm.simple_compile_cache_info()
+        self.assertEqual(info["size"], 1)
+        self.assertEqual(info["misses"], 1)
+        self.assertEqual(info["hits"], 1)
+
+    def test_fused_filtered_values_and_update_compile(self):
+        from django import _native
+
+        orm = _native.orm
+        mid = orm.register_model(
+            "test.Fused",
+            "fused",
+            [
+                _row("id", "id", "id", "AutoField", True, False),
+                _row("value", "value", "value", "IntegerField", False, False),
+            ],
+        )
+        selected = orm.compile_simple_values_filter(
+            mid,
+            orm.DIALECT_POSTGRES,
+            ["id", "value"],
+            "id",
+            True,
+            [3, 1, 2],
+            ["-id"],
+            0,
+            0,
+        )
+        self.assertIn(" IN (%s, %s, %s)", selected[0])
+        self.assertIn('ORDER BY "fused"."id" DESC', selected[0])
+        self.assertEqual(list(selected[1]), [3, 1, 2])
+
+        updated = orm.compile_simple_update(
+            mid, orm.DIALECT_POSTGRES, "id", 7, ["value"], [99]
+        )
+        self.assertEqual(
+            updated[0], 'UPDATE "fused" SET "value" = %s WHERE "fused"."id" = %s'
+        )
+        self.assertEqual(list(updated[1]), [99, 7])
+
 
 @isolate_apps("native_orm_dataplane")
 class OrmDataPlaneFacadeTests(SimpleTestCase):
+    def test_model_schema_export_is_cached(self):
+        from django.native import orm
+
+        class CachedModel(models.Model):
+            value = models.IntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane"
+
+        orm.clear_schema()
+        model_id = orm.register_model_from_meta(CachedModel)
+        with mock.patch(
+            "django.native.orm._field_row",
+            side_effect=AssertionError("model metadata was exported twice"),
+        ):
+            self.assertEqual(orm.register_model_from_meta(CachedModel), model_id)
+
+    def test_custom_field_subclass_uses_python_fallback(self):
+        from django import native
+        from django.native import orm
+
+        if not native.AVAILABLE:
+            self.skipTest("native extension required")
+
+        class PreparedIntegerField(models.IntegerField):
+            def get_prep_value(self, value):
+                return super().get_prep_value(value) + 100
+
+        class CustomModel(models.Model):
+            value = PreparedIntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane_custom_prep"
+
+        class _Conn:
+            vendor = "sqlite"
+
+        orm.clear_schema()
+        orm.register_model_from_meta(CustomModel)
+
+        # A custom subclass reports IntegerField semantics through
+        # get_internal_type(), but its Python preparation hook must still win.
+        self.assertIsNone(
+            orm.compile_values_list_get(
+                CustomModel,
+                field_names=["id", "value"],
+                lookup_field="id",
+                lookup_value=1,
+                limit=21,
+                connection=_Conn(),
+            )
+        )
+        filtered = CustomModel.objects.filter(value=1)
+        self.assertFalse(filtered._native_authoritative)
+        self.assertIsNotNone(filtered._query)
+
+        id_filtered = CustomModel.objects.filter(id=1)
+        self.assertTrue(id_filtered._native_authoritative)
+        self.assertIsNone(
+            orm.compile_query_plan_update(
+                CustomModel,
+                _Conn(),
+                id_filtered._native_plan,
+                updates={"value": 2},
+            )
+        )
+
+    def test_native_terminal_rejects_values_needing_python_coercion(self):
+        from django import native
+        from django.native import orm
+
+        if not native.AVAILABLE:
+            self.skipTest("native extension required")
+
+        class PrimitiveModel(models.Model):
+            value = models.IntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane_strict_primitive"
+
+        class _Conn:
+            vendor = "sqlite"
+
+        orm.clear_schema()
+        self.assertIsNone(
+            orm.compile_values_list_get(
+                PrimitiveModel,
+                field_names=["id", "value"],
+                lookup_field="id",
+                lookup_value="1",
+                limit=21,
+                connection=_Conn(),
+            )
+        )
+        # Django accepts and converts this input on the stock fallback path.
+        qs = PrimitiveModel.objects.filter(id="1")
+        self.assertFalse(qs._native_authoritative)
+        self.assertIsNotNone(qs._query)
+
+    def test_postgresql_integer_field_widths_are_bound_natively(self):
+        from django import native
+        from django.native import orm
+
+        if not native.AVAILABLE:
+            self.skipTest("native extension required")
+        try:
+            from psycopg.types import numeric
+        except ImportError:
+            self.skipTest("psycopg 3 required")
+
+        class PrimitiveModel(models.Model):
+            small_value = models.PositiveSmallIntegerField()
+            integer_value = models.IntegerField()
+            big_value = models.BigIntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane_postgresql_widths"
+
+        class _Ops:
+            integerfield_type_map = {
+                "SmallIntegerField": numeric.Int2,
+                "IntegerField": numeric.Int4,
+                "BigIntegerField": numeric.Int8,
+            }
+
+        class _Conn:
+            vendor = "postgresql"
+            ops = _Ops()
+
+        orm.clear_schema()
+        compiled = orm.compile_simple_update(
+            PrimitiveModel,
+            _Conn(),
+            lookup_field="id",
+            lookup_value=7,
+            update_names=["small_value", "integer_value", "big_value"],
+            update_values=[1, 2, 3],
+        )
+        self.assertIsNotNone(compiled)
+        params = compiled[1]
+        self.assertIs(type(params[0]), numeric.Int2)
+        self.assertIs(type(params[1]), numeric.Int4)
+        self.assertIs(type(params[2]), numeric.Int8)
+        # AutoField values remain plain ints, matching Django's backend prep.
+        self.assertIs(type(params[3]), int)
+        self.assertEqual(params, [1, 2, 3, 7])
+
     def test_compile_values_list_get_from_model(self):
         from django.native import orm
 
@@ -314,6 +553,15 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         sql, params = compiled
         self.assertIn("randomnumber", sql)
         self.assertEqual(params, [2])
+
+        empty_select = orm.compile_select(
+            World,
+            _Conn(),
+            field_names=["id", "randomnumber"],
+            limit=0,
+        )
+        self.assertIsNotNone(empty_select)
+        self.assertIn("LIMIT 0", empty_select[0])
 
         compiled2 = orm.compile_update(
             World,
@@ -540,6 +788,125 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         qs3 = World.objects.filter(Q(randomnumber=1) ^ Q(randomnumber=2))
         self.assertIsNotNone(qs3._native_qs)
 
+    def test_supported_chain_keeps_native_graph_authoritative(self):
+        class World(models.Model):
+            randomnumber = models.IntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane_authoritative"
+
+        filtered = World.objects.filter(id__in=[3, 1, 2])
+        shared = filtered.all()
+        self.assertIsNone(filtered._native_qs)
+        self.assertIsNone(filtered._query)
+        self.assertEqual(
+            filtered._native_plan.simple_filter(), ("id", True, [3, 1, 2])
+        )
+        self.assertIs(shared._native_plan, filtered._native_plan)
+
+        ordered = filtered.order_by("id")
+        self.assertIsNone(ordered._native_qs)
+
+        qs = ordered.values_list("id", "randomnumber")
+        self.assertTrue(qs._native_authoritative)
+        self.assertIsNone(qs._query)
+
+        class _Conn:
+            vendor = "postgresql"
+
+        native_sql, params = qs._native_compile_deferred_simple_values(_Conn())
+        self.assertIn(" IN (", native_sql)
+        self.assertIn("ORDER BY", native_sql)
+        self.assertEqual(list(params), [3, 1, 2])
+
+        query = qs.query
+        self.assertFalse(qs._native_authoritative)
+        self.assertIsNone(qs._native_plan)
+        self.assertTrue(query.where.children)
+        self.assertEqual(query.order_by, ("id",))
+        self.assertEqual(query.values_select, ("id", "randomnumber"))
+
+    def test_native_queryset_defers_python_query_until_fallback(self):
+        class World(models.Model):
+            randomnumber = models.IntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane_lazy_query"
+
+        base = World.objects.all()
+        clone = base.all()
+        self.assertIsNone(base._query)
+        self.assertIsNone(clone._query)
+        self.assertIsNone(clone._native_plan)
+
+        python_query = clone.query
+        self.assertIsNotNone(python_query)
+        self.assertIs(clone._query, python_query)
+        self.assertIsNone(base._query)
+
+    def test_cpp_plan_replays_nested_q_and_deepcopy_shares_plan(self):
+        from django.db.models import Q
+
+        class World(models.Model):
+            randomnumber = models.IntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane_cpp_plan_replay"
+
+        qs = World.objects.filter(
+            Q(randomnumber=1) | ~Q(randomnumber__gte=9)
+        ).values_list("id", "randomnumber")
+        copied = copy.deepcopy(qs)
+        self.assertIsNone(qs._query)
+        self.assertIs(copied._native_plan, qs._native_plan)
+
+        query = copied.query
+        sql, params = query.sql_with_params()
+        self.assertIn(" OR ", sql)
+        self.assertIn("NOT", sql)
+        self.assertEqual(params, (1, 9))
+        self.assertTrue(qs._native_authoritative)
+        self.assertIsNone(qs._query)
+
+    def test_cpp_plan_does_not_retain_python_filter_values(self):
+        class Item(models.Model):
+            name = models.CharField(max_length=100)
+
+            class Meta:
+                app_label = "native_orm_dataplane_cpp_plan_refs"
+
+        value = "".join(("native-plan-", str(id(self)), "-payload"))
+        references = sys.getrefcount(value)
+        qs = Item.objects.filter(name=value)
+
+        self.assertTrue(qs._native_authoritative)
+        self.assertIsNone(qs._query)
+        self.assertEqual(sys.getrefcount(value), references)
+        self.assertEqual(qs.query.where.children[0].rhs, value)
+
+    def test_deferred_simple_filter_freezes_input_and_replays_before_fallback(self):
+        class World(models.Model):
+            randomnumber = models.IntegerField()
+
+            class Meta:
+                app_label = "native_orm_dataplane_deferred_fallback"
+
+        ids = [3, 1, 2]
+        first = World.objects.filter(id__in=ids)
+        ids.append(99)
+        self.assertEqual(
+            first._native_plan.simple_filter(), ("id", True, [3, 1, 2])
+        )
+
+        chained = first.filter(randomnumber=7)
+        self.assertFalse(chained._native_authoritative)
+        self.assertIsNone(chained._native_qs)
+        self.assertEqual(len(chained._query.where.children), 2)
+        sql, params = chained.query.sql_with_params()
+        self.assertIn('"id" IN (%s, %s, %s)', sql)
+        self.assertIn('"randomnumber" = %s', sql)
+        self.assertEqual(params, (3, 1, 2, 7))
+
     def test_annotate_aggregate_and_subquery_compile(self):
         from django import _native
 
@@ -561,16 +928,12 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
 
         qs2 = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
         qs2.filter_eq("id", 1)
-        self.assertTrue(
-            qs2.annotate_sql("s", "SELECT 1", [])
-        )
+        self.assertTrue(qs2.annotate_sql("s", "SELECT 1", []))
         sql2, _ = qs2.compile_sql()
         self.assertIn("(SELECT 1)", sql2)
 
         qs3 = orm.QuerySet.create(mid, orm.DIALECT_SQLITE)
-        self.assertTrue(
-            qs3.filter_subquery("id", orm.OP_IN, "SELECT %s", [1])
-        )
+        self.assertTrue(qs3.filter_subquery("id", orm.OP_IN, "SELECT %s", [1]))
         sql3, p3 = qs3.compile_sql()
         self.assertIn("IN (SELECT %s)", sql3)
         self.assertEqual(list(p3), [1])
@@ -640,9 +1003,7 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         qs = orm.QuerySet.create(mid, orm.DIALECT_POSTGRES)
         qs.select_model_columns()
         when = {"kind": "atom", "key": "n__gt", "values": [10]}
-        self.assertTrue(
-            qs.annotate_case("bucket", [(when, "hi")], "lo")
-        )
+        self.assertTrue(qs.annotate_case("bucket", [(when, "hi")], "lo"))
         sql, params = qs.compile_sql()
         self.assertIn("CASE", sql)
         self.assertIn("WHEN", sql)
@@ -663,7 +1024,7 @@ class OrmDataPlaneFacadeTests(SimpleTestCase):
         qs3.select_model_columns()
         self.assertTrue(qs3.annotate_subquery_qs("sid", sub))
         sql3, _ = qs3.compile_sql()
-        self.assertIn("AS \"sid\"", sql3)
+        self.assertIn('AS "sid"', sql3)
 
     def test_prefetch_secondary_sql(self):
         from django import _native

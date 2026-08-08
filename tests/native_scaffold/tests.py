@@ -21,6 +21,15 @@ def _reload_native_stack():
 
 
 class NativeScaffoldTests(SimpleTestCase):
+    def test_release_identity(self):
+        import django
+
+        self.assertEqual(django.VERSION, (6, 0, 7, "final", 0))
+        self.assertEqual(django.UPSTREAM_VERSION, "6.0.7")
+        self.assertEqual(django.__version__, "6.0.7.post1")
+        self.assertEqual(django.get_version(), "6.0.7.post1")
+        self.assertEqual(django.get_version(django.VERSION), "6.0.7")
+
     def test_native_module_available(self):
         from django import native
 
@@ -34,7 +43,7 @@ class NativeScaffoldTests(SimpleTestCase):
         self.assertEqual(native.cxx_standard(), "c++26")
         self.assertTrue(native.compiler())
         self.assertNotEqual(native.compiler(), "none")
-        self.assertEqual(native.version(), "6.0.7")
+        self.assertEqual(native.version(), "6.0.7.post1")
         self.assertIsNotNone(native.get_native_module())
 
     def test_direct_extension_import(self):
@@ -44,7 +53,7 @@ class NativeScaffoldTests(SimpleTestCase):
         self.assertEqual(_native.add(1, 2), 3)
         self.assertEqual(_native.cxx_standard(), "c++26")
         self.assertIn("g++", _native.compiler())
-        self.assertEqual(_native.version(), "6.0.7")
+        self.assertEqual(_native.version(), "6.0.7.post1")
 
     def test_facade_matches_extension(self):
         from django import _native, native
@@ -62,7 +71,7 @@ class NativeFallbackTests(SimpleTestCase):
         self.assertEqual(fallbacks.add(2, 40), 42)
         self.assertEqual(fallbacks.cxx_standard(), "python")
         self.assertEqual(fallbacks.compiler(), "none")
-        self.assertEqual(fallbacks.version(), "6.0.7")
+        self.assertEqual(fallbacks.version(), "6.0.7.post1")
 
     def test_env_disables_native(self):
         with mock.patch.dict(os.environ, {"DJANGO_NATIVE": "0"}, clear=False):
@@ -74,7 +83,7 @@ class NativeFallbackTests(SimpleTestCase):
             self.assertEqual(native.add(2, 40), 42)
             self.assertEqual(native.cxx_standard(), "python")
             self.assertEqual(native.compiler(), "none")
-            self.assertEqual(native.version(), "6.0.7")
+            self.assertEqual(native.version(), "6.0.7.post1")
 
         with mock.patch.dict(os.environ, {"DJANGO_NATIVE": "1"}, clear=False):
             restored = _reload_native_stack()

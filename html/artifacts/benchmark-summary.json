@@ -1,0 +1,138 @@
+{
+  "baseline": "Django 6.0.7 baseline",
+  "benchmark": "cppdjango PostgreSQL ORM CPU comparison",
+  "construction": {
+    "manager_all": {
+      "native_median_us": 0.5708,
+      "speedup_ratio": 1.856,
+      "stock_median_us": 1.0596
+    },
+    "ordered_in32_values": {
+      "native_median_us": 9.0997,
+      "speedup_ratio": 7.413,
+      "stock_median_us": 67.4563
+    },
+    "point_filter": {
+      "native_median_us": 3.268,
+      "speedup_ratio": 7.433,
+      "stock_median_us": 24.2901
+    },
+    "values_list": {
+      "native_median_us": 3.7369,
+      "speedup_ratio": 4.43,
+      "stock_median_us": 16.5543
+    }
+  },
+  "correctness": {
+    "expected_failures": 2,
+    "native_disabled_tests": 515,
+    "postgresql_integer_oid_parity": true,
+    "skips": 15,
+    "tests": 548
+  },
+  "headline": {
+    "cpu_performance_ratio": 5.3643,
+    "native_orm_cpu_us": 80.0622,
+    "percent_faster": 436.4,
+    "percent_less_cpu": 81.4,
+    "published_claim": "436% faster ORM-only CPU performance",
+    "scope": "equal mix of point select, ordered IN32 select, and point update; matched cursor/psycopg CPU excluded",
+    "stock_orm_cpu_us": 429.4797
+  },
+  "method": {
+    "cpu_repetitions": 3,
+    "memory_validation": {
+      "concurrency": 64,
+      "request_errors": 0,
+      "request_mix": [
+        "point select",
+        "ordered IN32 select",
+        "point update"
+      ],
+      "requests_per_variant": 300032,
+      "workers": 16
+    },
+    "postgres_cpu_source": "dedicated backend /proc task ticks sampled at worker boundaries",
+    "run_order": "stock/native order alternated",
+    "seconds_per_cpu_sample": 5,
+    "warmup_operations": 500
+  },
+  "native": "cppdjango native implementation released as 6.0.7.post1",
+  "operations": [
+    {
+      "combined_worker_and_postgres_cpu_reduction_percent": 44.45,
+      "name": "point_select",
+      "native": {
+        "orm_only_cpu_us": 24.3628,
+        "postgres_cpu_us": 56.5934,
+        "raw_cursor_cpu_us": 65.5854,
+        "wall_us": 139.286,
+        "worker_cpu_us": 89.9482
+      },
+      "orm_cpu_performance_ratio": 5.787,
+      "orm_cpu_reduction_percent": 82.72,
+      "postgres_cpu_delta_percent": -1.34,
+      "stock": {
+        "orm_only_cpu_us": 140.9804,
+        "postgres_cpu_us": 57.3604,
+        "raw_cursor_cpu_us": 65.4441,
+        "wall_us": 254.8341,
+        "worker_cpu_us": 206.4245
+      },
+      "wall_speedup_ratio": 1.83,
+      "worker_cpu_reduction_percent": 56.43
+    },
+    {
+      "combined_worker_and_postgres_cpu_reduction_percent": 44.49,
+      "name": "ordered_in32_select",
+      "native": {
+        "orm_only_cpu_us": 32.6845,
+        "postgres_cpu_us": 90.9449,
+        "raw_cursor_cpu_us": 80.3987,
+        "wall_us": 194.2998,
+        "worker_cpu_us": 113.0832
+      },
+      "orm_cpu_performance_ratio": 6.012,
+      "orm_cpu_reduction_percent": 83.37,
+      "postgres_cpu_delta_percent": 0.25,
+      "stock": {
+        "orm_only_cpu_us": 196.5053,
+        "postgres_cpu_us": 90.7143,
+        "raw_cursor_cpu_us": 80.3615,
+        "wall_us": 360.3531,
+        "worker_cpu_us": 276.8668
+      },
+      "wall_speedup_ratio": 1.855,
+      "worker_cpu_reduction_percent": 59.16
+    },
+    {
+      "combined_worker_and_postgres_cpu_reduction_percent": 23.05,
+      "name": "point_update",
+      "native": {
+        "orm_only_cpu_us": 23.0149,
+        "postgres_cpu_us": 149.162,
+        "raw_cursor_cpu_us": 65.0824,
+        "wall_us": 282.615,
+        "worker_cpu_us": 88.0973
+      },
+      "orm_cpu_performance_ratio": 3.997,
+      "orm_cpu_reduction_percent": 74.98,
+      "postgres_cpu_delta_percent": -1.24,
+      "stock": {
+        "orm_only_cpu_us": 91.994,
+        "postgres_cpu_us": 151.0345,
+        "raw_cursor_cpu_us": 65.3054,
+        "wall_us": 349.263,
+        "worker_cpu_us": 157.2994
+      },
+      "wall_speedup_ratio": 1.236,
+      "worker_cpu_reduction_percent": 43.99
+    }
+  ],
+  "release": {
+    "distribution": "cppdjango",
+    "git_tag": "6.0.7.post1",
+    "upstream_compatibility": "Django 6.0.7",
+    "version": "6.0.7.post1"
+  }
+}

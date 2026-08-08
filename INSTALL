@@ -1,8 +1,27 @@
-Thanks for downloading Django.
+cppdjango 6.0.7.post1
+=====================
 
-To install it, make sure you have Python 3.12 or greater installed. Then run
-this command from the command prompt:
+cppdjango is distributed on PyPI as "cppdjango" and imported as "django".
+Install it in a fresh virtual environment:
 
-    python -m pip install .
+    python3 -m venv .venv
+    . .venv/bin/activate
+    python -m pip install --upgrade pip
+    python -m pip install cppdjango==6.0.7.post1
 
-For more detailed instructions, see docs/intro/install.txt.
+Do not co-install the upstream "Django" distribution. Both distributions own
+the same Python import namespace. To convert an existing environment:
+
+    python -m pip uninstall -y Django
+    python -m pip install cppdjango==6.0.7.post1
+
+The native extension requires Python 3.12+, CMake 3.26+, a sufficiently recent
+C++26 compiler, OpenSSL development files, and zlib development files when pip
+must build from source.
+
+Verify the installation:
+
+    python -c "import django; from django import native; print(django.__version__, native.version(), native.compiler())"
+
+See docs/installation.md for prerequisites, PostgreSQL setup, source installs,
+dependency caveats, troubleshooting, and uninstall instructions.

@@ -1,0 +1,41 @@
+{
+  "scope": "Terminal compilation entries; persistent C++ QueryPlan mutations are separate construction operations.",
+  "operations": {
+    "point_get": {
+      "native_terminal": "compile_simple_values_get",
+      "terminal_entries": 1,
+      "python_meta_get_field_calls": 0,
+      "python_field_prep_calls": 0
+    },
+    "ordered_in32": {
+      "native_terminal": "compile_simple_values_plan",
+      "terminal_entries": 1,
+      "python_meta_get_field_calls": 0,
+      "python_field_prep_calls": 0
+    },
+    "point_update": {
+      "native_terminal": "compile_simple_update_plan",
+      "terminal_entries": 1,
+      "python_meta_get_field_calls": 0,
+      "python_field_prep_calls": 0
+    }
+  },
+  "native_schema": "Registered model and field IDs; generation checked before terminal compilation.",
+  "parameter_binding": "Exact built-in primitive fields bind in C++; custom fields, expressions, relations, generated fields, and coercion-requiring values fall back before execution.",
+  "postgresql_integer_binding": "Native Int2/Int4/Int8 parameter objects match Django/psycopg OIDs without executing Python Field hooks or Python constructors.",
+  "cpp_to_cpp_via_python": false,
+  "endpoint_probe": {
+    "baseline_native_available": false,
+    "native_available": true,
+    "native_compiler": "g++ 15.2.0",
+    "supported_chain_python_query_materialized": false,
+    "ordered_in32_sql": "SELECT \"world\".\"id\" AS \"id\", \"world\".\"randomnumber\" AS \"randomnumber\" FROM \"world\" WHERE \"world\".\"id\" IN (%s, %s, %s) ORDER BY \"world\".\"id\"",
+    "successful_facade_calls_across_probe_endpoints": {
+      "compile_values_list_get": 4,
+      "compile_select": 1,
+      "compile_query_plan_values": 3,
+      "compile_query_plan_update": 1,
+      "native_terminal_update": 1
+    }
+  }
+}

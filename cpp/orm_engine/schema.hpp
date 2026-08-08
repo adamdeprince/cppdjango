@@ -50,6 +50,11 @@ struct FieldSchema {
   FieldType type = FieldType::Other;
   bool primary_key = false;
   bool nullable = false;
+  // True only when Django's exact built-in field class has identity/simple
+  // primitive preparation semantics. Custom subclasses deliberately remain
+  // false even when get_internal_type() reports a built-in type.
+  bool native_direct = false;
+  bool generated = false;
 
   RelKind rel = RelKind::None;
   std::string remote_table;
@@ -63,6 +68,9 @@ struct FieldSchema {
   std::string m2m_reverse_column;  // through col → remote model
 
   [[nodiscard]] bool is_relation() const { return rel != RelKind::None; }
+  [[nodiscard]] bool is_native_scalar() const {
+    return native_direct && !generated && !is_relation() && !column.empty();
+  }
 };
 
 struct ModelSchema {
@@ -84,15 +92,19 @@ class SchemaRegistry {
   [[nodiscard]] const ModelSchema* get_by_label(std::string_view label) const;
   [[nodiscard]] std::optional<ModelId> find_id(std::string_view label) const;
 
+  [[nodiscard]] std::uint64_t generation() const { return generation_; }
+
   void clear();
 
  private:
   SchemaRegistry() = default;
   std::vector<ModelSchema> models_;
   std::unordered_map<std::string, ModelId> by_label_;
+  std::uint64_t generation_ = 0;
 };
 
 [[nodiscard]] FieldType field_type_from_class_name(std::string_view class_name);
 [[nodiscard]] RelKind rel_kind_from_string(std::string_view s);
+[[nodiscard]] bool field_type_has_direct_primitive_prep(FieldType type);
 
 }  // namespace django::orm

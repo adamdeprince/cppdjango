@@ -37,7 +37,18 @@ struct ParamValue {
     String,
     Bytes,
   };
+  // Logical database type information needed by a driver at the final
+  // Python boundary. PostgreSQL's server-side binding otherwise chooses an
+  // integer OID from the value's magnitude (for example, 7 -> int2), whereas
+  // Django binds an IntegerField as int4 regardless of value.
+  enum class TypeHint : std::uint8_t {
+    Default = 0,
+    PostgresInt2,
+    PostgresInt4,
+    PostgresInt8,
+  };
   Kind kind = Kind::None;
+  TypeHint type_hint = TypeHint::Default;
   bool b = false;
   std::int64_t i = 0;
   double f = 0;
@@ -51,9 +62,11 @@ struct ParamValue {
     p.b = v;
     return p;
   }
-  static ParamValue from_int(std::int64_t v) {
+  static ParamValue from_int(
+      std::int64_t v, TypeHint hint = TypeHint::Default) {
     ParamValue p;
     p.kind = Kind::Int;
+    p.type_hint = hint;
     p.i = v;
     return p;
   }

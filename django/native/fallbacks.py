@@ -47,10 +47,9 @@ def add(a: int, b: int) -> int:
 
 def version() -> str:
     """Package version when the extension is not loaded."""
-    from django import VERSION
-    from django.utils.version import get_version
+    from django import __version__
 
-    return get_version(VERSION)
+    return __version__
 
 
 def cxx_standard() -> str:
@@ -72,9 +71,9 @@ _js_escapes = {
     ord("\\"): "\\u005C",
     ord("'"): "\\u0027",
     ord('"'): "\\u0022",
-    ord(">"): "\u003E",
-    ord("<"): "\u003C",
-    ord("&"): "\u0026",
+    ord(">"): "\\u003E",
+    ord("<"): "\\u003C",
+    ord("&"): "\\u0026",
     ord("="): "\\u003D",
     ord("-"): "\\u002D",
     ord(";"): "\\u003B",

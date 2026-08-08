@@ -31,6 +31,7 @@ SchemaRegistry& SchemaRegistry::instance() {
 
 ModelId SchemaRegistry::register_model(ModelSchema schema) {
   index_fields(schema);
+  ++generation_;
   if (auto it = by_label_.find(schema.label); it != by_label_.end()) {
     ModelId id = it->second;
     schema.id = id;
@@ -70,6 +71,7 @@ std::optional<ModelId> SchemaRegistry::find_id(std::string_view label) const {
 void SchemaRegistry::clear() {
   models_.clear();
   by_label_.clear();
+  ++generation_;
 }
 
 FieldType field_type_from_class_name(std::string_view class_name) {
@@ -79,11 +81,11 @@ FieldType field_type_from_class_name(std::string_view class_name) {
   if (class_name == "BigAutoField") {
     return FieldType::BigAuto;
   }
-  if (class_name == "IntegerField" || class_name == "PositiveIntegerField" ||
-      class_name == "PositiveSmallIntegerField") {
+  if (class_name == "IntegerField" || class_name == "PositiveIntegerField") {
     return FieldType::Integer;
   }
-  if (class_name == "SmallIntegerField") {
+  if (class_name == "SmallIntegerField" ||
+      class_name == "PositiveSmallIntegerField") {
     return FieldType::SmallInteger;
   }
   if (class_name == "BigIntegerField" || class_name == "PositiveBigIntegerField") {
@@ -140,6 +142,23 @@ RelKind rel_kind_from_string(std::string_view s) {
     return RelKind::ReverseM2M;
   }
   return RelKind::None;
+}
+
+bool field_type_has_direct_primitive_prep(FieldType type) {
+  switch (type) {
+    case FieldType::Integer:
+    case FieldType::BigInteger:
+    case FieldType::SmallInteger:
+    case FieldType::Auto:
+    case FieldType::BigAuto:
+    case FieldType::Float:
+    case FieldType::Boolean:
+    case FieldType::Text:
+    case FieldType::Char:
+      return true;
+    default:
+      return false;
+  }
 }
 
 }  // namespace django::orm

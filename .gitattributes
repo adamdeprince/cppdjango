@@ -7,3 +7,6 @@ tests/staticfiles_tests/project/documents/test/*txt text eol=lf
 docs/releases/*.txt merge=union
 # Make GitHub syntax-highlight .html files as Django templates
 *.html linguist-language=django
+# Captured benchmark patches are byte-for-byte evidence and may contain
+# whitespace inherited from the measured source tree.
+html/artifacts/*.patch -whitespace

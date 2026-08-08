@@ -1,0 +1,175 @@
+{
+  "benchmark": "cppdjango uWSGI memory and prefork COW comparison",
+  "copy_on_write": {
+    "cppdjango_minus_stock": {
+      "fork_to_warmed_private_dirty_growth_mib": 0.7,
+      "measured_minor_faults": -210,
+      "measured_private_dirty_growth_mib": -0.82
+    },
+    "native": {
+      "fork_to_warmed_minor_faults": 116892,
+      "fork_to_warmed_private_dirty_growth_mib": 437.84,
+      "measured_minor_faults": 182535,
+      "measured_minor_faults_per_request": 0.608385,
+      "measured_private_dirty_growth_mib": 713.02,
+      "measured_private_dirty_kib_per_request": 2.4335,
+      "worker_uss_immediately_after_fork_mib": 11.68
+    },
+    "stock": {
+      "fork_to_warmed_minor_faults": 116231,
+      "fork_to_warmed_private_dirty_growth_mib": 437.14,
+      "measured_minor_faults": 182745,
+      "measured_minor_faults_per_request": 0.609085,
+      "measured_private_dirty_growth_mib": 713.84,
+      "measured_private_dirty_kib_per_request": 2.4363,
+      "worker_uss_immediately_after_fork_mib": 11.63
+    }
+  },
+  "definitions": {
+    "lazy": "Existing uWSGI lazy-apps mode; Django loads independently in each worker",
+    "minor_faults": "Upper-bound COW proxy; also includes demand faults and first-touch allocation",
+    "preload": "Django and the native extension load in the master before workers fork",
+    "private_dirty_growth": "Upper bound on post-fork COW burden; also includes new private allocations",
+    "pss": "Proportional Set Size; shared pages divided among mappings",
+    "uss": "Private_Clean plus Private_Dirty; memory unique to each process"
+  },
+  "environment": {
+    "concurrency": "64",
+    "fork_modes": "lazy preload",
+    "harness_sha256": "bc744870346deb70ec793582fa206d3391a05a0cbd9f7cf6b00c068a313faba3",
+    "kernel": "7.0.0-27-generic",
+    "ksm_run": "0",
+    "load_kind": "equal_work",
+    "logical_cpus": "128",
+    "memory_kib": "1039378836",
+    "mix_script_sha256": "d735d4981e1e20432f19f6baf031b5f1a13b49249206a1f16ab3ec70c118e9fd",
+    "native_base_commit": "e331be3cef3cd722211caa92e9e02c39c9c7bb9b",
+    "native_worktree_patch_sha256": "2db1128e97f7f07a93a892d3d6b9006369127c35bf6c7519af7ca4399ca75755",
+    "postgres": "psql (PostgreSQL) 18.4 (Ubuntu 18.4-0ubuntu0.26.04.1)",
+    "profiler_sha256": "0f8e12b05a64a4138845c5bb479596c5d8097dab104c664c6e0236e5dace28ed",
+    "psycopg": "3.3.4",
+    "python": "3.14.4",
+    "repeats": "3",
+    "requests_per_endpoint": "100000",
+    "siege_rc_sha256": "6d773703e1de48dec5e1aa7c586b9153045113079fa7e672c0cba5e1e9764e18",
+    "threads": "8",
+    "transparent_hugepage": "always [madvise] never",
+    "uwsgi": "2.0.31",
+    "warmup_requests_per_endpoint": "5000",
+    "workers": "16"
+  },
+  "integrity": {
+    "load_csv_sha256": "f5f7492ae13c25a62aaddea0d64481e8a6f703d794d945d3bb1fbed8b0297215",
+    "metadata_sha256": "cc4f0b5efec69b39b59374cef05f4f652f0716fe045dd065e144d0894d172d74",
+    "raw_jsonl_sha256": "e1bb37b170b6e4e53c3b49b45726b7ef8b587cce74dbadb61f336e77c7da3d3c"
+  },
+  "preload_savings": {
+    "native": {
+      "pss_mib": 180.4,
+      "pss_percent": 12.94
+    },
+    "stock": {
+      "pss_mib": 138.48,
+      "pss_percent": 10.28
+    }
+  },
+  "results": {
+    "lazy": {
+      "cppdjango_minus_stock": {
+        "pss_mib_per_worker": 2.93,
+        "total_pss_mib": 46.85,
+        "total_pss_percent": 3.48,
+        "total_uss_mib": 44.04,
+        "total_uss_percent": 3.31
+      },
+      "native": {
+        "mean_worker_pss_mib": 86.57,
+        "mean_worker_uss_mib": 85.4,
+        "total_pss_mib": 1393.68,
+        "total_uss_mib": 1374.16,
+        "worker_pss_mib": 1385.13,
+        "worker_uss_mib": 1366.38
+      },
+      "stock": {
+        "mean_worker_pss_mib": 83.8,
+        "mean_worker_uss_mib": 82.8,
+        "total_pss_mib": 1346.83,
+        "total_uss_mib": 1330.12,
+        "worker_pss_mib": 1340.82,
+        "worker_uss_mib": 1324.87
+      }
+    },
+    "preload": {
+      "cppdjango_minus_stock": {
+        "pss_mib_per_worker": 0.31,
+        "total_pss_mib": 4.94,
+        "total_pss_percent": 0.41,
+        "total_uss_mib": 0.03,
+        "total_uss_percent": 0.0
+      },
+      "native": {
+        "mean_worker_pss_mib": 74.45,
+        "mean_worker_uss_mib": 72.66,
+        "total_pss_mib": 1213.29,
+        "total_uss_mib": 1182.24,
+        "worker_pss_mib": 1191.19,
+        "worker_uss_mib": 1162.57
+      },
+      "stock": {
+        "mean_worker_pss_mib": 74.17,
+        "mean_worker_uss_mib": 72.67,
+        "total_pss_mib": 1208.35,
+        "total_uss_mib": 1182.21,
+        "worker_pss_mib": 1186.79,
+        "worker_uss_mib": 1162.74
+      }
+    }
+  },
+  "schema": 1,
+  "scope": {
+    "load_order": "stock/cppdjango and lazy/preload order alternated by repeat",
+    "measured_requests_per_configuration": 300032,
+    "processes_included": "uWSGI master and workers only; PostgreSQL excluded",
+    "repeats": 3,
+    "request_mix": [
+      "one PostgreSQL ORM point select",
+      "one ordered 32-row PostgreSQL ORM IN select",
+      "one PostgreSQL ORM read plus point update"
+    ],
+    "workers": 16
+  },
+  "throughput_context": {
+    "lazy": {
+      "native": {
+        "median_requests_per_second": 21569.52,
+        "range_requests_per_second": [
+          21569.52,
+          21948.21
+        ]
+      },
+      "stock": {
+        "median_requests_per_second": 15749.71,
+        "range_requests_per_second": [
+          15586.08,
+          15866.31
+        ]
+      }
+    },
+    "preload": {
+      "native": {
+        "median_requests_per_second": 21741.45,
+        "range_requests_per_second": [
+          21631.72,
+          21884.17
+        ]
+      },
+      "stock": {
+        "median_requests_per_second": 15908.38,
+        "range_requests_per_second": [
+          15700.26,
+          16165.52
+        ]
+      }
+    }
+  }
+}

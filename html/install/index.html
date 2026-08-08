@@ -1,0 +1,196 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="description" content="Install cppdjango 6.0.7.post1 from PyPI or source and verify its C++ extension.">
+  <meta name="theme-color" content="#11130f">
+  <link rel="canonical" href="https://django.goblinreactor.com/install/">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600;700&amp;family=IBM+Plex+Serif:wght@400;500;600;700&amp;display=swap" rel="stylesheet">
+  <link rel="icon" href="../goblin.png" type="image/png" sizes="1254x1254">
+  <title>Install cppdjango 6.0.7.post1</title>
+  <style>
+    :root {
+      color-scheme: light;
+      --ink: #12140f;
+      --paper: #f7f6f1;
+      --white: #fffefa;
+      --muted: #62645c;
+      --line: #d8d8cf;
+      --acid: #a6e22e;
+      --acid-dark: #548a08;
+      --cyan: #0b8897;
+      --orange: #ed6b2f;
+      --dark: #11130f;
+      --dark-soft: #1b1e17;
+      --mono: "IBM Plex Mono", "SFMono-Regular", Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      --serif: "IBM Plex Serif", Georgia, serif;
+      --max: 1120px;
+    }
+    * { box-sizing: border-box; }
+    html { background: var(--dark); }
+    body { margin: 0; color: var(--ink); background: var(--paper); font: 16px/1.62 var(--sans); }
+    ::selection { color: var(--ink); background: var(--acid); }
+    a { color: inherit; text-underline-offset: .2em; }
+    a:hover { color: var(--acid-dark); }
+    code { font-family: var(--mono); font-size: .88em; }
+    h1, h2, h3, p, li { overflow-wrap: anywhere; }
+    .header {
+      display: flex;
+      min-height: 76px;
+      align-items: center;
+      justify-content: space-between;
+      gap: 24px;
+      width: min(calc(100% - 40px), var(--max));
+      margin: 0 auto;
+      border-bottom: 1px solid var(--line);
+    }
+    .brand { display: flex; align-items: center; gap: 10px; font: 800 .9rem var(--mono); text-decoration: none; }
+    .brand img { width: 40px; height: 40px; object-fit: cover; border: 1px solid var(--ink); border-radius: 50%; }
+    .back { padding: 8px 12px; color: var(--white); background: var(--ink); font-size: .78rem; font-weight: 750; text-decoration: none; }
+    .back:hover { color: var(--white); background: var(--orange); }
+    .hero { padding: 100px max(20px, calc((100vw - var(--max)) / 2)) 88px; }
+    .eyebrow { margin: 0 0 18px; color: var(--acid-dark); font: 750 .74rem var(--mono); text-transform: uppercase; }
+    .eyebrow::before { content: "// "; color: var(--orange); }
+    h1 { max-width: 950px; margin: 0; font: 900 clamp(3.7rem, 8vw, 7.5rem)/.86 var(--sans); letter-spacing: -.065em; }
+    .lede { max-width: 800px; margin: 30px 0 0; color: var(--muted); font: 1.2rem/1.65 var(--serif); }
+    .quick { color: var(--white); background: var(--dark); }
+    .quick-inner { display: grid; grid-template-columns: .72fr 1.28fr; gap: 72px; padding: 82px max(20px, calc((100vw - var(--max)) / 2)); }
+    .quick h2 { color: var(--white); }
+    .quick p { margin-top: 20px; color: #b7baaf; }
+    h2 { margin: 0; font: 840 clamp(2.25rem, 5vw, 4.6rem)/.96 var(--sans); letter-spacing: -.045em; }
+    h3 { margin: 0 0 14px; font-size: 1.25rem; }
+    .terminal { overflow-x: auto; border: 1px solid #45483f; background: var(--dark-soft); }
+    .terminal-head { padding: 10px 14px; color: #9da096; border-bottom: 1px solid #45483f; font: .68rem var(--mono); }
+    pre { margin: 0; padding: 23px; color: #f5f6f1; font: .75rem/1.85 var(--mono); }
+    .prompt { color: var(--acid); }
+    .comment { color: #8f9388; }
+    .warning { padding: 22px; color: var(--ink); background: #fff1d8; border: 1px solid #d49b50; border-top: 0; font-size: .88rem; }
+    .section { padding: 92px max(20px, calc((100vw - var(--max)) / 2)); }
+    .section.white { background: var(--white); border-block: 1px solid var(--line); }
+    .intro { max-width: 780px; margin: 22px 0 0; color: var(--muted); font: 1.08rem/1.65 var(--serif); }
+    .cards { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 1px; margin-top: 48px; border: 1px solid var(--ink); background: var(--ink); }
+    .card { min-width: 0; padding: 29px; background: var(--paper); }
+    .card p { color: var(--muted); }
+    .card ul { padding-left: 20px; color: var(--muted); }
+    .card .terminal { margin-top: 22px; }
+    .note { margin-top: 35px; padding: 26px; border-left: 4px solid var(--orange); background: #ecebe4; }
+    .note strong { font: 800 .78rem var(--mono); text-transform: uppercase; }
+    .note p { margin-top: 10px; color: var(--muted); }
+    .actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 35px; }
+    .button { padding: 11px 17px; border: 1px solid var(--ink); font-size: .85rem; font-weight: 780; text-decoration: none; }
+    .button.primary { color: var(--white); background: var(--ink); }
+    .button.primary:hover { color: var(--white); background: var(--acid-dark); border-color: var(--acid-dark); }
+    footer { padding: 42px max(20px, calc((100vw - var(--max)) / 2)); color: #96998f; background: #090a08; font: .68rem/1.6 var(--mono); }
+    @media (max-width: 760px) {
+      .header { width: calc(100% - 28px); }
+      .hero { padding-top: 72px; }
+      h1 { font-size: clamp(3.2rem, 16vw, 5rem); }
+      .quick-inner, .cards { grid-template-columns: 1fr; }
+      .quick-inner { gap: 40px; }
+    }
+  </style>
+</head>
+<body>
+  <header class="header">
+    <a class="brand" href="../"><img src="../goblin.png" alt="" width="40" height="40">cppdjango 6.0.7.post1</a>
+    <a class="back" href="../">← About cppdjango</a>
+  </header>
+
+  <main>
+    <section class="hero">
+      <p class="eyebrow">Installation guide</p>
+      <h1>Install the C++ port. Keep the Django API.</h1>
+      <p class="lede">The distribution is named <code>cppdjango</code>. Your application continues importing <code>django</code> and using <code>django-admin</code>.</p>
+    </section>
+
+    <section class="quick">
+      <div class="quick-inner">
+        <div>
+          <p class="eyebrow">Fresh environment</p>
+          <h2>Four commands.</h2>
+          <p>pip selects a compatible native wheel when one is available and otherwise builds the C++ extension from source.</p>
+        </div>
+        <div>
+          <div class="terminal">
+            <div class="terminal-head">Install from PyPI</div>
+            <pre><span class="prompt">$</span> python3 -m venv .venv
+<span class="prompt">$</span> . .venv/bin/activate
+<span class="prompt">$</span> python -m pip install --upgrade pip
+<span class="prompt">$</span> python -m pip install cppdjango==6.0.7.post1</pre>
+          </div>
+          <div class="warning"><strong>Do not co-install upstream Django.</strong> The <code>Django</code> and <code>cppdjango</code> distributions both own the <code>django</code> import namespace.</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="section white">
+      <p class="eyebrow">Native prerequisites</p>
+      <h2>When pip builds from source.</h2>
+      <p class="intro">A source build requires Python 3.12+, CMake 3.26+, Ninja or Make, a sufficiently recent C++26 compiler, OpenSSL development files, and zlib development files.</p>
+      <div class="cards">
+        <article class="card">
+          <h3>macOS with Homebrew</h3>
+          <p>Install the build tools and point CMake at Homebrew OpenSSL.</p>
+          <div class="terminal"><pre><span class="prompt">$</span> brew install cmake ninja openssl@3
+<span class="prompt">$</span> CMAKE_PREFIX_PATH="$(brew --prefix openssl@3)" \
+    python -m pip install cppdjango==6.0.7.post1</pre></div>
+        </article>
+        <article class="card">
+          <h3>Debian-family Linux</h3>
+          <p>Package names vary by distribution release. A typical recent setup is:</p>
+          <div class="terminal"><pre><span class="prompt">$</span> sudo apt install cmake ninja-build \
+    g++-15 libssl-dev zlib1g-dev
+<span class="prompt">$</span> CXX=g++-15 python -m pip install \
+    cppdjango==6.0.7.post1</pre></div>
+        </article>
+      </div>
+    </section>
+
+    <section class="section">
+      <p class="eyebrow">Verify and use</p>
+      <h2>Confirm the native extension loaded.</h2>
+      <p class="intro">The runtime package and extension should both report <code>6.0.7.post1</code>. The final value should name the compiler rather than <code>none</code>.</p>
+      <div class="terminal" style="margin-top: 38px"><pre><span class="prompt">$</span> python -c "import django; from django import native; print(django.__version__, native.version(), native.compiler())"
+6.0.7.post1 6.0.7.post1 ...
+
+<span class="comment"># PostgreSQL driver, installed separately as in Django</span>
+<span class="prompt">$</span> python -m pip install "psycopg[binary]>=3.1"</pre></div>
+      <div class="note">
+        <strong>Third-party dependency metadata</strong>
+        <p>A plugin that declares a dependency on the distribution name <code>Django</code> cannot tell pip that <code>cppdjango</code> supplies the compatible import API. Review plugin installs and run <code>python -m pip list | grep -i django</code>; only cppdjango should own this environment.</p>
+      </div>
+      <div class="actions">
+        <a class="button primary" href="https://pypi.org/project/cppdjango/">Open cppdjango on PyPI →</a>
+        <a class="button" href="https://github.com/adamdeprince/cppdjango">Browse the source →</a>
+        <a class="button" href="../artifacts/">Inspect benchmark evidence →</a>
+      </div>
+    </section>
+
+    <section class="section white">
+      <p class="eyebrow">Existing environments and diagnostics</p>
+      <h2>Replace cleanly. Fall back safely.</h2>
+      <div class="cards">
+        <article class="card">
+          <h3>Replace upstream Django</h3>
+          <div class="terminal"><pre><span class="prompt">$</span> python -m pip uninstall -y Django
+<span class="prompt">$</span> python -m pip install cppdjango==6.0.7.post1</pre></div>
+          <p style="margin-top: 18px">A new virtual environment is safer than switching a long-lived shared environment.</p>
+        </article>
+        <article class="card">
+          <h3>Diagnostic Python mode</h3>
+          <div class="terminal"><pre><span class="prompt">$</span> DJANGO_NATIVE=0 python manage.py check</pre></div>
+          <p style="margin-top: 18px">Unsupported operations already replay through compatible Python paths automatically. The environment switch disables all native dispatch only for comparison and troubleshooting.</p>
+        </article>
+      </div>
+    </section>
+  </main>
+
+  <footer>
+    “Django” is a trademark of the Django Software Foundation. cppdjango is an independent C++ port and is not endorsed by the DSF.
+  </footer>
+</body>
+</html>

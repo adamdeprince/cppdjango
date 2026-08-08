@@ -6,6 +6,7 @@
 #include "orm_engine/schema.hpp"
 
 #include <optional>
+#include <memory>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -26,14 +27,80 @@ struct QNode {
   int rhs_op = 0;  // CmpOp
 };
 
+// Compact, Python-object-free replay state for QuerySet operations that the
+// native data plane owns. The Python QuerySet wrapper treats this as an
+// immutable value: every ``with_*`` operation returns a new tail, allowing
+// cloned Python QuerySets to share earlier nodes without mutating them.
+class QueryPlan {
+ public:
+  enum class OperationKind { Filter, OrderBy, Values };
+
+  struct Operation {
+    OperationKind kind = OperationKind::Filter;
+    QNode filter;
+    std::vector<std::string> names;
+    bool simple_filter = false;
+    std::string lookup_field;
+    bool lookup_in = false;
+  };
+
+  struct SimpleValuesShape {
+    std::vector<std::string> fields;
+    std::vector<std::string> ordering;
+    std::string lookup_field;
+    bool lookup_in = false;
+    const std::vector<ParamValue>* lookup_values = nullptr;
+  };
+
+  struct SimpleUpdateShape {
+    std::string lookup_field;
+    const ParamValue* lookup_value = nullptr;
+  };
+
+  QueryPlan() = default;
+  explicit QueryPlan(ModelId model);
+
+  [[nodiscard]] bool is_model_bound() const { return model_.has_value(); }
+  [[nodiscard]] bool matches_model(ModelId model) const;
+  [[nodiscard]] std::optional<ModelId> model_id() const { return model_; }
+
+  [[nodiscard]] QueryPlan with_filter(QNode filter) const;
+  [[nodiscard]] QueryPlan with_simple_filter(
+      std::string lookup_field, bool lookup_in,
+      std::vector<ParamValue> lookup_values) const;
+  [[nodiscard]] QueryPlan with_ordering(
+      std::vector<std::string> field_names) const;
+  [[nodiscard]] QueryPlan with_values(
+      std::vector<std::string> field_names) const;
+
+  [[nodiscard]] bool has_only_projection() const;
+  [[nodiscard]] bool has_simple_filter() const;
+  [[nodiscard]] std::optional<SimpleValuesShape> simple_values_shape() const;
+  [[nodiscard]] std::optional<SimpleUpdateShape> simple_update_shape() const;
+  // Materialized only for the compatibility replay path.
+  [[nodiscard]] std::vector<Operation> operations() const;
+
+ private:
+  struct Node {
+    Operation operation;
+    std::shared_ptr<const Node> previous;
+  };
+
+  std::shared_ptr<const Node> tail_;
+  std::optional<ModelId> model_;
+  std::uint64_t schema_generation_ = 0;
+
+  [[nodiscard]] QueryPlan append(Operation operation) const;
+};
+
 class QuerySet {
  public:
-  QuerySet() = default;
+  QuerySet();
   explicit QuerySet(ModelId model, DialectId dialect = DialectId::Postgres);
 
-  [[nodiscard]] ModelId model_id() const { return query_.model; }
-  [[nodiscard]] const Query& query() const { return query_; }
-  Query& query_mut() { return query_; }
+  [[nodiscard]] ModelId model_id() const { return q().model; }
+  [[nodiscard]] const Query& query() const { return q(); }
+  Query& query_mut() { return q(); }
 
   bool filter_eq(std::string_view field_name, ParamValue value);
   bool filter_in(std::string_view field_name, std::vector<ParamValue> values);
@@ -123,6 +190,7 @@ class QuerySet {
 
   bool order_by(std::string_view field_name, bool desc);
   bool order_by_alias(std::string_view alias, bool desc);
+  void clear_ordering();
 
   void set_limit(std::uint64_t n);
   void set_offset(std::uint64_t n);
@@ -134,13 +202,13 @@ class QuerySet {
 
   // Materialize helpers for Python
   [[nodiscard]] std::vector<std::string> base_attnames() const {
-    return query_.base_attnames;
+    return q().base_attnames;
   }
   [[nodiscard]] const std::vector<RelatedSelect>& related_selects() const {
-    return query_.related_selects;
+    return q().related_selects;
   }
   [[nodiscard]] const std::vector<PrefetchSpec>& prefetches() const {
-    return query_.prefetches;
+    return q().prefetches;
   }
   // Annotation aliases with select-list offsets for setattr on instances.
   struct AnnotationSelect {
@@ -150,11 +218,30 @@ class QuerySet {
   [[nodiscard]] std::vector<AnnotationSelect> annotation_selects() const;
 
   [[nodiscard]] QuerySet clone() const;
+  [[nodiscard]] bool shares_state_with(const QuerySet& other) const {
+    return state_ == other.state_;
+  }
+  [[nodiscard]] std::uint64_t compile_runs() const {
+    return state_->compile_runs;
+  }
 
  private:
-  Query query_{};
-  std::uint32_t join_counter_ = 0;
-  std::unordered_map<std::string, std::string> join_aliases_;
+  struct State {
+    Query query{};
+    std::uint32_t join_counter = 0;
+    std::unordered_map<std::string, std::string> join_aliases;
+    mutable std::optional<CompiledSql> compiled;
+    mutable std::uint64_t compiled_schema_generation = 0;
+    mutable std::uint64_t compile_runs = 0;
+  };
+
+  std::shared_ptr<State> state_;
+
+  void detach();
+  State& s();
+  [[nodiscard]] const State& s() const { return *state_; }
+  Query& q() { return s().query; }
+  [[nodiscard]] const Query& q() const { return s().query; }
 
   [[nodiscard]] std::optional<FieldId> resolve_field(std::string_view name) const;
   bool append_pred(Pred p);

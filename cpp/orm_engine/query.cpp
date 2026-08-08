@@ -63,9 +63,6 @@ std::optional<CmpOp> cmp_op_from_lookup(std::string_view lookup) {
   if (lookup.empty() || lookup == "exact") {
     return CmpOp::Eq;
   }
-  if (lookup == "iexact") {
-    return CmpOp::Eq;  // emit same; collations later
-  }
   if (lookup == "gt") {
     return CmpOp::Gt;
   }
