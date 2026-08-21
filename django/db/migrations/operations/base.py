@@ -1,10 +1,10 @@
-import enum
+from enum import StrEnum
 
 from django.db import router
 from django.utils.inspect import get_func_args
 
 
-class OperationCategory(str, enum.Enum):
+class OperationCategory(StrEnum):
     ADDITION = "+"
     REMOVAL = "-"
     ALTERATION = "~"
@@ -119,11 +119,10 @@ class Operation:
         from django import native as _native
 
         description = self.describe()
-        category = (
-            OperationCategory.MIXED.value
-            if self.category is None
-            else self.category.value
-        )
+        if self.category is None:
+            category = f"{OperationCategory.MIXED}"
+        else:
+            category = f"{self.category}"
         if _native.AVAILABLE:
             return _native.migration_formatted_description(category, description)
         return f"{category} {description}"

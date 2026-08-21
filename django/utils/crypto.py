@@ -5,9 +5,11 @@ Django's standard crypto functions and utilities.
 import hashlib
 import hmac
 import secrets
+import warnings
 
 from django import native as _native
 from django.conf import settings
+from django.utils.deprecation import RemovedInDjango70Warning, django_file_prefixes
 from django.utils.encoding import force_bytes
 
 
@@ -32,14 +34,27 @@ class _HmacResult:
         return self._d.hex()
 
 
-def salted_hmac(key_salt, value, secret=None, *, algorithm="sha1"):
+# RemovedInDjango70Warning: algorithm="sha256"
+def salted_hmac(key_salt, value, secret=None, *, algorithm=None):
     """
     Return the HMAC of 'value', using a key generated from key_salt and a
     secret (which defaults to settings.SECRET_KEY). Default algorithm is SHA1,
     but any algorithm name supported by hashlib can be passed.
 
+    Removed in Django70Warning: The default algorithm will change to SHA256
+    in Django 7.0, so provide an explicit algorithm to silence the warning.
+
     A different key_salt should be passed in for every application of HMAC.
     """
+    if algorithm is None:
+        warnings.warn(
+            "The default argument for algorithm in salted_hmac() will change "
+            "from 'sha1' to 'sha256' in Django 7.0. Pass an explicit "
+            "algorithm to silence this warning.",
+            category=RemovedInDjango70Warning,
+            skip_file_prefixes=django_file_prefixes(),
+        )
+        algorithm = "sha1"
     if secret is None:
         secret = settings.SECRET_KEY
 

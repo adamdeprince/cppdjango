@@ -460,6 +460,11 @@ class CompositePKFilterTests(TestCase):
         queryset = User.objects.filter(comments__in=subquery)
         self.assertSequenceEqual(queryset, (self.user_2,))
 
+    def test_filter_comments_by_users_subquery(self):
+        subquery = Comment.objects.filter(id=3).values("user")
+        queryset = Comment.objects.filter(user__in=subquery)
+        self.assertSequenceEqual(queryset, (self.comment_3,))
+
     def test_cannot_cast_pk(self):
         msg = "Cast expression does not support composite primary keys."
         with self.assertRaisesMessage(ValueError, msg):
@@ -602,3 +607,30 @@ class CompositePKFilterTupleLookupFallbackTests(CompositePKFilterTests):
         )
         self.enterContext(feature_patch_1)
         self.enterContext(feature_patch_2)
+
+
+class CompositePKExcludeNoneTests(TestCase):
+    @classmethod
+    def setUpTestData(cls):
+        cls.tenant = Tenant.objects.create()
+        cls.user = User.objects.create(
+            tenant=cls.tenant, id=1, email="exclude@example.com"
+        )
+
+    def test_filter_pk_in_partial_none(self):
+        self.assertQuerySetEqual(
+            User.objects.filter(pk__in=[(self.user.pk[0], None)]), []
+        )
+
+    def test_filter_pk_in_full_none(self):
+        self.assertQuerySetEqual(User.objects.filter(pk__in=[(None, None)]), [])
+
+    def test_exclude_pk_in_partial_none(self):
+        self.assertQuerySetEqual(
+            User.objects.exclude(pk__in=[(self.user.pk[0], None)]), [self.user]
+        )
+
+    def test_exclude_pk_in_full_none(self):
+        self.assertQuerySetEqual(
+            User.objects.exclude(pk__in=[(None, None)]), [self.user]
+        )

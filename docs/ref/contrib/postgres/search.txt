@@ -338,9 +338,9 @@ than comparing the size of an integer, for example.
 
 In the event that all the fields you're querying on are contained within one
 particular model, you can create a functional
-:class:`GIN <django.contrib.postgres.indexes.GinIndex>` or
-:class:`GiST <django.contrib.postgres.indexes.GistIndex>` index which matches
-the search vector you wish to use. For example::
+:class:`~django.contrib.postgres.indexes.GinIndex` or
+:class:`~django.contrib.postgres.indexes.GistIndex` which matches the search
+vector you wish to use. For example::
 
     GinIndex(
         SearchVector("body_text", "headline", config="english"),
@@ -367,6 +367,31 @@ if it were an annotated ``SearchVector``:
     <QuerySet [<Entry: Cheese on Toast recipes>, <Entry: Pizza recipes>]>
 
 .. _PostgreSQL documentation: https://www.postgresql.org/docs/current/textsearch-features.html#TEXTSEARCH-UPDATE-TRIGGERS
+
+Using ``GeneratedField``
+------------------------
+
+An alternative method is to use a :class:`~django.db.models.GeneratedField`,
+which has PostgreSQL maintain the column rather than a trigger::
+
+    from django.contrib.postgres.indexes import GinIndex
+    from django.contrib.postgres.search import SearchVector, SearchVectorField
+    from django.db import models
+
+
+    class Entry(models.Model):
+        headline = models.CharField(max_length=255)
+        body_text = models.TextField()
+
+        search_vector = models.GeneratedField(
+            expression=SearchVector("headline", weight="A", config="english")
+            + SearchVector("body_text", weight="B", config="english"),
+            output_field=SearchVectorField(),
+            db_persist=True,
+        )
+
+        class Meta:
+            indexes = [GinIndex(fields=["search_vector"])]
 
 Trigram similarity
 ==================

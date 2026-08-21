@@ -1,10 +1,12 @@
 import functools
 import inspect
 import os
+import sys
 import warnings
 from collections import Counter
+from inspect import iscoroutinefunction, markcoroutinefunction
 
-from asgiref.sync import iscoroutinefunction, markcoroutinefunction, sync_to_async
+from asgiref.sync import sync_to_async
 
 import django
 from django.utils.inspect import signature
@@ -18,7 +20,7 @@ def django_file_prefixes():
     return (os.path.join(os.path.dirname(file), ""),)
 
 
-class RemovedInDjango61Warning(DeprecationWarning):
+class RemovedInNextVersionWarning(DeprecationWarning):
     pass
 
 
@@ -26,8 +28,138 @@ class RemovedInDjango70Warning(PendingDeprecationWarning):
     pass
 
 
-RemovedInNextVersionWarning = RemovedInDjango61Warning
 RemovedAfterNextVersionWarning = RemovedInDjango70Warning
+
+
+def warn_about_external_use(
+    message,
+    category,
+    *,
+    skip_name_prefixes=None,
+    skip_frames=0,
+    internal_modules=None,
+):
+    """Issue a warning when a deprecated feature is used outside of Django.
+
+    Skip the warning when called from within Django, to avoid cascading
+    warnings when one deprecated feature is implemented on top of another.
+
+    Examine the stack to determine the "effective caller" (the code using the
+    deprecated feature). By default, this is the third frame from the top
+    (ignoring this helper plus the call site).
+
+    Provide `skip_name_prefixes` (a string or tuple of strings) to skip
+    additional frames by prefix-matching each frame's fully qualified name
+    (dotted module path plus qualname). `skip_name_prefixes` can be used to
+    skip specific functions, all methods in a class, or everything in a module.
+    Skipping stops at the first non-matching frame. Useful when a shared helper
+    is called through multiple paths of varying depth with a common prefix.
+
+    Provide `skip_frames` (an integer) to skip a fixed number of additional
+    frames (e.g., exactly one decorator or shared helper function). If both
+    options are provided, `skip_name_prefixes` is applied first.
+
+    Provide `internal_modules` (a tuple of names, defaulting to ("django",)) to
+    customize what counts as "internal". A frame is internal when its fully
+    qualified name starts with one of these names followed by a dot.
+
+    The warning is issued only if the effective caller (the first non-skipped
+    frame) is outside Django, attributed to that frame. If all frames are
+    skipped, it falls back to the base of the stack.
+
+    Note: To unconditionally issue a warning identifying the first caller
+    outside Django as its source, don't use this function. Instead, use::
+
+        warnings.warn(..., skip_file_prefixes=django_file_prefixes())
+
+    to avoid unnecessary stack inspection overhead.
+    """
+
+    if internal_modules is None:
+        internal_modules = ("django",)
+    if not isinstance(internal_modules, tuple):
+        raise TypeError("internal_modules must be a tuple of module names")
+    internal_prefixes = tuple(f"{mod}." for mod in internal_modules)
+
+    def get_fq_name(frame):
+        mod_name = frame.f_globals.get("__name__", "__main__")
+        return f"{mod_name}.{frame.f_code.co_qualname}"
+
+    def back(frame, level):
+        if frame is not None:
+            return frame.f_back, level + 1
+        return None, level
+
+    frame, level = inspect.currentframe(), 0
+    try:
+        # Back two frames: ignore warn_about_external_use() and its caller.
+        frame, level = back(*back(frame, level))
+
+        if skip_name_prefixes is not None:
+            while frame and get_fq_name(frame).startswith(skip_name_prefixes):
+                frame, level = back(frame, level)
+
+        for _ in range(skip_frames):
+            frame, level = back(frame, level)
+
+        is_internal = frame and get_fq_name(frame).startswith(internal_prefixes)
+    finally:
+        del frame
+
+    if not is_internal:
+        warnings.warn(message, category=category, stacklevel=level + 1)
+
+
+def warn_about_implementation(message, category, target):
+    """Issue a warning about a specific function, class, or method definition.
+
+    The warning will point to the source filename and line number where
+    'target' is _defined_ (not where it is being _called_ as with other warning
+    helpers). Use this to warn about code that isn't currently on the call
+    stack, e.g., deprecation based on the return value of a called method or
+    inspecting a function's signature to see if it supports an updated API.
+
+    Supported usage:
+    warn_about_implementation(message, category, some_function)
+    warn_about_implementation(message, category, SomeClass)
+    warn_about_implementation(message, category, SomeClass.method)
+    warn_about_implementation(message, category, self.method) [a bound method]
+
+    To warn about a property without invoking its descriptor, call with
+    'target' set to inspect.getattr_static(class_or_instance, "property_name").
+    """
+    if inspect.ismethod(target) or isinstance(target, (classmethod, staticmethod)):
+        function = target.__func__
+    elif inspect.isfunction(target) or inspect.isclass(target):
+        function = target
+    elif isinstance(target, property):
+        function = target.fget
+    else:
+        raise TypeError(
+            "target must be a function, class, bound method, or unbound descriptor "
+            "(classmethod, staticmethod, or property)."
+        )
+
+    function = inspect.unwrap(function)
+
+    try:
+        filename = inspect.getsourcefile(function)
+        _, lineno = inspect.getsourcelines(function)
+    except (AttributeError, OSError, TypeError):
+        # Can't identify the source. Issue the warning generically.
+        warnings.warn(message, category, skip_file_prefixes=django_file_prefixes())
+        return
+
+    # Find or create the module's warning registry so warning filters work.
+    module = function.__module__
+    try:
+        registry = sys.modules[module].__dict__.setdefault("__warningregistry__", {})
+    except (AttributeError, KeyError):
+        registry = None
+
+    warnings.warn_explicit(
+        message, category, filename, lineno, module=module, registry=registry
+    )
 
 
 class warn_about_renamed_method:

@@ -58,6 +58,7 @@ class HttpRequest:
     # The encoding used in GET/POST dicts. None means use default setting.
     _encoding = None
     _upload_handlers = []
+    _multipart_parser_class = MultiPartParser
 
     def __init__(self):
         # WARNING: The `WSGIRequest` subclass doesn't call `super`.
@@ -155,9 +156,12 @@ class HttpRequest:
 
     def _set_content_type_params(self, meta):
         """Set content_type, content_params, and encoding."""
-        self.content_type, self.content_params = parse_header_parameters(
-            meta.get("CONTENT_TYPE", "")
-        )
+        try:
+            self.content_type, self.content_params = parse_header_parameters(
+                meta.get("CONTENT_TYPE", "")
+            )
+        except ValueError as exc:
+            raise BadRequest("Invalid Content-Type header.") from exc
         if "charset" in self.content_params:
             try:
                 codecs.lookup(self.content_params["charset"])
@@ -366,6 +370,19 @@ class HttpRequest:
             )
         self._upload_handlers = upload_handlers
 
+    @property
+    def multipart_parser_class(self):
+        return self._multipart_parser_class
+
+    @multipart_parser_class.setter
+    def multipart_parser_class(self, multipart_parser_class):
+        if hasattr(self, "_files"):
+            raise RuntimeError(
+                "You cannot set the multipart parser class after the upload has been "
+                "processed."
+            )
+        self._multipart_parser_class = multipart_parser_class
+
     def parse_file_upload(self, META, post_data):
         """Return a tuple of (POST QueryDict, FILES MultiValueDict)."""
         self.upload_handlers = ImmutableList(
@@ -375,7 +392,9 @@ class HttpRequest:
                 "processed."
             ),
         )
-        parser = MultiPartParser(META, post_data, self.upload_handlers, self.encoding)
+        parser = self.multipart_parser_class(
+            META, post_data, self.upload_handlers, self.encoding
+        )
         return parser.parse()
 
     @property
@@ -386,10 +405,16 @@ class HttpRequest:
                     "You cannot access body after reading from request's data stream"
                 )
 
+            # Make Content-Length fall back to 0 if malformed (e.g. ASGIRequest
+            # comma-joins duplicate Content-Length headers).
+            try:
+                content_length = int(self.META.get("CONTENT_LENGTH") or 0)
+            except (ValueError, TypeError):
+                content_length = 0
             # Limit the maximum request data size that will be handled
             # in-memory. Reject early when Content-Length is present and
             # already exceeds the limit, avoiding reading the body at all.
-            self._check_data_too_big(int(self.META.get("CONTENT_LENGTH") or 0))
+            self._check_data_too_big(content_length)
 
             # Content-Length can be absent or understated (e.g.
             # `Transfer-Encoding: chunked` on ASGI), so for seekable

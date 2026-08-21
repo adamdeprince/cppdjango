@@ -384,21 +384,23 @@ class TestInline(TestDataMixin, TestCase):
         response = self.client.get(url)
         # The whole line containing name + position fields is not hidden.
         self.assertContains(
-            response, '<div class="form-row field-name field-position">'
+            response,
+            "<div class="
+            '"form-row flex-container form-multiline field-name field-position">',
         )
         # The div containing the position field is hidden.
         self.assertInHTML(
-            '<div class="flex-container fieldBox field-position hidden">'
+            '<div class="flex-container field-position fieldBox hidden">'
             '<label class="inline">Position:</label>'
-            '<div class="readonly">0</div></div>'
-            '<div class="help hidden"><div>Position help_text.</div></div>',
+            '<div class="help hidden"><div>Position help_text.</div></div>'
+            '<div class="readonly">0</div></div>',
             response.rendered_content,
         )
         self.assertInHTML(
-            '<div class="flex-container fieldBox field-position hidden">'
+            '<div class="flex-container field-position fieldBox hidden">'
             '<label class="inline">Position:</label>'
-            '<div class="readonly">1</div></div>'
-            '<div class="help hidden"><div>Position help_text.</div></div>',
+            '<div class="help hidden"><div>Position help_text.</div></div>'
+            '<div class="readonly">1</div></div>',
             response.rendered_content,
         )
 
@@ -419,17 +421,17 @@ class TestInline(TestDataMixin, TestCase):
         # The whole line containing position field is hidden.
         self.assertInHTML(
             '<div class="form-row hidden field-position">'
-            '<div><div class="flex-container"><label>Position:</label>'
-            '<div class="readonly">0</div></div>'
+            '<div class="flex-container"><label>Position:</label>'
             '<div class="help hidden"><div>Position help_text.</div></div>'
+            '<div class="readonly">0</div>'
             "</div></div>",
             response.rendered_content,
         )
         self.assertInHTML(
             '<div class="form-row hidden field-position">'
-            '<div><div class="flex-container"><label>Position:</label>'
-            '<div class="readonly">1</div></div>'
+            '<div class="flex-container"><label>Position:</label>'
             '<div class="help hidden"><div>Position help_text.</div></div>'
+            '<div class="readonly">1</div>'
             "</div></div>",
             response.rendered_content,
         )
@@ -828,6 +830,76 @@ class TestInline(TestDataMixin, TestCase):
         parent.refresh_from_db()
         self.assertIs(parent.show_inlines, True)
 
+    def test_delete_protected_message_limits_number_of_objects_displayed(self):
+        # admin limits the number of displayed objects to 2, so we create
+        # 5 footnotes.
+        novel = Novel.objects.create()
+        chapter = Chapter.objects.create(novel=novel)
+        footnotes = [FootNote(chapter=chapter) for i in range(5)]
+        FootNote.objects.bulk_create(footnotes)
+
+        response = self.client.post(
+            reverse("admin:admin_inlines_novel_change", args=(novel.pk,)),
+            data={
+                "show_inlines": "on",
+                "chapter_set-TOTAL_FORMS": "1",
+                "chapter_set-INITIAL_FORMS": "1",
+                "chapter_set-MAX_NUM_FORMS": "1000",
+                "chapter_set-MIN_NUM_FORMS": "0",
+                "chapter_set-0-id": chapter.id,
+                "chapter_set-0-name": chapter.name,
+                "chapter_set-0-novel": novel.id,
+                "chapter_set-0-DELETE": "on",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        inline_formset = response.context_data["inline_admin_formsets"][0]
+        self.assertEqual(1, len(inline_formset.non_form_errors()))
+        error_message = inline_formset.non_form_errors()[0]
+        self.assertTrue(
+            error_message.startswith(
+                f"Deleting chapter Chapter object ({chapter.pk}) would "
+                "require deleting the following protected related objects:"
+            ),
+            error_message,
+        )
+        self.assertEqual(error_message.count("FootNote"), 3, error_message)
+        self.assertTrue(error_message.endswith("…and 2 more objects."), error_message)
+
+    def test_delete_protected_message_does_not_limit_small_amount_of_objects(self):
+        novel = Novel.objects.create()
+        chapter = Chapter.objects.create(novel=novel)
+        footnotes = [FootNote(chapter=chapter) for i in range(3)]
+        FootNote.objects.bulk_create(footnotes)
+
+        response = self.client.post(
+            reverse("admin:admin_inlines_novel_change", args=(novel.pk,)),
+            data={
+                "show_inlines": "on",
+                "chapter_set-TOTAL_FORMS": "1",
+                "chapter_set-INITIAL_FORMS": "1",
+                "chapter_set-MAX_NUM_FORMS": "1000",
+                "chapter_set-MIN_NUM_FORMS": "0",
+                "chapter_set-0-id": chapter.id,
+                "chapter_set-0-name": chapter.name,
+                "chapter_set-0-novel": novel.id,
+                "chapter_set-0-DELETE": "on",
+            },
+        )
+        self.assertEqual(response.status_code, 200)
+        inline_formset = response.context_data["inline_admin_formsets"][0]
+        self.assertEqual(1, len(inline_formset.non_form_errors()))
+        error_message = inline_formset.non_form_errors()[0]
+        self.assertTrue(
+            error_message.startswith(
+                f"Deleting chapter Chapter object ({chapter.pk}) would require "
+                "deleting the following protected related objects:"
+            ),
+            error_message,
+        )
+        self.assertEqual(error_message.count("FootNote object"), 3)
+        self.assertNotIn("more", error_message)
+
 
 @override_settings(ROOT_URLCONF="admin_inlines.urls")
 class TestInlineMedia(TestDataMixin, TestCase):
@@ -1198,7 +1270,7 @@ class TestInlinePermissions(TestCase):
         )
         self.assertContains(
             response,
-            '<input type="hidden" id="id_Author_books-0-id" value="%i" '
+            '<input type="hidden" id="id_Author_books-0-id" value="%s" '
             'name="Author_books-0-id">' % self.author_book_auto_m2m_intermediate_id,
             html=True,
         )
@@ -1226,7 +1298,7 @@ class TestInlinePermissions(TestCase):
         )
         self.assertNotContains(
             response,
-            '<input type="hidden" id="id_inner2_set-0-id" value="%i" '
+            '<input type="hidden" id="id_inner2_set-0-id" value="%s" '
             'name="inner2_set-0-id">' % self.inner2.id,
             html=True,
         )
@@ -1258,7 +1330,7 @@ class TestInlinePermissions(TestCase):
         )
         self.assertContains(
             response,
-            '<input type="hidden" id="id_inner2_set-0-id" value="%i" '
+            '<input type="hidden" id="id_inner2_set-0-id" value="%s" '
             'name="inner2_set-0-id">' % self.inner2.id,
             html=True,
         )
@@ -1305,7 +1377,7 @@ class TestInlinePermissions(TestCase):
         )
         self.assertContains(
             response,
-            '<input type="hidden" id="id_inner2_set-0-id" value="%i" '
+            '<input type="hidden" id="id_inner2_set-0-id" value="%s" '
             'name="inner2_set-0-id">' % self.inner2.id,
             html=True,
         )
@@ -1335,7 +1407,7 @@ class TestInlinePermissions(TestCase):
         )
         self.assertContains(
             response,
-            '<input type="hidden" id="id_inner2_set-0-id" value="%i" '
+            '<input type="hidden" id="id_inner2_set-0-id" value="%s" '
             'name="inner2_set-0-id">' % self.inner2.id,
             html=True,
         )
@@ -1375,7 +1447,7 @@ class TestInlinePermissions(TestCase):
         )
         self.assertContains(
             response,
-            '<input type="hidden" id="id_inner2_set-0-id" value="%i" '
+            '<input type="hidden" id="id_inner2_set-0-id" value="%s" '
             'name="inner2_set-0-id">' % self.inner2.id,
             html=True,
         )
@@ -2570,3 +2642,19 @@ class SeleniumTests(AdminSeleniumTestCase):
         m2m_widget = self.selenium.find_element(By.CSS_SELECTOR, "div.selector")
         self.assertTrue(m2m_widget.is_displayed())
         self.take_screenshot("tabular")
+
+    @screenshot_cases(["desktop_size", "mobile_size", "rtl", "dark", "high_contrast"])
+    def test_tabular_inline_m2m_widget_option_bg(self):
+        from selenium.webdriver.common.by import By
+
+        Person.objects.create(firstname="Lee")
+        self.admin_login(username="super", password="secret")
+        self.selenium.get(
+            self.live_server_url + reverse("admin:admin_inlines_courseproxy2_add")
+        )
+        selector = self.selenium.find_element(By.CSS_SELECTOR, "div.selector")
+        options = selector.find_elements(By.CSS_SELECTOR, "select option")
+        self.assertGreater(len(options), 0)
+        options[0].click()
+        selector.find_element(By.CSS_SELECTOR, "p.selector-filter input").click()
+        self.take_screenshot("focus_out")

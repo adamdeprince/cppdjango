@@ -1,7 +1,7 @@
 from django import native as _native
-from django.utils.cache import cc_delim_re, get_conditional_response, set_response_etag
+from django.utils.cache import get_conditional_response, set_response_etag
 from django.utils.deprecation import MiddlewareMixin
-from django.utils.http import parse_http_date_safe
+from django.utils.http import parse_http_date_safe, split_directive_names
 
 
 class ConditionalGetMiddleware(MiddlewareMixin):
@@ -43,5 +43,5 @@ class ConditionalGetMiddleware(MiddlewareMixin):
         cc = response.get("Cache-Control", "") or ""
         if _native.AVAILABLE:
             return _native.conditional_needs_etag(cc)
-        cache_control_headers = cc_delim_re.split(cc)
-        return all(header.lower() != "no-store" for header in cache_control_headers)
+        directives = split_directive_names(cc)
+        return "no-store" not in directives

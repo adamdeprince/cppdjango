@@ -4,6 +4,7 @@ accessors
 Aceh
 admindocs
 affordances
+ai
 Ai
 Alchin
 allowlist
@@ -51,6 +52,7 @@ benchmarking
 Benoit
 Berners
 Biggs
+Biome
 bitwise
 Bjørn
 blazingly
@@ -86,12 +88,14 @@ codebase
 codec
 codename
 codenamed
+codenames
 coercible
 commenters
 conf
 config
 contenttypes
 contrib
+cooldown
 coroutine
 coroutines
 counterintuitive
@@ -191,6 +195,7 @@ gis
 GiST
 Googol
 Greenhill
+Granian
 gunicorn
 GZip
 gzipped
@@ -314,6 +319,7 @@ needsinfo
 needsnewfeatureprocess
 německy
 nginx
+nitpicky
 noding
 nonces
 nonnegative
@@ -388,7 +394,7 @@ queryset
 querysets
 querystring
 queueing
-Quickstart
+quickstart
 quoteless
 Radziej
 rasters
@@ -542,6 +548,7 @@ unencrypted
 unescape
 unescaped
 unevaluated
+unfetched
 unglamorous
 ungrouped
 unhandled

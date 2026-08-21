@@ -17,6 +17,7 @@ class Child(models.Model):
     parent = models.ForeignKey(Parent, models.SET_NULL, editable=False, null=True)
     name = models.CharField(max_length=30, blank=True)
     age = models.IntegerField(null=True, blank=True)
+    is_active = models.BooleanField(default=True)
 
 
 class GrandChild(models.Model):
@@ -45,6 +46,7 @@ class Band(models.Model):
 class Musician(models.Model):
     name = models.CharField(max_length=30)
     age = models.IntegerField(null=True, blank=True)
+    genre = models.ForeignKey(Genre, null=True, on_delete=models.SET_NULL)
 
     def __str__(self):
         return self.name
@@ -140,3 +142,10 @@ class CharPK(models.Model):
 class ProxyUser(User):
     class Meta:
         proxy = True
+
+
+class MixedFieldsModel(models.Model):
+    """Model with multiple field types for testing search validation."""
+
+    int_field = models.IntegerField(null=True, blank=True)
+    json_field = models.JSONField(null=True, blank=True)

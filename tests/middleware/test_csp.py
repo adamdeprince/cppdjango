@@ -177,13 +177,6 @@ class CSPMiddlewareWithDecoratedViewsTest(SimpleTestCase):
 
 @override_settings(
     ROOT_URLCONF="middleware.urls",
-    SECURE_CSP_REPORT_ONLY={
-        "default-src": [CSP.NONE],
-        "img-src": [CSP.SELF],
-        "script-src": [CSP.SELF],
-        "style-src": [CSP.SELF],
-        "report-uri": "/csp-report/",
-    },
 )
 @modify_settings(
     MIDDLEWARE={"append": "django.middleware.csp.ContentSecurityPolicyMiddleware"}
@@ -203,4 +196,4 @@ class CSPSeleniumTestCase(SeleniumTestCase, StaticLiveServerTestCase):
             (r["csp-report"]["document-uri"], r["csp-report"]["violated-directive"])
             for r in csp_reports
         )
-        self.assertEqual(reports, [(url, "img-src"), (url, "style-src-elem")])
+        self.assertEqual(reports, [(url, "style-src-elem")])

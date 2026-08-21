@@ -33,6 +33,7 @@ from django.utils.regex_helper import _lazy_re_compile
 _charset_from_content_type_re = _lazy_re_compile(
     r";\s*charset=(?P<charset>[^\s;]+)", re.I
 )
+_control_chars_re = _lazy_re_compile(r"[\x00-\x1f\x7f-\x9f]")
 
 # Cached WSGI status line for the common default (framework-floor path).
 _STATUS_LINE_200_OK = "200 OK"
@@ -148,7 +149,7 @@ class HttpResponseBase:
             # Pure Python range check (native hop was net-negative on TE json/plaintext).
             if not 100 <= self.status_code <= 599:
                 raise ValueError("HTTP status code must be an integer from 100 to 599.")
-        self._reason_phrase = reason
+        self.reason_phrase = reason
 
     @property
     def reason_phrase(self):
@@ -160,6 +161,8 @@ class HttpResponseBase:
 
     @reason_phrase.setter
     def reason_phrase(self, value):
+        if value and _control_chars_re.search(value):
+            raise BadHeaderError("reason_phrase can't contain control characters.")
         self._reason_phrase = value
 
     @property
@@ -682,15 +685,21 @@ class FileResponse(StreamingHttpResponse):
 class HttpResponseRedirectBase(HttpResponse):
     allowed_schemes = ["http", "https", "ftp"]
 
-    def __init__(self, redirect_to, preserve_request=False, *args, **kwargs):
+    def __init__(
+        self,
+        redirect_to,
+        preserve_request=False,
+        *args,
+        max_length=MAX_URL_REDIRECT_LENGTH,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self["Location"] = iri_to_uri(redirect_to)
-        redirect_to_str = str(redirect_to)
-        if len(redirect_to_str) > MAX_URL_REDIRECT_LENGTH:
+        if max_length is not None and len(self["Location"]) > max_length:
             raise DisallowedRedirect(
-                f"Unsafe redirect exceeding {MAX_URL_REDIRECT_LENGTH} characters"
+                f"Unsafe redirect exceeding {max_length} characters"
             )
-        parsed = urlsplit(redirect_to_str)
+        parsed = urlsplit(str(redirect_to))
         if preserve_request:
             self.status_code = self.status_code_preserve_request
         if parsed.scheme and parsed.scheme not in self.allowed_schemes:

@@ -4,7 +4,6 @@
 *js text eol=lf
 tests/staticfiles_tests/apps/test/static/test/*txt text eol=lf
 tests/staticfiles_tests/project/documents/test/*txt text eol=lf
-docs/releases/*.txt merge=union
 # Make GitHub syntax-highlight .html files as Django templates
 *.html linguist-language=django
 # Captured benchmark patches are byte-for-byte evidence and may contain

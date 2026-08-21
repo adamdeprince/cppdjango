@@ -49,6 +49,7 @@ from ..views import (
     multivalue_dict_key_error,
     non_sensitive_view,
     paranoid_view,
+    partially_sensitive_view,
     sensitive_args_function_caller,
     sensitive_kwargs_function_caller,
     sensitive_method_view,
@@ -423,6 +424,16 @@ class DebugViewTests(SimpleTestCase):
             response, "<h1>The install worked successfully! Congratulations!</h1>"
         )
 
+    @override_settings(ROOT_URLCONF="view_tests.default_urls")
+    def test_default_urlconf_technical_404(self):
+        response = self.client.get("/favicon.ico")
+        self.assertContains(
+            response,
+            "<code>\nadmin/\n[namespace='admin']\n</code>",
+            status_code=404,
+            html=True,
+        )
+
     @override_settings(ROOT_URLCONF="view_tests.regression_21530_urls")
     def test_regression_21530(self):
         """
@@ -485,6 +496,14 @@ class DebugViewTests(SimpleTestCase):
         with self.assertLogs("django.request", "ERROR"):
             response = self.client.get("/raises500/", headers={"accept": "text/plain"})
         self.assertContains(response, "Oh dear, an error occurred!", status_code=500)
+
+    # RemovedInDjango70Warning.
+    @override_settings(MAILERS={})
+    def test_works_with_mailers_defined(self):
+        with self.assertLogs("django.request", "ERROR"):
+            response = self.client.get("/raises500/")
+        self.assertContains(response, "MAILERS", status_code=500)
+        self.assertNotContains(response, "EMAIL_BACKEND", status_code=500)
 
 
 class DebugViewQueriesAllowedTests(SimpleTestCase):
@@ -1576,7 +1595,10 @@ class ExceptionReportTestMixin:
                 self.assertNotIn(v, body)
 
 
-@override_settings(ROOT_URLCONF="view_tests.urls")
+@override_settings(
+    ROOT_URLCONF="view_tests.urls",
+    MAILERS={"default": {"BACKEND": "django.core.mail.backends.locmem.EmailBackend"}},
+)
 class ExceptionReporterFilterTests(
     ExceptionReportTestMixin, LoggingCaptureMixin, SimpleTestCase
 ):
@@ -1650,6 +1672,20 @@ class ExceptionReporterFilterTests(
         with self.settings(DEBUG=False):
             self.verify_paranoid_response(paranoid_view)
             self.verify_paranoid_email(paranoid_view)
+
+    def test_partially_sensitive_request(self):
+        """
+        No POST parameters can be seen in the default error reports for views
+        decorated with the no-argument form of sensitive_post_parameters()
+        alongside a with-arguments form of sensitive_variables().
+        """
+        with self.settings(DEBUG=True):
+            self.verify_unsafe_response(partially_sensitive_view)
+            self.verify_unsafe_email(partially_sensitive_view)
+
+        with self.settings(DEBUG=False):
+            self.verify_paranoid_response(partially_sensitive_view)
+            self.verify_paranoid_email(partially_sensitive_view)
 
     def test_multivalue_dict_key_error(self):
         """

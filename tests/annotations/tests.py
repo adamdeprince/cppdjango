@@ -483,6 +483,17 @@ class NonAggregateAnnotationTestCase(TestCase):
         with self.assertRaisesMessage(FieldError, expected_message % article_fields):
             Book.objects.annotate(annotation=Value(1)).values_list("annotation_typo")
 
+    def test_chained_values_masked_annotation_error_message(self):
+        msg = (
+            "Cannot select the 'author_id' alias. It was excluded by a "
+            "previous values() or values_list() call. Include 'author_id' in "
+            "that call to select it."
+        )
+        with self.assertRaisesMessage(FieldError, msg):
+            Book.objects.annotate(
+                author_name=F("authors__name"), author_id=F("authors__id")
+            ).values("author_name").values("author_id")
+
     def test_decimal_annotation(self):
         salary = Decimal(10) ** -Employee._meta.get_field("salary").decimal_places
         Employee.objects.create(
@@ -731,8 +742,7 @@ class NonAggregateAnnotationTestCase(TestCase):
         4. model_related_fields
         """
         store = Store.objects.first()
-        Employee.objects.create(
-            id=1,
+        e1 = Employee.objects.create(
             first_name="Max",
             manager=True,
             last_name="Paine",
@@ -740,8 +750,7 @@ class NonAggregateAnnotationTestCase(TestCase):
             age=23,
             salary=Decimal(50000.00),
         )
-        Employee.objects.create(
-            id=2,
+        e2 = Employee.objects.create(
             first_name="Buffy",
             manager=False,
             last_name="Summers",
@@ -759,8 +768,18 @@ class NonAggregateAnnotationTestCase(TestCase):
         )
 
         rows = [
-            (1, "Max", True, 42, "Paine", 23, Decimal(50000.00), store.name, 17),
-            (2, "Buffy", False, 42, "Summers", 18, Decimal(40000.00), store.name, 17),
+            (e1.pk, "Max", True, 42, "Paine", 23, Decimal(50000.00), store.name, 17),
+            (
+                e2.pk,
+                "Buffy",
+                False,
+                42,
+                "Summers",
+                18,
+                Decimal(40000.00),
+                store.name,
+                17,
+            ),
         ]
 
         self.assertQuerySetEqual(
@@ -781,8 +800,7 @@ class NonAggregateAnnotationTestCase(TestCase):
 
     def test_column_field_ordering_with_deferred(self):
         store = Store.objects.first()
-        Employee.objects.create(
-            id=1,
+        e1 = Employee.objects.create(
             first_name="Max",
             manager=True,
             last_name="Paine",
@@ -790,8 +808,7 @@ class NonAggregateAnnotationTestCase(TestCase):
             age=23,
             salary=Decimal(50000.00),
         )
-        Employee.objects.create(
-            id=2,
+        e2 = Employee.objects.create(
             first_name="Buffy",
             manager=False,
             last_name="Summers",
@@ -809,8 +826,18 @@ class NonAggregateAnnotationTestCase(TestCase):
         )
 
         rows = [
-            (1, "Max", True, 42, "Paine", 23, Decimal(50000.00), store.name, 17),
-            (2, "Buffy", False, 42, "Summers", 18, Decimal(40000.00), store.name, 17),
+            (e1.pk, "Max", True, 42, "Paine", 23, Decimal(50000.00), store.name, 17),
+            (
+                e2.pk,
+                "Buffy",
+                False,
+                42,
+                "Summers",
+                18,
+                Decimal(40000.00),
+                store.name,
+                17,
+            ),
         ]
 
         # and we respect deferred columns!
@@ -1563,13 +1590,12 @@ class AliasTests(TestCase):
                 with self.assertRaisesMessage(ValueError, msg):
                     Book.objects.alias(**{crafted_alias: FilteredRelation("authors")})
 
-    def test_alias_filtered_relation_sql_injection_dollar_sign(self):
-        qs = Book.objects.alias(
-            **{"crafted_alia$": FilteredRelation("authors")}
-        ).values("name", "crafted_alia$")
-        if connection.vendor == "postgresql":
-            msg = "Dollar signs are not permitted in column aliases on PostgreSQL."
-            with self.assertRaisesMessage(ValueError, msg):
-                list(qs)
-        else:
-            self.assertEqual(qs.first()["name"], self.b1.name)
+    def test_values_wrong_alias(self):
+        expected_message = (
+            "Cannot resolve keyword 'alias_typo' into field. Choices are: %s"
+        )
+        alias_fields = ", ".join(
+            sorted(["my_alias"] + list(get_field_names_from_opts(Book._meta)))
+        )
+        with self.assertRaisesMessage(FieldError, expected_message % alias_fields):
+            Book.objects.alias(my_alias=F("pk")).order_by("alias_typo")

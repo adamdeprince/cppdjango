@@ -16,6 +16,7 @@ from io import BytesIO
 from django import native as _native
 from django.core import validators
 from django.core.exceptions import ValidationError
+from django.db.models.utils import get_blank_choice_label
 from django.forms.boundfield import BoundField
 from django.forms.utils import from_current_timezone, to_current_timezone
 from django.forms.widgets import (
@@ -41,6 +42,7 @@ from django.forms.widgets import (
 )
 from django.utils import formats
 from django.utils.choices import normalize_choices
+from django.utils.datastructures import OrderedSet
 from django.utils.dateparse import parse_datetime, parse_duration
 from django.utils.duration import duration_string
 from django.utils.ipv6 import MAX_IPV6_ADDRESS_LENGTH, clean_ipv6_address
@@ -1011,7 +1013,8 @@ class MultipleChoiceField(ChoiceField):
         if self.required and not value:
             raise ValidationError(self.error_messages["required"], code="required")
         # Validate that each value in the value list is in self.choices.
-        for val in value:
+        # Avoid redundant validation, and keep elements ordered.
+        for val in OrderedSet(value):
             if not self.valid_value(val):
                 raise ValidationError(
                     self.error_messages["invalid_choice"],
@@ -1244,29 +1247,31 @@ class FilePathField(ChoiceField):
         self.path, self.match, self.recursive = path, match, recursive
         self.allow_files, self.allow_folders = allow_files, allow_folders
         super().__init__(choices=(), **kwargs)
+        self.set_choices()
 
+    def set_choices(self):
         if self.required:
             self.choices = []
         else:
-            self.choices = [("", "---------")]
+            self.choices = [("", get_blank_choice_label())]
 
         if self.match is not None:
             self.match_re = re.compile(self.match)
 
-        if recursive:
+        if self.recursive:
             for root, dirs, files in sorted(os.walk(self.path)):
                 if self.allow_files:
                     for f in sorted(files):
                         if self.match is None or self.match_re.search(f):
                             f = os.path.join(root, f)
-                            self.choices.append((f, f.replace(path, "", 1)))
+                            self.choices.append((f, f.replace(self.path, "", 1)))
                 if self.allow_folders:
                     for f in sorted(dirs):
                         if f == "__pycache__":
                             continue
                         if self.match is None or self.match_re.search(f):
                             f = os.path.join(root, f)
-                            self.choices.append((f, f.replace(path, "", 1)))
+                            self.choices.append((f, f.replace(self.path, "", 1)))
         else:
             choices = []
             with os.scandir(self.path) as entries:

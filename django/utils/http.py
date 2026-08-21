@@ -187,11 +187,11 @@ def int_to_base36(i):
         return _native.int_to_base36(i)
     if i < 36:
         return char_set[i]
-    b36 = ""
+    b36_parts = []
     while i != 0:
         i, n = divmod(i, 36)
-        b36 = char_set[n] + b36
-    return b36
+        b36_parts.append(char_set[n])
+    return "".join(reversed(b36_parts))
 
 
 def urlsafe_base64_encode(s):
@@ -221,11 +221,40 @@ def urlsafe_base64_decode(s):
         raise ValueError(e)
 
 
+def split_header_value(value, sep=","):
+    """Yield stripped parts of an HTTP header value split by sep.
+
+    Use only with headers whose values are token lists (e.g. Vary,
+    Cache-Control). Do not use with headers that allow quoted strings in values
+    (e.g. Set-Cookie), as commas inside values will be used as separators.
+    """
+    for part in value.split(sep):
+        if stripped := part.strip():
+            yield stripped
+
+
+def split_directive_names(value):
+    """Yield the lowercased directive names from an HTTP header value.
+
+    Any qualified value is discarded, so that qualified forms permitted by
+    RFC 9111 (e.g. `private="Set-Cookie"`) reduce to their directive name
+    ("private").
+
+    Use to check for the presence of a directive when its value is not needed;
+    use `split_header_value()` when the value matters (e.g. `max-age`).
+    """
+    for part in split_header_value(value):
+        yield part.split("=", 1)[0].strip().lower()
+
+
 def parse_etags(etag_str):
     """
     Parse a string of ETags given in an If-None-Match or If-Match header as
     defined by RFC 9110. Return a list of quoted ETags, or ['*'] if all ETags
     should be matched.
+
+    ETags values containing a comma are not supported, as the comma is used as
+    list separator.
     """
     if _native.AVAILABLE:
         return _native.parse_etags(etag_str)
@@ -233,7 +262,7 @@ def parse_etags(etag_str):
         return ["*"]
     else:
         # Parse each ETag individually, and return any that are valid.
-        etag_matches = (ETAG_MATCH.match(etag.strip()) for etag in etag_str.split(","))
+        etag_matches = (ETAG_MATCH.match(etag) for etag in split_header_value(etag_str))
         return [match[1] for match in etag_matches if match]
 
 
@@ -380,6 +409,10 @@ def parse_header_parameters(line, max_length=MAX_HEADER_LENGTH):
     if max_length is not None and len(line) > max_length:
         raise ValueError("Unable to parse header parameters (value too long).")
 
+    # Fast path for no params.
+    if ";" not in line:
+        return line.strip().lower(), {}
+
     parts = _parseparam(";" + line)
     key = parts.__next__().lower()
     pdict = {}
@@ -400,7 +433,11 @@ def parse_header_parameters(line, max_length=MAX_HEADER_LENGTH):
                 value = value.replace("\\\\", "\\").replace('\\"', '"')
             if has_encoding:
                 encoding, lang, value = value.split("'")
-                value = unquote(value, encoding=encoding)
+                try:
+                    value = unquote(value, encoding=encoding)
+                except (LookupError, UnicodeDecodeError):
+                    msg = f"Invalid encoding {encoding!r} for RFC 2231 param."
+                    raise ValueError(msg)
             pdict[name] = value
     return key, pdict
 

@@ -38,7 +38,7 @@ from django.db.migrations.recorder import MigrationRecorder
 from django.test import LiveServerTestCase, SimpleTestCase, TestCase, override_settings
 from django.test.utils import captured_stderr, captured_stdout
 from django.urls import path
-from django.utils.version import PY313, get_docs_version
+from django.utils.version import PY313, PY314, get_docs_version
 from django.views.static import serve
 
 from . import urls
@@ -134,6 +134,7 @@ class AdminScriptTestCase(SimpleTestCase):
         python_path.extend(ext_backend_base_dirs)
         test_environ["PYTHONPATH"] = os.pathsep.join(python_path)
         test_environ["PYTHONWARNINGS"] = ""
+        test_environ["PYTHON_COLORS"] = "0"
 
         p = subprocess.run(
             [sys.executable, *args],
@@ -1624,7 +1625,7 @@ class ManageRunserver(SimpleTestCase):
         self.cmd._raw_ipv6 = False
         self.cmd.on_bind("8000")
         self.assertIn(
-            "Starting development server at http://0.0.0.0:8000/",
+            "Starting WSGI development server at http://0.0.0.0:8000/",
             self.output.getvalue(),
         )
         docs_version = get_docs_version()
@@ -1643,7 +1644,7 @@ class ManageRunserver(SimpleTestCase):
         self.cmd._raw_ipv6 = False
         self.cmd.on_bind("14437")
         self.assertIn(
-            "Starting development server at http://127.0.0.1:14437/",
+            "Starting WSGI development server at http://127.0.0.1:14437/",
             self.output.getvalue(),
         )
         docs_version = get_docs_version()
@@ -1662,7 +1663,7 @@ class ManageRunserver(SimpleTestCase):
         self.cmd._raw_ipv6 = False
         self.cmd.on_bind("8000")
         self.assertIn(
-            "Starting development server at http://0.0.0.0:8000/",
+            "Starting WSGI development server at http://0.0.0.0:8000/",
             self.output.getvalue(),
         )
         docs_version = get_docs_version()
@@ -2446,10 +2447,17 @@ class Discovery(SimpleTestCase):
 
 class CommandDBOptionChoiceTests(SimpleTestCase):
     def test_invalid_choice_db_option(self):
-        expected_error = (
-            r"Error: argument --database: invalid choice: 'deflaut' "
-            r"\(choose from '?default'?, '?other'?\)"
-        )
+        if PY314:
+            expected_error = (
+                r"Error: argument --database: invalid choice: 'deflaut', "
+                r"maybe you meant 'default'\? "
+                r"\(choose from '?default'?, '?other'?\)"
+            )
+        else:
+            expected_error = (
+                r"Error: argument --database: invalid choice: 'deflaut' "
+                r"\(choose from '?default'?, '?other'?\)"
+            )
         args = [
             "changepassword",
             "createsuperuser",
@@ -2545,6 +2553,7 @@ class ArgumentOrder(AdminScriptTestCase):
         )
 
 
+@mock.patch.dict(os.environ, {"PYTHON_COLORS": "0"})
 class ExecuteFromCommandLine(SimpleTestCase):
     def test_program_name_from_argv(self):
         """
@@ -2766,6 +2775,21 @@ class StartProject(LiveServerTestCase, AdminScriptTestCase):
         self.assertNoOutput(err)
         self.assertTrue(os.path.isdir(testproject_dir))
         self.assertTrue(os.path.exists(os.path.join(testproject_dir, "run.py")))
+
+    def test_custom_project_template_from_tarball_by_url_bad_filename(self):
+        """
+        The startproject management command will raise SuspiciousFileOperation
+        on an ill-formed remote template archive filename.
+        """
+        template_url = "%s/bad_template_filename.tgz" % self.live_server_url
+
+        args = ["startproject", "--template", template_url, "urltestproject"]
+
+        out, err = self.run_django_admin(args)
+        self.assertOutput(
+            err,
+            "is located outside of the base path component",
+        )
 
     def test_custom_project_template_from_tarball_by_url_django_user_agent(self):
         user_agent = None

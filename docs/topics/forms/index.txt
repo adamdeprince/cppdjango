@@ -578,13 +578,13 @@ Reusable field group templates
 ------------------------------
 
 Each field is available as an attribute of the form, using
-``{{ form.name_of_field }}`` in a template. A field has a
+``{{ form.name_of_field }}`` in a template. A field has an
 :meth:`~django.forms.BoundField.as_field_group` method which renders the
-related elements of the field as a group, its label, widget, errors, and help
+related elements of the field as a group: its label, widget, errors, and help
 text.
 
-This allows generic templates to be written that arrange fields elements in the
-required layout. For example:
+This allows generic templates to be written that arrange each field's elements
+in the required layout. For example:
 
 .. code-block:: html+django
 
@@ -814,10 +814,8 @@ Useful attributes on ``{{ field }}`` include:
 ``{{ field.value }}``
     The value of the field. e.g ``someone@example.com``.
 
-.. seealso::
-
-    For a complete list of attributes and methods, see
-    :class:`~django.forms.BoundField`.
+For a complete list of attributes and methods, see the reference guide for
+:class:`~django.forms.BoundField`.
 
 Looping over hidden and visible fields
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -870,3 +868,7 @@ This covers the basics, but forms can do a whole lot more:
     :doc:`The Forms Reference </ref/forms/index>`
         Covers the full API reference, including form fields, form widgets,
         and form and field validation.
+
+    :pypi:`django-formtools`
+        Provides additional form utilities, such as form previews and wizards
+        (`documentation <https://django-formtools.readthedocs.io/>`_).

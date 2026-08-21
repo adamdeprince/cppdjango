@@ -117,6 +117,8 @@ Built-in Expressions
     ``django.db.models.aggregates``, but for convenience they're available and
     usually imported from :mod:`django.db.models`.
 
+.. _f-expressions:
+
 ``F()`` expressions
 -------------------
 
@@ -436,11 +438,11 @@ return type.
 
     Built-in database functions (such as
     :class:`~django.db.models.functions.Cast`) vary in whether arguments such
-    as ``output_field`` can be supplied positionally or only by keyword. For
-    ``output_field`` and several other cases, the input ultimately reaches
-    ``Func()`` as a keyword argument, so the advice to avoid constructing
-    keyword arguments from untrusted user input applies as equally to these
-    arguments as it does to ``**extra``.
+    as ``output_field`` can be supplied as positional arguments or only by
+    keyword. For ``output_field`` and several other cases, the input ultimately
+    reaches ``Func()`` as a keyword argument, so the advice to avoid
+    constructing keyword arguments from untrusted user input applies as equally
+    to these arguments as it does to ``**extra``.
 
 ``Aggregate()`` expressions
 ---------------------------
@@ -509,7 +511,7 @@ should be invoked for each distinct value of ``expressions`` (or set of
 values, for multiple ``expressions``). The argument is only supported on
 aggregates that have :attr:`~Aggregate.allow_distinct` set to ``True``.
 
-The ``filter`` argument takes a :class:`Q object <django.db.models.Q>` that's
+The ``filter`` argument takes a :ref:`Q object <q-objects>` that's
 used to filter the rows that are aggregated. See :ref:`conditional-aggregation`
 and :ref:`filtering-on-annotations` for example usage.
 
@@ -594,6 +596,18 @@ arithmetic on ``F()`` expressions with different types as described in
     ``ExpressionWrapper`` only sets the output field for the ORM and does not
     perform any database-level casting. To ensure a specific type is returned
     from the database, use :class:`~django.db.models.functions.Cast` instead.
+
+``JSONNull()`` expression
+-------------------------
+
+.. versionadded:: 6.1
+
+.. class:: JSONNull()
+
+Specialized expression to represent JSON scalar ``null`` on a
+:class:`~django.db.models.JSONField`.
+
+See :ref:`storing-and-querying-for-none` for usage examples.
 
 Conditional expressions
 -----------------------
@@ -864,7 +878,7 @@ expression is applied. For example, if you sum over the rows in a partition,
 the first result is the value of the first row, the second is the sum of first
 and second row.
 
-The ``frame`` parameter specifies which other rows that should be used in the
+The ``frame`` parameter specifies which other rows should be used in the
 computation. See :ref:`window-frames` for details.
 
 For example, to annotate each movie with the average rating for the movies by
@@ -1117,8 +1131,6 @@ calling the appropriate methods on the wrapped expression.
 
     .. attribute:: set_returning
 
-        .. versionadded:: 5.2
-
         Tells Django that this expression contains a set-returning function,
         enforcing subquery evaluation. It's used, for example, to allow some
         Postgres set-returning functions (e.g. ``JSONB_PATH_QUERY``,
@@ -1126,8 +1138,6 @@ calling the appropriate methods on the wrapped expression.
         annotations spawn rows themselves. Defaults to ``False``.
 
     .. attribute:: allows_composite_expressions
-
-        .. versionadded:: 5.2
 
         Tells Django that this expression allows composite expressions, for
         example, to support :ref:`composite primary keys
@@ -1192,7 +1202,7 @@ calling the appropriate methods on the wrapped expression.
 
     .. method:: get_group_by_cols()
 
-        Responsible for returning the list of columns references by
+        Responsible for returning the list of columns referenced by
         this expression. ``get_group_by_cols()`` should be called on any
         nested expressions. ``F()`` objects, in particular, hold a reference
         to a column.

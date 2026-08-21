@@ -18,6 +18,8 @@ from django.db import (
 from django.db.backends.utils import truncate_name
 from django.db.models import (
     CASCADE,
+    DB_CASCADE,
+    DB_SET_NULL,
     PROTECT,
     AutoField,
     BigAutoField,
@@ -410,6 +412,40 @@ class SchemaTests(TransactionTestCase):
             ]
         )
 
+    @skipUnlessDBFeature("can_create_inline_fk", "supports_on_delete_db_cascade")
+    def test_inline_fk_db_on_delete(self):
+        with connection.schema_editor() as editor:
+            editor.create_model(Author)
+            editor.create_model(Book)
+            editor.create_model(Note)
+        self.assertForeignKeyNotExists(Note, "book_id", "schema_book")
+        # Add a foreign key from model to the other.
+        with (
+            CaptureQueriesContext(connection) as ctx,
+            connection.schema_editor() as editor,
+        ):
+            new_field = ForeignKey(Book, DB_CASCADE)
+            new_field.set_attributes_from_name("book")
+            editor.add_field(Note, new_field)
+        self.assertForeignKeyExists(Note, "book_id", "schema_book")
+        # Creating a FK field with a constraint uses a single statement without
+        # a deferred ALTER TABLE.
+        self.assertFalse(
+            [
+                sql
+                for sql in (str(statement) for statement in editor.deferred_sql)
+                if sql.startswith("ALTER TABLE") and "ADD CONSTRAINT" in sql
+            ]
+        )
+        # ON DELETE clause is used.
+        self.assertTrue(
+            any(
+                capture_query["sql"].startswith("ALTER TABLE")
+                and "ON DELETE" in capture_query["sql"]
+                for capture_query in ctx.captured_queries
+            )
+        )
+
     @skipUnlessDBFeature("can_create_inline_fk")
     def test_add_inline_fk_update_data(self):
         with connection.schema_editor() as editor:
@@ -565,6 +601,118 @@ class SchemaTests(TransactionTestCase):
         with connection.schema_editor() as editor:
             editor.alter_field(Author, new_field2, new_field, strict=True)
         self.assertForeignKeyNotExists(Author, "tag_id", "schema_tag")
+
+    @skipUnlessDBFeature(
+        "supports_foreign_keys",
+        "can_introspect_foreign_keys",
+        "supports_on_delete_db_cascade",
+    )
+    def test_fk_alter_on_delete(self):
+        with connection.schema_editor() as editor:
+            editor.create_model(Author)
+            editor.create_model(Book)
+        self.assertForeignKeyExists(Book, "author_id", "schema_author")
+        # Change CASCADE to DB_CASCADE.
+        old_field = Book._meta.get_field("author")
+        new_field = ForeignKey(Author, DB_CASCADE)
+        new_field.set_attributes_from_name("author")
+        with (
+            connection.schema_editor() as editor,
+            CaptureQueriesContext(connection) as ctx,
+        ):
+            editor.alter_field(Book, old_field, new_field)
+        self.assertForeignKeyExists(Book, "author_id", "schema_author")
+        self.assertIs(
+            any("ON DELETE" in query["sql"] for query in ctx.captured_queries), True
+        )
+        # Change DB_CASCADE to CASCADE.
+        old_field = new_field
+        new_field = ForeignKey(Author, CASCADE)
+        new_field.set_attributes_from_name("author")
+        with (
+            connection.schema_editor() as editor,
+            CaptureQueriesContext(connection) as ctx,
+        ):
+            editor.alter_field(Book, old_field, new_field)
+        self.assertForeignKeyExists(Book, "author_id", "schema_author")
+        self.assertGreater(len(ctx.captured_queries), 0)
+        self.assertIs(
+            any("ON DELETE" in query["sql"] for query in ctx.captured_queries), False
+        )
+
+    @skipUnlessDBFeature("supports_foreign_keys", "can_introspect_foreign_keys")
+    def test_fk_alter_on_delete_python_level_noop(self):
+        with connection.schema_editor() as editor:
+            editor.create_model(Author)
+            editor.create_model(Book)
+        old_field = Book._meta.get_field("author")
+        new_field = ForeignKey(Author, PROTECT)
+        new_field.set_attributes_from_name("author")
+        # Changing between Python-level on_delete options doesn't require
+        # database changes.
+        with connection.schema_editor() as editor, self.assertNumQueries(0):
+            editor.alter_field(Book, old_field, new_field, strict=True)
+        with connection.schema_editor() as editor, self.assertNumQueries(0):
+            editor.alter_field(Book, new_field, old_field, strict=True)
+
+    @isolate_apps("schema")
+    @skipUnlessDBFeature(
+        "supports_foreign_keys",
+        "can_introspect_foreign_keys",
+        "supports_on_delete_db_cascade",
+    )
+    def test_fk_alter_on_delete_db_level(self):
+        class DBOnDeleteParent(Model):
+            class Meta:
+                app_label = "schema"
+
+        class DBOnDeleteChild(Model):
+            parent = ForeignKey(DBOnDeleteParent, DB_CASCADE, null=True)
+
+            class Meta:
+                app_label = "schema"
+
+        self.isolated_local_models = [DBOnDeleteChild, DBOnDeleteParent]
+        with connection.schema_editor() as editor:
+            editor.create_model(DBOnDeleteParent)
+            editor.create_model(DBOnDeleteChild)
+        # Changing between database-level on_delete options requires database
+        # changes.
+        old_field = DBOnDeleteChild._meta.get_field("parent")
+        new_field = ForeignKey(DBOnDeleteParent, DB_SET_NULL, null=True)
+        new_field.set_attributes_from_name("parent")
+        with (
+            connection.schema_editor() as editor,
+            CaptureQueriesContext(connection) as ctx,
+        ):
+            editor.alter_field(DBOnDeleteChild, old_field, new_field, strict=True)
+        self.assertIs(
+            any("SET NULL" in query["sql"] for query in ctx.captured_queries), True
+        )
+
+    @isolate_apps("schema")
+    @skipUnlessDBFeature("supports_foreign_keys", "can_introspect_foreign_keys")
+    def test_create_model_db_on_delete(self):
+        class Parent(Model):
+            class Meta:
+                app_label = "schema"
+
+        class Child(Model):
+            parent_fk = ForeignKey(Parent, DB_SET_NULL, null=True)
+
+            class Meta:
+                app_label = "schema"
+
+        with connection.schema_editor() as editor:
+            editor.create_model(Parent)
+        with CaptureQueriesContext(connection) as ctx:
+            with connection.schema_editor() as editor:
+                editor.create_model(Child)
+
+        self.assertForeignKeyNotExists(Child, "parent_id", "schema_parent")
+        self.assertIs(
+            any("ON DELETE" in query["sql"] for query in ctx.captured_queries), True
+        )
 
     @isolate_apps("schema")
     def test_no_db_constraint_added_during_primary_key_change(self):
@@ -936,7 +1084,7 @@ class SchemaTests(TransactionTestCase):
         class GeneratedFieldIndexedModel(Model):
             number = IntegerField(default=1)
             generated = GeneratedField(
-                expression=F("number"),
+                expression=F("number") + 1,
                 db_persist=True,
                 output_field=IntegerField(),
             )
@@ -949,7 +1097,7 @@ class SchemaTests(TransactionTestCase):
 
         old_field = GeneratedFieldIndexedModel._meta.get_field("generated")
         new_field = GeneratedField(
-            expression=F("number"),
+            expression=F("number") + 1,
             db_persist=True,
             db_index=True,
             output_field=IntegerField(),
@@ -3708,8 +3856,14 @@ class SchemaTests(TransactionTestCase):
             with self.assertRaises(DatabaseError):
                 editor.add_constraint(Author, constraint)
 
-    @skipUnlessDBFeature("supports_nulls_distinct_unique_constraints")
+    @skipUnlessDBFeature(
+        "supports_expression_indexes", "supports_nulls_distinct_unique_constraints"
+    )
     def test_unique_constraint_index_nulls_distinct(self):
+        """
+        For a UniqueConstraint with expressions, the backend executes:
+        CREATE UNIQUE INDEX ...
+        """
         with connection.schema_editor() as editor:
             editor.create_model(Author)
         nulls_distinct = UniqueConstraint(
@@ -3734,6 +3888,10 @@ class SchemaTests(TransactionTestCase):
 
     @skipUnlessDBFeature("supports_nulls_distinct_unique_constraints")
     def test_unique_constraint_nulls_distinct(self):
+        """
+        For UniqueConstraint(fields=...), the backend executes:
+        ALTER TABLE "schema_author" ADD CONSTRAINT ...
+        """
         with connection.schema_editor() as editor:
             editor.create_model(Author)
         constraint = UniqueConstraint(
@@ -4632,6 +4790,7 @@ class SchemaTests(TransactionTestCase):
                         "to_table": editor.quote_name(table),
                         "to_column": editor.quote_name(model._meta.auto_field.column),
                         "deferrable": connection.ops.deferrable_sql(),
+                        "on_delete_db": "",
                     }
                 )
                 self.assertIn(

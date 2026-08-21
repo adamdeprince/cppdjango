@@ -132,6 +132,12 @@ class FieldError(Exception):
     pass
 
 
+class FieldFetchBlocked(FieldError):
+    """On-demand fetching of a model field blocked."""
+
+    pass
+
+
 NON_FIELD_ERRORS = "__all__"
 
 
@@ -248,7 +254,7 @@ class EmptyResultSet(Exception):
 
 
 class FullResultSet(Exception):
-    """A database query predicate is matches everything."""
+    """A database query predicate that matches everything."""
 
     pass
 

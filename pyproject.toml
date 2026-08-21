@@ -18,7 +18,7 @@ authors = [
   {name = "Django Software Foundation and individual contributors"},
   {name = "cppdjango contributors"},
 ]
-description = "A C++ port of Django 6.0.7 with native ORM and request-processing paths."
+description = "A C++ port of Django 6.1 with native ORM and request-processing paths."
 readme = "README.rst"
 license = "BSD-3-Clause"
 license-files = ["LICENSE", "LICENSE.python", "AUTHORS"]

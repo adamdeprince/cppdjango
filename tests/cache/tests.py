@@ -14,6 +14,7 @@ from functools import wraps
 from pathlib import Path
 from unittest import mock, skipIf
 
+import django
 from django.conf import settings
 from django.core import management, signals
 from django.core.cache import (
@@ -24,7 +25,7 @@ from django.core.cache import (
     cache,
     caches,
 )
-from django.core.cache.backends.base import InvalidCacheBackendError
+from django.core.cache.backends.base import BaseCache, InvalidCacheBackendError
 from django.core.cache.backends.redis import RedisCacheClient
 from django.core.cache.utils import make_template_fragment_key
 from django.db import close_old_connections, connection, connections
@@ -55,8 +56,8 @@ from django.test.signals import setting_changed
 from django.test.utils import CaptureQueriesContext
 from django.utils import timezone, translation
 from django.utils.cache import (
-    cc_delim_re,
     get_cache_key,
+    get_max_age,
     has_vary_header,
     learn_cache_key,
     patch_cache_control,
@@ -1166,6 +1167,90 @@ class BaseCacheTests:
             cache_add.return_value = False
             self.assertEqual(cache.get_or_set("key", "default"), "default")
 
+    async def test_get_many_async_uses_specialized_implementation(self):
+        if (
+            cache.get_many.__func__ is not BaseCache.get_many
+            and cache.aget_many.__func__ is BaseCache.aget_many
+        ):
+            with mock.patch.object(cache, "get_many") as mocked:
+                mocked.__func__ = lambda x: x
+                await cache.aget_many({})
+                mocked.assert_called_once()
+
+    async def test_set_many_async_uses_specialized_implementation(self):
+        if (
+            cache.set_many.__func__ is not BaseCache.set_many
+            and cache.aset_many.__func__ is BaseCache.aset_many
+        ):
+            with mock.patch.object(cache, "set_many") as mocked:
+                mocked.__func__ = lambda x: x
+                await cache.aset_many({})
+                mocked.assert_called_once()
+
+    async def test_delete_many_async_uses_specialized_implementation(self):
+        if (
+            cache.delete_many.__func__ is not BaseCache.delete_many
+            and cache.adelete_many.__func__ is BaseCache.adelete_many
+        ):
+            with mock.patch.object(cache, "delete_many") as mocked:
+                mocked.__func__ = lambda x: x
+                await cache.adelete_many({})
+                mocked.assert_called_once()
+
+    async def test_get_or_set_async_uses_specialized_implementation(self):
+        await cache.aset("key", "value")
+        if (
+            cache.get_or_set.__func__ is not BaseCache.get_or_set
+            and cache.aget_or_set.__func__ is BaseCache.aget_or_set
+        ):
+            with mock.patch.object(cache, "get_or_set") as mocked:
+                mocked.__func__ = lambda x: x
+                await cache.aget_or_set("key")
+                mocked.assert_called_once()
+
+    async def test_has_key_async_uses_specialized_implementation(self):
+        await cache.aset("key", "value")
+        if (
+            cache.has_key.__func__ is not BaseCache.has_key
+            and cache.ahas_key.__func__ is BaseCache.ahas_key
+        ):
+            with mock.patch.object(cache, "has_key") as mocked:
+                mocked.__func__ = lambda x: x
+                await cache.ahas_key("key")
+                mocked.assert_called_once()
+
+    async def test_incr_async_uses_specialized_implementation(self):
+        await cache.aset("key", 1)
+        if (
+            cache.incr.__func__ is not BaseCache.incr
+            and cache.aincr.__func__ is BaseCache.aincr
+        ):
+            with mock.patch.object(cache, "incr") as mocked:
+                mocked.__func__ = lambda x: x
+                await cache.aincr("key")
+                mocked.assert_called_once()
+
+    async def test_incr_version_async_uses_specialized_implementation(self):
+        await cache.aset("key", "value", version=1)
+        if (
+            cache.incr_version.__func__ is not BaseCache.incr_version
+            and cache.aincr_version.__func__ is BaseCache.aincr_version
+        ):
+            with mock.patch.object(cache, "incr_version") as mocked:
+                mocked.__func__ = lambda x: x
+                await cache.aincr_version("key")
+                mocked.assert_called_once()
+
+    async def test_close_async_uses_specialized_implementation(self):
+        if (
+            cache.close.__func__ is not BaseCache.close
+            and cache.aclose.__func__ is BaseCache.aclose
+        ):
+            with mock.patch.object(cache, "close") as mocked:
+                mocked.__func__ = lambda x: x
+                await cache.aclose()
+                mocked.assert_called_once()
+
 
 @override_settings(
     CACHES=caches_setting_for_tests(
@@ -1903,6 +1988,24 @@ class RedisCacheTests(BaseCacheTests, TestCase):
         self.assertEqual(pool.connection_kwargs["socket_timeout"], 0.1)
         self.assertIs(pool.connection_kwargs["retry_on_timeout"], True)
 
+    def test_client_driver_info(self):
+        client_info = cache._cache.get_client().client_info()
+        if {"lib-name", "lib-ver"}.issubset(client_info):
+            version = django.get_version()
+            if hasattr(self.lib, "DriverInfo"):
+                info = self.lib.DriverInfo().add_upstream_driver("django", version)
+                correct_lib_name = info.formatted_name
+            else:
+                correct_lib_name = f"redis-py(django_v{version})"
+            # Relax the assertion to allow date variance in editable installs.
+            truncated_lib_name = correct_lib_name.rsplit(".dev", maxsplit=1)[0]
+            self.assertIn(truncated_lib_name, client_info["lib-name"])
+            self.assertEqual(client_info["lib-ver"], self.lib.__version__)
+        else:
+            # Redis versions below 7.2 lack CLIENT SETINFO.
+            self.assertNotIn("lib-ver", client_info)
+            self.assertNotIn("lib-name", client_info)
+
 
 class FileBasedCachePathLibTests(FileBasedCacheTests):
     def mkdtemp(self):
@@ -2104,6 +2207,61 @@ class CacheUtils(SimpleTestCase):
                 patch_vary_headers(response, newheaders)
                 self.assertEqual(response.headers["Vary"], resulting_vary)
 
+    def test_patch_vary_headers_strips_whitespace(self):
+        headers = (
+            # Whitespace-padded tokens in existing Vary must be stripped before
+            # deduplication so that adding a header already present (with
+            # surrounding whitespace) does not produce a duplicate entry.
+            (" Cookie", ("Accept-Encoding",), "Cookie, Accept-Encoding"),
+            ("Cookie ", ("Cookie",), "Cookie"),
+            (" Cookie ", ("Cookie",), "Cookie"),
+            # Tab-padded tokens must also be normalized.
+            (
+                "Cookie, Accept-Encoding",
+                ("Accept-Encoding\t", "\tcookie"),
+                "Cookie, Accept-Encoding",
+            ),
+            # Whitespace-padded wildcard in existing Vary must be recognized so
+            # that patch_vary_headers() still outputs a single "*" rather than
+            # appending new headers alongside the (unrecognized) padded "*".
+            ("* ", ("Accept-Language",), "*"),
+            (" *", ("Cookie",), "*"),
+            (" * ", ("Cookie", "Accept-Language"), "*"),
+            # Whitespace-padded wildcard supplied as a new header must also be
+            # recognized and collapsed to a single "*".
+            (None, (" * ",), "*"),
+            ("Cookie", (" * ",), "*"),
+            ("Cookie, Accept-Encoding", (" * ",), "*"),
+        )
+        for initial_vary, newheaders, resulting_vary in headers:
+            with self.subTest(initial_vary=initial_vary, newheaders=newheaders):
+                response = HttpResponse()
+                if initial_vary is not None:
+                    response.headers["Vary"] = initial_vary
+                patch_vary_headers(response, newheaders)
+                self.assertEqual(response.headers["Vary"], resulting_vary)
+
+    def test_get_max_age_strips_whitespace(self):
+        # A max-age directive with surrounding whitespace must be parsed
+        # correctly; a leading space (e.g. from manual header construction)
+        # previously caused the directive key to be " max-age" which never
+        # matched, returning None instead of the integer value.
+        tests = [
+            # Whitespace before directive (no preceding comma).
+            (" max-age=300", 300),
+            ("\tmax-age=300", 300),
+            # Whitespace around a non-first directive after split(",").
+            ("no-cache, max-age=600", 600),
+            ("no-cache,\tmax-age=600", 600),
+            # Whitespace after the value is handled by int() transparently.
+            ("max-age=300 ", 300),
+        ]
+        for header_value, expected in tests:
+            with self.subTest(header_value=header_value):
+                response = HttpResponse()
+                response.headers["Cache-Control"] = header_value
+                self.assertEqual(get_max_age(response), expected)
+
     def test_get_cache_key(self):
         request = self.factory.get(self.path)
         response = HttpResponse()
@@ -2160,8 +2318,51 @@ class CacheUtils(SimpleTestCase):
         self.assertEqual(
             get_cache_key(request),
             "views.decorators.cache.cache_page.settingsprefix.GET."
-            "18a03f9c9649f7d684af5db3524f5c99.d41d8cd98f00b204e9800998ecf8427e",
+            "18a03f9c9649f7d684af5db3524f5c99.3b59035bd3b34e30981dc990dd93acbb",
         )
+
+    def test_learn_cache_key_strips_whitespace(self):
+        # Vary header tokens with leading or trailing whitespace must be
+        # stripped before being used as request.META lookup keys, so that the
+        # generated cache key correctly incorporates the header value rather
+        # than silently ignoring it.
+        request_a = self.factory.get(
+            self.path, headers={"cookie": "a=1", "x-pony": "gold"}
+        )
+        request_b = self.factory.get(
+            self.path, headers={"cookie": "a=2", "x-pony": "gold"}
+        )
+
+        response = HttpResponse()
+        # Whitespace-padded token: should be treated identically to "Cookie".
+        response.headers["Vary"] = " Cookie "
+        learn_cache_key(request_a, response)
+
+        # Requests with different Cookie values must get different cache keys.
+        key_a = get_cache_key(request_a)
+        key_b = get_cache_key(request_b)
+        self.assertIsNotNone(key_a)
+        self.assertIsNotNone(key_b)
+        self.assertNotEqual(key_a, key_b)
+
+    def test_learn_cache_key_no_header_collision(self):
+        tests = [
+            ({"X-Region": "EU", "X-Tenant": ""}, {"X-Region": "", "X-Tenant": "EU"}),
+            ({"X-Region": "EU"}, {"X-Tenant": "EU"}),
+        ]
+        for headers_a, headers_b in tests:
+            with self.subTest(headers=(headers_a, headers_b)):
+                request_a = self.factory.get(self.path, headers=headers_a)
+                request_b = self.factory.get(self.path, headers=headers_b)
+                response = HttpResponse()
+                response.headers["Vary"] = "X-Region, X-Tenant"
+                learn_cache_key(request_a, response)
+                # Potentially colliding values result in different cache keys.
+                key_a = get_cache_key(request_a)
+                key_b = get_cache_key(request_b)
+                self.assertIsNotNone(key_a)
+                self.assertIsNotNone(key_b)
+                self.assertNotEqual(key_a, key_b)
 
     def test_patch_cache_control(self):
         tests = (
@@ -2212,8 +2413,19 @@ class CacheUtils(SimpleTestCase):
                 if initial_cc is not None:
                     response.headers["Cache-Control"] = initial_cc
                 patch_cache_control(response, **newheaders)
-                parts = set(cc_delim_re.split(response.headers["Cache-Control"]))
+                parts = {cc for cc in response.headers["Cache-Control"].split(", ")}
                 self.assertEqual(parts, expected_cc)
+
+    def test_patch_cache_control_whitespace_around_equals(self):
+        # Whitespace around "=" must not be retained in the directive name;
+        # otherwise no_cache=True fails to collapse the qualified field-list
+        # form (i.e. dictitem() lacks a strip()).
+        for initial_cc in ('no-cache ="Set-Cookie"', 'no-cache = "Set-Cookie"'):
+            with self.subTest(initial_cc=initial_cc):
+                response = HttpResponse(headers={"Cache-Control": initial_cc})
+                patch_cache_control(response, no_cache=True)
+                parts = {cc for cc in response.headers["Cache-Control"].split(", ")}
+                self.assertEqual(parts, {"no-cache"})
 
     def test_has_vary_header(self):
         tests = [
@@ -2353,7 +2565,7 @@ class CacheI18nTest(SimpleTestCase):
         request = self.factory.get(self.path)
         request.META["HTTP_ACCEPT_ENCODING"] = "gzip;q=1.0, identity; q=0.5, *;q=0"
         response = HttpResponse()
-        response.headers["Vary"] = "accept-encoding"
+        response.headers["Vary"] = "cookie, accept-encoding"
         key = learn_cache_key(request, response)
         self.assertIn(
             lang,
@@ -2793,6 +3005,57 @@ class CacheMiddlewareTest(SimpleTestCase):
                 response = view(request, "2")
                 self.assertEqual(response.content, b"Hello World 2")
 
+    def test_cache_control_not_cached_superstring(self):
+        """
+        "myprivate", a hypothetical extension directive, is not confused for
+        "private".
+        """
+
+        @cache_page(3)
+        @cache_control(myprivate=True)
+        def view(request, value):
+            return HttpResponse(f"Hello World {value}")
+
+        request = self.factory.get("/view/")
+        response = view(request, "1")
+        self.assertEqual(response.content, b"Hello World 1")
+        response = view(request, "2")
+        self.assertEqual(response.content, b"Hello World 1")
+
+    def test_qualified_cache_control_value_not_cached(self):
+        for cc in (
+            'private="Set-Cookie"',
+            'no-cache="Set-Cookie"',
+            'no-store="Set-Cookie"',
+            # Malformed whitespace around "=" still fails safe.
+            'private ="Set-Cookie"',
+            'no-cache = "Set-Cookie"',
+        ):
+            with self.subTest(cache_control=cc):
+
+                @cache_page(3)
+                def view(request, value):
+                    return HttpResponse(
+                        f"Hello World {value}", headers={"Cache-Control": cc}
+                    )
+
+                request = self.factory.get("/view/")
+                response = view(request, "1")
+                self.assertEqual(response.content, b"Hello World 1")
+                response = view(request, "2")
+                self.assertEqual(response.content, b"Hello World 2")
+
+    def test_authorization_header_exception_qualified_public_directive(self):
+        @cache_page(3)
+        def view(request, value):
+            return HttpResponse(
+                f"Hello World {value}", headers={"Cache-Control": 'public="abc"'}
+            )
+
+        request = self.factory.get("/view/", headers={"Authorization": "token"})
+        response = view(request, "1")
+        self.assertIs(has_vary_header(response, "Authorization"), False)
+
     def test_vary_asterisk_not_cached(self):
         views_with_cache = (
             cache_page(3)(hello_world_view_patch_vary_headers_asterisk),
@@ -2830,6 +3093,16 @@ class CacheMiddlewareTest(SimpleTestCase):
         request = self.factory.get("/view/", headers={"Authorization": "token"})
         response = view_with_cache(request, "1")
         self.assertIs(has_vary_header(response, "Authorization"), False)
+
+    def test_authorization_header_exception_superstring(self):
+        """
+        "nopublic", a hypothetical extension directive, is not confused for
+        "public".
+        """
+        view_with_cache = cache_page(3)(cache_control(no_public=True)(hello_world_view))
+        request = self.factory.get("/view/", headers={"Authorization": "token"})
+        response = view_with_cache(request, "1")
+        self.assertIs(has_vary_header(response, "Authorization"), True)
 
     def test_sensitive_cookie_not_cached(self):
         """
@@ -3043,27 +3316,32 @@ class TestMakeTemplateFragmentKey(SimpleTestCase):
 
     def test_with_one_vary_on(self):
         key = make_template_fragment_key("foo", ["abc"])
-        self.assertEqual(key, "template.cache.foo.493e283d571a73056196f1a68efd0f66")
+        self.assertEqual(key, "template.cache.foo.a6360ec2c58ecc4b23fd5bd00216fccd")
 
     def test_with_many_vary_on(self):
         key = make_template_fragment_key("bar", ["abc", "def"])
-        self.assertEqual(key, "template.cache.bar.17c1a507a0cb58384f4c639067a93520")
+        self.assertEqual(key, "template.cache.bar.250310c146db454966b64f5fc265a540")
 
     def test_proper_escaping(self):
         key = make_template_fragment_key("spam", ["abc:def%"])
-        self.assertEqual(key, "template.cache.spam.06c8ae8e8c430b69fb0a6443504153dc")
+        self.assertEqual(key, "template.cache.spam.bf6c24ef2576004284e0522c15314d8c")
 
     def test_with_ints_vary_on(self):
         key = make_template_fragment_key("foo", [1, 2, 3, 4, 5])
-        self.assertEqual(key, "template.cache.foo.7ae8fd2e0d25d651c683bdeebdb29461")
+        self.assertEqual(key, "template.cache.foo.087c006c1b99e0d147f624b4921f8a13")
 
     def test_with_unicode_vary_on(self):
         key = make_template_fragment_key("foo", ["42º", "😀"])
-        self.assertEqual(key, "template.cache.foo.7ced1c94e543668590ba39b3c08b0237")
+        self.assertEqual(key, "template.cache.foo.ab66482052ab2084b9d25bdd04bc9b10")
 
     def test_long_vary_on(self):
         key = make_template_fragment_key("foo", ["x" * 10000])
-        self.assertEqual(key, "template.cache.foo.3670b349b5124aa56bdb50678b02b23a")
+        self.assertEqual(key, "template.cache.foo.abff8a6702abde497feae7f61de2ef1e")
+
+    def test_collision_vary_on(self):
+        key1 = make_template_fragment_key("foo", ["a:b", "c"])
+        key2 = make_template_fragment_key("foo", ["a", "b:c"])
+        self.assertNotEqual(key1, key2)
 
 
 class CacheHandlerTest(SimpleTestCase):

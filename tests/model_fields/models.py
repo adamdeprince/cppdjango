@@ -9,7 +9,7 @@ from django.core.serializers.json import DjangoJSONEncoder
 from django.db import connection, models
 from django.db.models import F, Value
 from django.db.models.fields.files import ImageFieldFile
-from django.db.models.functions import Lower
+from django.db.models.functions import Cast, Lower
 from django.utils.functional import SimpleLazyObject
 from django.utils.translation import gettext_lazy as _
 
@@ -33,6 +33,13 @@ test_collation = SimpleLazyObject(
 class Foo(models.Model):
     a = models.CharField(max_length=10)
     d = models.DecimalField(max_digits=5, decimal_places=3)
+
+
+class DecimalWithoutPrecision(models.Model):
+    value = models.DecimalField()
+
+    class Meta:
+        required_db_features = {"supports_no_precision_decimalfield"}
 
 
 def get_foo():
@@ -102,6 +109,7 @@ class Choiceful(models.Model):
 
 class BigD(models.Model):
     d = models.DecimalField(max_digits=32, decimal_places=30)
+    large_int = models.DecimalField(max_digits=16, decimal_places=0, null=True)
 
 
 class FloatModel(models.Model):
@@ -413,6 +421,13 @@ class CustomJSONDecoder(json.JSONDecoder):
         return dct
 
 
+class JSONNullCustomEncoder(json.JSONEncoder):
+    def default(self, o):
+        if isinstance(o, models.JSONNull):
+            return None
+        return super().default(o)
+
+
 class JSONModel(models.Model):
     value = models.JSONField()
 
@@ -432,9 +447,19 @@ class NullableJSONModel(models.Model):
         required_db_features = {"supports_json_field"}
 
 
+class JSONNullDefaultModel(models.Model):
+    value = models.JSONField(
+        db_default=models.JSONNull(), encoder=JSONNullCustomEncoder
+    )
+
+    class Meta:
+        required_db_features = {"supports_json_field"}
+
+
 class RelatedJSONModel(models.Model):
     value = models.JSONField()
     json_model = models.ForeignKey(NullableJSONModel, models.CASCADE)
+    summary = models.CharField(max_length=100, null=True, blank=True)
 
     class Meta:
         required_db_features = {"supports_json_field"}
@@ -528,7 +553,7 @@ class UUIDGrandchild(UUIDChild):
 class GeneratedModelFieldWithConverters(models.Model):
     field = models.UUIDField()
     field_copy = models.GeneratedField(
-        expression=F("field"),
+        expression=Cast("field", models.UUIDField()),
         output_field=models.UUIDField(),
         db_persist=True,
     )
@@ -555,7 +580,7 @@ class GeneratedModelNonAutoPk(models.Model):
     id = models.IntegerField(primary_key=True)
     a = models.IntegerField()
     b = models.GeneratedField(
-        expression=F("a"),
+        expression=F("a") + 1,
         output_field=models.IntegerField(),
         db_persist=True,
     )
@@ -630,7 +655,6 @@ class GeneratedModelNull(models.Model):
         expression=Lower("name"),
         output_field=models.CharField(max_length=10),
         db_persist=True,
-        null=True,
     )
 
     class Meta:
@@ -643,7 +667,6 @@ class GeneratedModelNullVirtual(models.Model):
         expression=Lower("name"),
         output_field=models.CharField(max_length=10),
         db_persist=False,
-        null=True,
     )
 
     class Meta:

@@ -29,8 +29,8 @@ else:
     from django.test.selenium import SeleniumTestCase, SeleniumTestCaseBase
     from django.test.utils import NullTimeKeeper, TimeKeeper, get_runner
     from django.utils.deprecation import (
-        RemovedInDjango61Warning,
-        RemovedInDjango70Warning,
+        RemovedAfterNextVersionWarning,
+        RemovedInNextVersionWarning,
     )
     from django.utils.functional import classproperty
     from django.utils.log import DEFAULT_LOGGING
@@ -46,8 +46,8 @@ else:
     warnings.filterwarnings("ignore", r"\(1003, *", category=MySQLdb.Warning)
 
 # Make deprecation warnings errors to ensure no usage of deprecated features.
-warnings.simplefilter("error", RemovedInDjango70Warning)
-warnings.simplefilter("error", RemovedInDjango61Warning)
+warnings.simplefilter("error", RemovedInNextVersionWarning)
+warnings.simplefilter("error", RemovedAfterNextVersionWarning)
 # Make resource and runtime warning errors to ensure no usage of error prone
 # patterns.
 warnings.simplefilter("error", ResourceWarning)

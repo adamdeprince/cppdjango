@@ -1,9 +1,12 @@
+import copy
 import os
 import sys
 import threading
 import traceback
 import unittest
 import warnings
+from contextlib import contextmanager
+from functools import partial
 from io import StringIO
 from unittest import mock
 
@@ -28,13 +31,14 @@ from django.forms import (
     ValidationError,
     formset_factory,
 )
-from django.http import HttpResponse
+from django.http import HttpResponse, StreamingHttpResponse
 from django.template import Context, Template
 from django.template.loader import render_to_string
 from django.test import (
     SimpleTestCase,
     TestCase,
     TransactionTestCase,
+    ignore_warnings,
     skipIfDBFeature,
     skipUnlessDBFeature,
 )
@@ -46,8 +50,10 @@ from django.test.utils import (
     isolate_apps,
     override_settings,
     setup_test_environment,
+    teardown_test_environment,
 )
 from django.urls import NoReverseMatch, path, reverse, reverse_lazy
+from django.utils.deprecation import RemovedInDjango70Warning
 from django.utils.html import VOID_ELEMENTS
 
 from .models import Car, Person, PossessedCar
@@ -1046,6 +1052,17 @@ class HTMLEqualTests(SimpleTestCase):
             html=True,
         )
 
+    def test_streaming_response_idempotent(self):
+        response = StreamingHttpResponse(["hello world"])
+        self.assertContains(response, "hello")
+        self.assertContains(response, "world")
+
+    def test_streaming_response_not_contains_idempotent(self):
+        response = StreamingHttpResponse(["hello world"])
+        self.assertNotContains(response, "bye")
+        self.assertNotContains(response, "bye")
+        self.assertContains(response, "world")
+
 
 class InHTMLTests(SimpleTestCase):
     def test_needle_msg(self):
@@ -1801,15 +1818,86 @@ class SetupTestEnvironmentTests(SimpleTestCase):
         ):
             setup_test_environment()
 
+    @contextmanager
+    def mock_test_state(self):
+        """Mock Django's test state within a context.
+
+        This allows testing setup/teardown_test_environment() without impacting
+        the real test state or breaking Django's test runner.
+
+        Within the context, the state is initially reset so that calling
+        setup_test_environment() won't raise an "already called" error. The
+        original (real) state is restored at the end of the context.
+        """
+        with mock.patch("django.test.utils._TestState") as test_state:
+            del test_state.saved_data
+            yield test_state
+
     def test_allowed_hosts(self):
         for type_ in (list, tuple):
             with self.subTest(type_=type_):
                 allowed_hosts = type_("*")
-                with mock.patch("django.test.utils._TestState") as x:
-                    del x.saved_data
-                    with self.settings(ALLOWED_HOSTS=allowed_hosts):
-                        setup_test_environment()
-                        self.assertEqual(settings.ALLOWED_HOSTS, ["*", "testserver"])
+                with (
+                    self.mock_test_state(),
+                    self.settings(ALLOWED_HOSTS=allowed_hosts),
+                ):
+                    setup_test_environment()
+                    self.assertEqual(settings.ALLOWED_HOSTS, ["*", "testserver"])
+
+    # RemovedInDjango70Warning.
+    @ignore_warnings(category=RemovedInDjango70Warning)
+    def test_email_backend_override(self):
+        with (
+            self.mock_test_state(),
+            self.settings(
+                EMAIL_BACKEND="django.core.mail.backends.console.EmailBackend"
+            ),
+        ):
+            setup_test_environment()
+            self.assertEqual(
+                settings.EMAIL_BACKEND,
+                "django.core.mail.backends.locmem.EmailBackend",
+            )
+            self.assertFalse(hasattr(settings, "MAILERS"))
+            teardown_test_environment()
+            self.assertEqual(
+                settings.EMAIL_BACKEND,
+                "django.core.mail.backends.console.EmailBackend",
+            )
+            self.assertFalse(hasattr(settings, "MAILERS"))
+
+    def test_mailers_override(self):
+        expected_value = {
+            "default": {
+                "OPTIONS": {"host": "localhost"},
+            },
+            "custom": {
+                "BACKEND": "path.to.custom.EmailBackend",
+                "OPTIONS": {"custom": "option"},
+            },
+        }
+        settings_value = copy.deepcopy(expected_value)
+        with self.mock_test_state(), self.settings(MAILERS=settings_value):
+            setup_test_environment()
+            self.assertEqual(
+                settings.MAILERS,
+                {
+                    "default": {
+                        "BACKEND": "django.core.mail.backends.locmem.EmailBackend"
+                    },
+                    "custom": {
+                        "BACKEND": "django.core.mail.backends.locmem.EmailBackend"
+                    },
+                },
+            )
+            # setup_test_environment() shouldn't mutate original setting value.
+            self.assertEqual(settings_value, expected_value)
+            # RemovedInDjango70Warning: Remove both EMAIL_BACKEND assertions.
+            self.assertFalse(hasattr(settings, "EMAIL_BACKEND"))
+
+            teardown_test_environment()
+            self.assertEqual(settings.MAILERS, expected_value)
+            self.assertFalse(hasattr(settings, "EMAIL_BACKEND"))
 
 
 class OverrideSettingsTests(SimpleTestCase):
@@ -1952,7 +2040,7 @@ class OverrideSettingsTests(SimpleTestCase):
             self.assertIn(expected_location, finder.locations)
 
 
-@skipUnlessDBFeature("supports_transactions")
+@skipUnlessDBFeature("uses_savepoints")
 class TestBadSetUpTestData(TestCase):
     """
     An exception in setUpTestData() shouldn't leak a transaction which would
@@ -2040,6 +2128,7 @@ class CaptureOnCommitCallbacksTests(TestCase):
         self.assertEqual(len(callbacks), 1)
         self.assertNotEqual(callbacks[0], pre_hook)
 
+    @skipUnlessDBFeature("uses_savepoints")
     def test_with_rolled_back_savepoint(self):
         with self.captureOnCommitCallbacks() as callbacks:
             try:
@@ -2131,6 +2220,33 @@ class CaptureOnCommitCallbacksTests(TestCase):
             log_record.getMessage(),
             "Error calling CaptureOnCommitCallbacksTests.test_execute_robust.<locals>."
             "hook in on_commit() (robust callback).",
+        )
+        self.assertIsNotNone(log_record.exc_info)
+        raised_exception = log_record.exc_info[1]
+        self.assertIsInstance(raised_exception, MyException)
+        self.assertEqual(str(raised_exception), "robust callback")
+
+    def test_execute_robust_with_callback_as_partial(self):
+        class MyException(Exception):
+            pass
+
+        def hook():
+            self.callback_called = True
+            raise MyException("robust callback")
+
+        hook_partial = partial(hook)
+
+        with self.assertLogs("django.test", "ERROR") as cm:
+            with self.captureOnCommitCallbacks(execute=True) as callbacks:
+                transaction.on_commit(hook_partial, robust=True)
+
+        self.assertEqual(len(callbacks), 1)
+        self.assertIs(self.callback_called, True)
+
+        log_record = cm.records[0]
+        self.assertEqual(
+            log_record.getMessage(),
+            f"Error calling {hook_partial} in on_commit() (robust callback).",
         )
         self.assertIsNotNone(log_record.exc_info)
         raised_exception = log_record.exc_info[1]

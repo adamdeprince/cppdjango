@@ -6,6 +6,8 @@ from django.core.exceptions import FieldDoesNotExist, ValidationError
 from django.db import connections
 from django.db.models.constants import LOOKUP_SEP
 from django.db.models.expressions import Exists, ExpressionList, F, RawSQL
+from django.db.models.fields import BooleanField
+from django.db.models.functions import Coalesce
 from django.db.models.indexes import IndexExpression
 from django.db.models.lookups import Exact, IsNull
 from django.db.models.query_utils import Q
@@ -217,7 +219,11 @@ class CheckConstraint(BaseConstraint):
         # Ignore constraints with excluded fields in condition.
         if exclude and self._expression_refs_exclude(model, self.condition, exclude):
             return
-        if not Q(self.condition).check(against, using=using):
+        condition = self.condition
+        if connections[using].features.supports_comparing_boolean_expr:
+            # Checks constraints do not fail when they evaluate to UNKNOWN.
+            condition = Coalesce(condition, True, output_field=BooleanField())
+        if not Q(condition).check(against, using=using):
             raise ValidationError(
                 self.get_violation_error_message(), code=self.violation_error_code
             )
@@ -270,7 +276,7 @@ class UniqueConstraint(BaseConstraint):
         self,
         *expressions,
         fields=(),
-        name=None,
+        name,
         condition=None,
         deferrable=None,
         include=None,
@@ -413,8 +419,8 @@ class UniqueConstraint(BaseConstraint):
         ):
             errors.append(
                 checks.Warning(
-                    f"{connection.display_name} does not support unique constraints "
-                    "with nulls distinct.",
+                    f"{connection.display_name} does not support "
+                    "UniqueConstraint.nulls_distinct.",
                     hint=(
                         "A constraint won't be created. Silence this warning if you "
                         "don't care about it."

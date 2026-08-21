@@ -142,6 +142,16 @@ class BasicExpressionsTests(TestCase):
         )
         self.assertEqual(companies["result"], 2395)
 
+    def test_decimal_division_literal_value(self):
+        """
+        Division with a literal Decimal value preserves precision.
+        """
+        num = Number.objects.create(integer=2)
+        obj = Number.objects.annotate(
+            val=F("integer") / Value(Decimal("3.0"), output_field=DecimalField())
+        ).get(pk=num.pk)
+        self.assertAlmostEqual(obj.val, Decimal("0.6667"), places=4)
+
     def test_annotate_values_filter(self):
         companies = (
             Company.objects.annotate(
@@ -1452,6 +1462,20 @@ class ExpressionsTests(TestCase):
                 Employee(firstname="Jean-Claude", lastname="Claude%"),
                 Employee(firstname="Johnny", lastname="Joh\\n"),
                 Employee(firstname="Johnny", lastname="_ohn"),
+                # These names have regex characters that must be escaped by
+                # backends (like MongoDB) that use regex matching rather than
+                # LIKE.
+                Employee(firstname="Johnny", lastname="^Joh"),
+                Employee(firstname="Johnny", lastname="Johnny$"),
+                Employee(firstname="Johnny", lastname="Joh."),
+                Employee(firstname="Johnny", lastname="[J]ohnny"),
+                Employee(firstname="Johnny", lastname="(J)ohnny"),
+                Employee(firstname="Johnny", lastname="J*ohnny"),
+                Employee(firstname="Johnny", lastname="J+ohnny"),
+                Employee(firstname="Johnny", lastname="J?ohnny"),
+                Employee(firstname="Johnny", lastname="J{1}ohnny"),
+                Employee(firstname="Johnny", lastname="J|ohnny"),
+                Employee(firstname="Johnny", lastname="J-ohnny"),
             ]
         )
         claude = Employee.objects.create(firstname="Jean-Claude", lastname="Claude")
@@ -2480,9 +2504,9 @@ class ValueTests(TestCase):
         # This test might need to be revisited later on if #25425 is enforced.
         compiler = Time.objects.all().query.get_compiler(connection=connection)
         value = Value("foo")
-        self.assertEqual(value.as_sql(compiler, connection), ("%s", ["foo"]))
+        self.assertEqual(value.as_sql(compiler, connection), ("%s", ("foo",)))
         value = Value("foo", output_field=CharField())
-        self.assertEqual(value.as_sql(compiler, connection), ("%s", ["foo"]))
+        self.assertEqual(value.as_sql(compiler, connection), ("%s", ("foo",)))
 
     def test_output_field_decimalfield(self):
         Time.objects.create()

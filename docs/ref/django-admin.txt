@@ -193,7 +193,7 @@ Example usage:
 
 .. console::
 
-    django-admin compilemessages --ignore=cache --ignore=outdated/*/locale
+    django-admin compilemessages --ignore=node_modules --ignore=outdated/*/locale
 
 ``createcachetable``
 --------------------
@@ -431,8 +431,8 @@ The script will inspect the database and create a model for each table within
 it.
 
 As you might expect, the created models will have an attribute for every field
-in the table. Note that ``inspectdb`` has a few special cases in its field-name
-output:
+in the table. Note that ``inspectdb`` has a few special cases and limitations
+in its output:
 
 * If ``inspectdb`` cannot map a column's type to a model field type, it'll
   use ``TextField`` and will insert the Python comment
@@ -450,15 +450,21 @@ output:
   ``'Field renamed because it was a Python reserved word.'`` next to the
   field.
 
-This feature is meant as a shortcut, not as definitive model generation. After
-you run it, you'll want to look over the generated models yourself to make
-customizations. In particular, you'll need to rearrange models' order, so that
-models that refer to other models are ordered properly.
+* Database defaults are not introspected and will be absent from the generated
+  output.
 
-Django doesn't create database defaults when a
-:attr:`~django.db.models.Field.default` is specified on a model field.
-Similarly, database defaults aren't translated to model field defaults or
-detected in any fashion by ``inspectdb``.
+* Generated fields are mapped to their output field type.
+
+* Models that reference each other may not be in the correct order.
+
+* If models were managed by Django's migration framework, Python-level field
+  options that have no database-level representation will not be included. In
+  particular, ``Field.default`` will not be included, and Python variants
+  for ``on_delete`` are always emitted as ``DO_NOTHING``.
+
+As such, after you run it, you'll want to look over the generated models
+yourself to make customizations. This feature is meant as a shortcut, not as
+definitive model generation.
 
 By default, ``inspectdb`` creates unmanaged models. That is, ``managed =
 False`` in the model's ``Meta`` class tells Django not to manage each table's
@@ -950,8 +956,6 @@ Uses IPv6 for the development server. This changes the default IP address from
 
 .. envvar:: DJANGO_RUNSERVER_HIDE_WARNING
 
-.. versionadded:: 5.2
-
 By default, a warning is printed to the console that ``runserver`` is not
 suitable for production:
 
@@ -1046,8 +1050,15 @@ recipient(s) specified. For example:
 
     django-admin sendtestemail foo@example.com bar@example.com
 
-There are a couple of options, and you may use any combination of them
-together:
+The following options may be used in any combination with each other and with
+recipient email arguments.
+
+.. django-admin-option:: --using ALIAS
+
+.. versionadded:: 6.1
+
+Specifies the :setting:`MAILERS` alias to use for sending the test email to
+the recipients given as arguments. Defaults to the ``"default"`` mailer.
 
 .. django-admin-option:: --managers
 
@@ -1080,10 +1091,6 @@ flag.
 
 See the guide on :ref:`customizing this behavior
 <customizing-shell-auto-imports>` to add or remove automatic imports.
-
-.. versionchanged:: 5.2
-
-    Automatic models import was added.
 
 .. versionchanged:: 6.0
 
@@ -1124,8 +1131,6 @@ default, the script pointed to by the :envvar:`PYTHONSTARTUP` environment
 variable or the ``~/.pythonrc.py`` script is read.
 
 .. django-admin-option:: --no-imports
-
-.. versionadded:: 5.2
 
 Disables the automatic import of models from :setting:`INSTALLED_APPS`.
 
@@ -1345,8 +1350,8 @@ Specifies which directories in the app template should be excluded, in addition
 to ``.git`` and ``__pycache__``. If this option is not provided, directories
 named ``__pycache__`` or starting with ``.`` will be excluded.
 
-The :class:`template context <django.template.Context>` used for all matching
-files is:
+The template context (see :class:`~django.template.Context`) used for all
+matching files is:
 
 - Any option passed to the ``startapp`` command (among the command's supported
   options)
@@ -1443,7 +1448,7 @@ Specifies which directories in the project template should be excluded, in
 addition to ``.git`` and ``__pycache__``. If this option is not provided,
 directories named ``__pycache__`` or starting with ``.`` will be excluded.
 
-The :class:`template context <django.template.Context>` used is:
+The template context (see :class:`~django.template.Context`) used is:
 
 - Any option passed to the ``startproject`` command (among the command's
   supported options)

@@ -253,8 +253,10 @@ In this example, the cache table's name is ``my_cache_table``::
     }
 
 Unlike other cache backends, the database cache does not support automatic
-culling of expired entries at the database level. Instead, expired cache
-entries are culled each time ``add()``, ``set()``, or ``touch()`` is called.
+culling of expired entries at the database level. Instead, an expired cache
+entry is deleted when evaluated by a ``get()`` request. Furthermore,
+expired cache entries are culled when ``add()``, ``set()``, or ``touch()``
+is called and the number of entries exceeds ``MAX_ENTRIES``.
 
 .. _database-caching-creating-the-table:
 
@@ -653,7 +655,7 @@ disable caching for a view (using the
 .. _i18n-cache-key:
 
 If :setting:`USE_I18N` is set to ``True`` then the generated cache key will
-include the name of the active :term:`language<language code>` -- see also
+include the name of the active :term:`language<language code>` (see also
 :ref:`how-django-discovers-language-preference`). This allows you to easily
 cache multilingual sites without having to create the cache key yourself.
 
@@ -723,6 +725,18 @@ Additionally, ``cache_page`` automatically sets ``Cache-Control`` and
 ``Expires`` headers in the response which affect :ref:`downstream caches
 <downstream-caches>`.
 
+.. admonition:: Responses are cached before response middleware runs
+
+    ``cache_page`` is intended for content that is safe to reuse for requests
+    to the same URL. It does not automatically vary by authentication,
+    sessions, cookies, or other request-specific state.
+
+    As a decorator wrapping the view directly, responses are cached before
+    response middleware runs. If cache variation depends on response
+    middleware, ensure it runs before the response is cached. For example, when
+    caching views containing CSRF-protected forms, follow
+    :ref:`csrf-cache-page` to ensure the ``Vary`` header is set first.
+
 Specifying per-view cache in the URLconf
 ----------------------------------------
 
@@ -777,7 +791,8 @@ some dynamic data that appears inside the fragment. For example, you might want
 a separate cached copy of the sidebar used in the previous example for every
 user of your site. Do this by passing one or more additional arguments, which
 may be variables with or without filters, to the ``{% cache %}`` template tag
-to uniquely identify the cache fragment:
+that will uniquely identify the cache fragment when those values are converted
+to strings:
 
 .. code-block:: html+django
 
@@ -785,6 +800,15 @@ to uniquely identify the cache fragment:
     {% cache 500 sidebar request.user.username %}
         .. sidebar for logged-in user ..
     {% endcache %}
+
+.. admonition:: Argument values converted to strings
+
+    Because argument values are converted to strings when creating the cache
+    key, consider uniqueness carefully to avoid serving one fragment for two
+    distinct values that share a string representation, such as ``None`` and
+    ``"None"``. Avoid supplying a model instance, since its ``__str__()`` is
+    not guaranteed to be unique. Conveniently, in the example above,
+    ``request.user.username`` is unique for the default ``User`` model.
 
 If :setting:`USE_I18N` is set to ``True`` the per-site middleware cache will
 :ref:`respect the active language<i18n-cache-key>`. For the ``cache`` template
@@ -830,7 +854,7 @@ It is considered an error to specify a cache name that is not configured.
 .. function:: django.core.cache.utils.make_template_fragment_key(fragment_name, vary_on=None)
 
 If you want to obtain the cache key used for a cached fragment, you can use
-``make_template_fragment_key``. ``fragment_name`` is the same as second
+``make_template_fragment_key``. ``fragment_name`` is the same as the second
 argument to the ``cache`` template tag; ``vary_on`` is a list of all additional
 arguments passed to the tag. This function can be useful for invalidating or
 overwriting a cached item, for example:
