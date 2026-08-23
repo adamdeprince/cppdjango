@@ -682,15 +682,20 @@ def execute_fetchone_pair(connection, sql: str, params=None):
         return row, extra
 
 
-def materialize_models(model, connection, handle, *, limit=None):
+def materialize_models(model, connection, handle, *, limit=None, fetch_mode=None):
     """
     Compile+fetch model rows from a native handle.
     Returns (list[model], prefetch_lookups) or None on failure.
     Applies select_related caches when related_selects_info is present.
     Projects annotation aliases onto instances (setattr).
     Runs native secondary queries for prefetch_specs when possible.
+
+    ``fetch_mode`` (Django 6.1+) is applied via ``Model.from_db`` and peer
+    weakrefs when ``fetch_mode.track_peers`` is true — matching ModelIterable.
     """
     try:
+        from weakref import ref as weak_ref
+
         qs = handle.clone()
         if not qs.base_attnames():
             if not qs.select_model_columns():
@@ -713,10 +718,18 @@ def materialize_models(model, connection, handle, *, limit=None):
         except Exception:
             ann_info = []
         db = connection.alias
+        track_peers = bool(fetch_mode is not None and fetch_mode.track_peers)
+        peers = []
         objs = []
         for row in rows:
             base = row[: len(attnames)]
-            obj = model.from_db(db, attnames, base)
+            if fetch_mode is not None:
+                obj = model.from_db(db, attnames, base, fetch_mode=fetch_mode)
+            else:
+                obj = model.from_db(db, attnames, base)
+            if track_peers:
+                peers.append(weak_ref(obj))
+                obj._state.peers = peers
             for rs in related:
                 off = int(rs["offset"])
                 cnt = int(rs["count"])
@@ -730,7 +743,12 @@ def materialize_models(model, connection, handle, *, limit=None):
                 for part in path.split("__"):
                     field = rel_model._meta.get_field(part)
                     rel_model = field.related_model
-                rel_obj = rel_model.from_db(db, rel_atts, rel_vals)
+                if fetch_mode is not None:
+                    rel_obj = rel_model.from_db(
+                        db, rel_atts, rel_vals, fetch_mode=fetch_mode
+                    )
+                else:
+                    rel_obj = rel_model.from_db(db, rel_atts, rel_vals)
                 if field is not None:
                     if hasattr(field, "set_cached_value"):
                         field.set_cached_value(obj, rel_obj)

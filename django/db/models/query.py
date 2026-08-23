@@ -836,10 +836,10 @@ class QuerySet(AltersData):
         for name, value in kwargs.items():
             if LOOKUP_SEP in name or hasattr(value, "resolve_expression"):
                 return _FAST_PATH_MISS
+        from django.native import orm as native_orm
+
         if self._native_qs is None and self._native_authoritative:
             try:
-                from django.native import orm as native_orm
-
                 compiled = native_orm.compile_query_plan_update(
                     self.model,
                     connection,
@@ -1019,7 +1019,11 @@ class QuerySet(AltersData):
             if not handle.set_ordering([]):
                 return _FAST_PATH_MISS
             result = native_orm.materialize_models(
-                self.model, connection, handle, limit=MAX_GET_RESULTS
+                self.model,
+                connection,
+                handle,
+                limit=MAX_GET_RESULTS,
+                fetch_mode=self._fetch_mode,
             )
             if result is None:
                 return _FAST_PATH_MISS
@@ -1075,7 +1079,9 @@ class QuerySet(AltersData):
                     h.set_limit(int(high - low))
                 if low:
                     h.set_offset(int(low))
-            result = native_orm.materialize_models(self.model, connection, h)
+            result = native_orm.materialize_models(
+                self.model, connection, h, fetch_mode=self._fetch_mode
+            )
             if result is None:
                 return _FAST_PATH_MISS
             objs, prefetches = result
@@ -1252,7 +1258,9 @@ class QuerySet(AltersData):
             )
 
         if as_model:
-            return self.model.from_db(db, model_field_names, row)
+            # Respect Django 6.1 fetch_mode (and warn on old from_db signatures).
+            from_db = _get_from_db(self.model, self._fetch_mode)
+            return from_db(db, model_field_names, row)
         if self._iterable_class is FlatValuesListIterable:
             return row[0]
         return row
@@ -2265,10 +2273,11 @@ class QuerySet(AltersData):
                             if compiled is None:
                                 return False
                             sql, sql_params = compiled
+                            from_db = _get_from_db(self.model, self._fetch_mode)
                             for row in native_orm.execute_fetchall(
                                 connection, sql, sql_params
                             ):
-                                obj = self.model.from_db(db, field_names, row)
+                                obj = from_db(db, field_names, row)
                                 result[
                                     getattr(
                                         obj,
@@ -2401,7 +2410,9 @@ class QuerySet(AltersData):
             self._not_support_combined_queries("update")
         if query_state is not None and query_state.is_sliced:
             raise TypeError("Cannot update a query once a slice has been taken.")
-        if self.query.distinct_fields:
+        # Use _query (not .query): accessing .query materializes an authoritative
+        # native plan into Python and clears the C++ fast path.
+        if query_state is not None and query_state.distinct_fields:
             raise TypeError("Cannot call update() after .distinct(*fields).")
         self._for_write = True
         # An authoritative native filter compiles all assignments in one hop.

@@ -218,19 +218,28 @@ nb::dict gzip_process_response_plan(bool streaming, int content_len, int min_len
 }
 
 bool conditional_needs_etag(std::string_view cache_control) {
-  // Split on comma, reject if any token is no-store (case-insensitive).
+  // Match django.utils.http.split_directive_names: comma-split, then take the
+  // directive name before '=' (so no-store="x" / no-store = x still count).
   std::size_t start = 0;
   while (start <= cache_control.size()) {
     auto comma = cache_control.find(',', start);
     std::string_view tok = cache_control.substr(
         start, comma == std::string_view::npos ? std::string_view::npos
                                                : comma - start);
-    // trim
+    // Trim whitespace.
     while (!tok.empty() && (tok.front() == ' ' || tok.front() == '\t')) {
       tok.remove_prefix(1);
     }
     while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) {
       tok.remove_suffix(1);
+    }
+    // Directive name is the part before '=', trimmed (RFC 9111 qualified form).
+    auto eq = tok.find('=');
+    if (eq != std::string_view::npos) {
+      tok = tok.substr(0, eq);
+      while (!tok.empty() && (tok.back() == ' ' || tok.back() == '\t')) {
+        tok.remove_suffix(1);
+      }
     }
     if (tok.size() == 8) {
       bool match = true;

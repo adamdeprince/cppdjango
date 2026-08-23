@@ -1,7 +1,7 @@
 # Native WSGI Handler
 
 **Status:** Implemented (dual-path lean loop: slim request + exact routes + lean get_response)  
-**Date:** 2026-08-06  
+**Date:** 2026-08-06 (revalidated on Django 6.1.x / cppdjango `6.1.1a0.post0`)  
 
 ## Thesis
 
