@@ -51,6 +51,37 @@ That is a **product** dual-path, not a hot-path dual implementation glued togeth
 
 ---
 
+## 2b. Django 6.1 fetch modes (full materialize coverage)
+
+Stock `ModelIterable` / `RelatedPopulator` / `RawModelIterable` pass ``fetch_mode``
+into ``Model.from_db`` and, when ``FETCH_PEERS.track_peers``, share a weakref peer
+list across the result batch.
+
+Native parity:
+
+| Path | Behavior |
+|------|----------|
+| Root rows | ``_get_from_db(model, fetch_mode)``; peer weakrefs when ``track_peers`` |
+| ``select_related`` | Related rows get the same ``fetch_mode``; **not** on root peers |
+| Native prefetch secondaries | ``fetch_mode`` + one peer list per secondary result set |
+| Prefetch fallback to stock | Instances already carry mode; descriptors apply it |
+| ``get`` / ``in_bulk`` / simple eq get | ``_get_from_db`` / pass ``_fetch_mode`` |
+| ``iterator()`` (+ chunked prefetch) | ``ModelIterable`` / stock prefetch; peers per batch |
+| ``RawQuerySet`` | ``raw()`` copies mode; ``_clone`` / ``fetch_mode()`` / ``using()`` preserve it |
+| ``create`` / ``get_or_create`` | ``create`` sets ``_state.fetch_mode``; get uses ``from_db`` |
+| Lazy FK / reverse | Descriptors use ``fetch_mode.fetch(...)`` or related queryset ``_fetch_mode`` |
+| Pickle | Mode singletons reduce via ``__reduce__`` |
+
+C++ does not own peer lists (Python ``weakref``). Policy stays in Python; native
+preserves mode + peers at materialize boundaries.
+
+Tests: ``tests/native_orm_fastpath.FetchModeNativeTests`` plus stock modules
+``many_to_one``, ``one_to_one``, ``many_to_many``, ``select_related``,
+``prefetch_related``, ``defer``, ``raw_query``, ``foreign_object``,
+``generic_relations``, ``queryset_pickle``, ``model_inheritance_regress``, ``basic``.
+
+---
+
 ## 3. The real enemy: boundary tax
 
 ### 3.1 Cost model
