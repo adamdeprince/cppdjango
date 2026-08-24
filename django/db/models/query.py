@@ -4282,6 +4282,12 @@ class RawQuerySet:
             clone._prefetch_related_lookups = clone._prefetch_related_lookups + lookups
         return clone
 
+    def fetch_mode(self, fetch_mode):
+        """Same as QuerySet.fetch_mode()."""
+        clone = self._clone()
+        clone._fetch_mode = fetch_mode
+        return clone
+
     def _prefetch_related_objects(self):
         prefetch_related_objects(self._result_cache, *self._prefetch_related_lookups)
         self._prefetch_done = True
@@ -4296,6 +4302,7 @@ class RawQuerySet:
             translations=self.translations,
             using=self._db,
             hints=self._hints,
+            fetch_mode=self._fetch_mode,
         )
         c._prefetch_related_lookups = self._prefetch_related_lookups[:]
         return c

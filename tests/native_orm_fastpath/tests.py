@@ -299,3 +299,117 @@ class FetchModeNativeTests(TestCase):
 
         author = FastAuthor.objects.fetch_mode(FETCH_PEERS).create(name="Ken")
         self.assertIs(author._state.fetch_mode, FETCH_PEERS)
+
+    def test_iterator_shares_peers_within_chunk(self):
+        from django.db.models import FETCH_PEERS
+
+        # iterator() uses ModelIterable (after any native→Python materialize),
+        # which must still attach a shared peer list for FETCH_PEERS.
+        it = FastArticle.objects.fetch_mode(FETCH_PEERS).order_by("id").iterator(
+            chunk_size=10
+        )
+        articles = list(it)
+        self.assertEqual(len(articles), 3)
+        for a in articles:
+            self.assertIs(a._state.fetch_mode, FETCH_PEERS)
+            self.assertIs(a._state.peers, articles[0]._state.peers)
+
+    def test_iterator_prefetch_chunk_preserves_mode(self):
+        from django.db.models import FETCH_PEERS
+
+        qs = (
+            FastArticle.objects.fetch_mode(FETCH_PEERS)
+            .order_by("id")
+            .prefetch_related("author")
+        )
+        articles = list(qs.iterator(chunk_size=2))
+        self.assertEqual(len(articles), 3)
+        for a in articles:
+            self.assertIs(a._state.fetch_mode, FETCH_PEERS)
+            # Prefetch ran per chunk; author is cached with same mode.
+            self.assertIs(a.author._state.fetch_mode, FETCH_PEERS)
+
+    def test_reverse_fk_copies_fetch_mode(self):
+        from django.db.models import FETCH_PEERS
+
+        author = FastAuthor.objects.fetch_mode(FETCH_PEERS).get(pk=1)
+        self.assertIs(author._state.fetch_mode, FETCH_PEERS)
+        # Reverse manager inherits the parent's fetch_mode onto related rows.
+        articles = list(author.articles.order_by("id"))
+        self.assertEqual(len(articles), 2)
+        for a in articles:
+            self.assertIs(a._state.fetch_mode, FETCH_PEERS)
+
+    def test_prefetch_related_copies_fetch_mode(self):
+        from django.db.models import FETCH_PEERS
+
+        articles = list(
+            FastArticle.objects.fetch_mode(FETCH_PEERS)
+            .order_by("id")
+            .prefetch_related("author")
+        )
+        self.assertIs(articles[0]._state.fetch_mode, FETCH_PEERS)
+        self.assertIs(articles[0].author._state.fetch_mode, FETCH_PEERS)
+        # Peer-fetched authors for Ada's two articles should share identity.
+        self.assertIs(articles[0].author, articles[1].author)
+
+    def test_raw_clone_preserves_fetch_mode(self):
+        from django.db.models import FETCH_PEERS, FETCH_RAISE
+
+        raw = FastArticle.objects.fetch_mode(FETCH_PEERS).raw(
+            "SELECT * FROM native_orm_fastpath_fastarticle ORDER BY id"
+        )
+        # prefetch_related clones the RawQuerySet — mode must survive.
+        cloned = raw.prefetch_related()
+        articles = list(cloned)
+        self.assertEqual(len(articles), 3)
+        for a in articles:
+            self.assertIs(a._state.fetch_mode, FETCH_PEERS)
+            self.assertIs(a._state.peers, articles[0]._state.peers)
+
+        raised = FastArticle.objects.raw(
+            "SELECT * FROM native_orm_fastpath_fastarticle WHERE id = %s", [1]
+        ).fetch_mode(FETCH_RAISE)
+        obj = list(raised)[0]
+        self.assertIs(obj._state.fetch_mode, FETCH_RAISE)
+
+    def test_get_or_create_propagates_fetch_mode(self):
+        from django.db.models import FETCH_PEERS
+
+        author, created = FastAuthor.objects.fetch_mode(FETCH_PEERS).get_or_create(
+            name="New", defaults={}
+        )
+        self.assertTrue(created)
+        self.assertIs(author._state.fetch_mode, FETCH_PEERS)
+        author2, created2 = FastAuthor.objects.fetch_mode(FETCH_PEERS).get_or_create(
+            name="New"
+        )
+        self.assertFalse(created2)
+        self.assertIs(author2._state.fetch_mode, FETCH_PEERS)
+
+    def test_pickle_roundtrip_fetch_modes(self):
+        import pickle
+
+        from django.db.models import FETCH_ONE, FETCH_PEERS, FETCH_RAISE
+
+        for mode in (FETCH_ONE, FETCH_PEERS, FETCH_RAISE):
+            with self.subTest(mode=mode):
+                objs = list(FastArticle.objects.fetch_mode(mode).order_by("id")[:1])
+                restored = pickle.loads(pickle.dumps(objs))
+                self.assertIs(restored[0]._state.fetch_mode, mode)
+
+    def test_native_off_fetch_peers_still_works(self):
+        from django.db.models import FETCH_PEERS
+
+        with mock.patch("django.native.AVAILABLE", False):
+            with mock.patch("django.native._loader.AVAILABLE", False):
+                articles = list(
+                    FastArticle.objects.fetch_mode(FETCH_PEERS).order_by("id")
+                )
+                self.assertEqual(len(articles), 3)
+                for a in articles:
+                    self.assertIs(a._state.fetch_mode, FETCH_PEERS)
+                    self.assertIs(a._state.peers, articles[0]._state.peers)
+                with self.assertNumQueries(1):
+                    self.assertEqual(articles[0].author.name, "Ada")
+                    self.assertEqual(articles[1].author.name, "Ada")
