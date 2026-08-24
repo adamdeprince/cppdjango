@@ -11,7 +11,7 @@ from unittest import mock
 from django.test import SimpleTestCase, TestCase, modify_settings
 from django.test.utils import isolate_apps
 
-from .models import FastFortune, FastWorld
+from .models import FastArticle, FastAuthor, FastFortune, FastWorld
 
 
 @isolate_apps("native_orm_fastpath")
@@ -223,3 +223,79 @@ class OrmFastPathNativeOffTests(TestCase):
                 self.assertEqual(n, 1)
                 obj = FastWorld.objects.get(pk=2)
                 self.assertEqual(obj.randomnumber, 99)
+
+
+@isolate_apps("native_orm_fastpath")
+@modify_settings(INSTALLED_APPS={"append": "native_orm_fastpath"})
+class FetchModeNativeTests(TestCase):
+    """Django 6.1 fetch modes through native materialize / get / peers."""
+
+    @classmethod
+    def setUpTestData(cls):
+        a1 = FastAuthor.objects.create(id=1, name="Ada")
+        a2 = FastAuthor.objects.create(id=2, name="Grace")
+        FastArticle.objects.bulk_create(
+            [
+                FastArticle(id=1, title="one", author=a1),
+                FastArticle(id=2, title="two", author=a1),
+                FastArticle(id=3, title="three", author=a2),
+            ]
+        )
+
+    def test_fetch_peers_shared_on_list(self):
+        from django.db.models import FETCH_PEERS
+
+        articles = list(FastArticle.objects.fetch_mode(FETCH_PEERS).order_by("id"))
+        self.assertEqual(len(articles), 3)
+        for a in articles:
+            self.assertIs(a._state.fetch_mode, FETCH_PEERS)
+            self.assertIs(a._state.peers, articles[0]._state.peers)
+        # Peer weakrefs resolve to the same instances.
+        live = [ref() for ref in articles[0]._state.peers]
+        self.assertEqual(live, articles)
+
+    def test_fetch_peers_forward_fk_batches(self):
+        from django.db.models import FETCH_PEERS
+
+        a1, a2 = FastArticle.objects.fetch_mode(FETCH_PEERS).filter(
+            author_id=1
+        ).order_by("id")
+        # Accessing author on either peer should use fetch_many (one query).
+        with self.assertNumQueries(1):
+            self.assertEqual(a1.author.name, "Ada")
+            self.assertEqual(a2.author.name, "Ada")
+        self.assertIs(a1.author._state.fetch_mode, FETCH_PEERS)
+
+    def test_fetch_raise_blocks_fk(self):
+        from django.core.exceptions import FieldFetchBlocked
+        from django.db.models import FETCH_RAISE
+
+        article = FastArticle.objects.fetch_mode(FETCH_RAISE).get(pk=1)
+        self.assertIs(article._state.fetch_mode, FETCH_RAISE)
+        with self.assertRaises(FieldFetchBlocked):
+            _ = article.author
+
+    def test_select_related_copies_fetch_mode(self):
+        from django.db.models import FETCH_PEERS
+
+        article = (
+            FastArticle.objects.fetch_mode(FETCH_PEERS)
+            .select_related("author")
+            .get(pk=1)
+        )
+        self.assertIs(article._state.fetch_mode, FETCH_PEERS)
+        self.assertIs(article.author._state.fetch_mode, FETCH_PEERS)
+
+    def test_in_bulk_propagates_fetch_mode(self):
+        from django.db.models import FETCH_PEERS
+
+        bulk = FastArticle.objects.fetch_mode(FETCH_PEERS).in_bulk([1, 2])
+        self.assertEqual(set(bulk), {1, 2})
+        for obj in bulk.values():
+            self.assertIs(obj._state.fetch_mode, FETCH_PEERS)
+
+    def test_create_propagates_fetch_mode(self):
+        from django.db.models import FETCH_PEERS
+
+        author = FastAuthor.objects.fetch_mode(FETCH_PEERS).create(name="Ken")
+        self.assertIs(author._state.fetch_mode, FETCH_PEERS)

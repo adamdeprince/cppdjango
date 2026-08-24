@@ -1,7 +1,7 @@
 # Native ORM Data Plane (Thought Experiment)
 
-**Status:** Thought experiment / north-star architecture  
-**Date:** 2026-08-05  
+**Status:** Thought experiment / north-star architecture (fetch-mode materialize wired on 6.1)  
+**Date:** 2026-08-05 (updated 2026-08-23 for Django 6.1 fetch modes)  
 **Product constraint:** API-compatible with Django 6.x ORM usage  
 **Performance constraint:** Hot paths are **pure C++**; Python↔C++ crossings are **not** on the per-row or per-clause critical path  
 

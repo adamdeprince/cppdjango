@@ -719,14 +719,14 @@ def materialize_models(model, connection, handle, *, limit=None, fetch_mode=None
             ann_info = []
         db = connection.alias
         track_peers = bool(fetch_mode is not None and fetch_mode.track_peers)
+        from_db = _from_db_factory(model, fetch_mode)
+        # Cache related from_db factories by model (select_related paths).
+        related_from_db = {}
         peers = []
         objs = []
         for row in rows:
             base = row[: len(attnames)]
-            if fetch_mode is not None:
-                obj = model.from_db(db, attnames, base, fetch_mode=fetch_mode)
-            else:
-                obj = model.from_db(db, attnames, base)
+            obj = from_db(db, attnames, base)
             if track_peers:
                 peers.append(weak_ref(obj))
                 obj._state.peers = peers
@@ -743,12 +743,13 @@ def materialize_models(model, connection, handle, *, limit=None, fetch_mode=None
                 for part in path.split("__"):
                     field = rel_model._meta.get_field(part)
                     rel_model = field.related_model
-                if fetch_mode is not None:
-                    rel_obj = rel_model.from_db(
-                        db, rel_atts, rel_vals, fetch_mode=fetch_mode
-                    )
-                else:
-                    rel_obj = rel_model.from_db(db, rel_atts, rel_vals)
+                rel_factory = related_from_db.get(rel_model)
+                if rel_factory is None:
+                    rel_factory = _from_db_factory(rel_model, fetch_mode)
+                    related_from_db[rel_model] = rel_factory
+                # RelatedPopulator does not put select_related objects on the
+                # root peer list — only apply fetch_mode via from_db.
+                rel_obj = rel_factory(db, rel_atts, rel_vals)
                 if field is not None:
                     if hasattr(field, "set_cached_value"):
                         field.set_cached_value(obj, rel_obj)
@@ -762,7 +763,14 @@ def materialize_models(model, connection, handle, *, limit=None, fetch_mode=None
             objs.append(obj)
         # Native prefetch secondary queries (multi-hop sequential).
         if objs and prefetch_specs:
-            _run_native_prefetch(model, objs, handle, prefetch_specs, connection)
+            _run_native_prefetch(
+                model,
+                objs,
+                handle,
+                prefetch_specs,
+                connection,
+                fetch_mode=fetch_mode,
+            )
             # Mark lookups done so Django prefetch skips them
             prefetches = []
         return objs, prefetches
@@ -814,17 +822,35 @@ def _attach_prefetched(parent, cache_name, rel_list_or_obj, many=True):
     parent._prefetched_objects_cache[cache_name] = rel_list_or_obj
 
 
-def _run_native_prefetch(model, objs, handle, specs, connection):
+def _from_db_factory(model, fetch_mode):
+    """
+    Return a callable(db, field_names, values) that applies ``fetch_mode``.
+
+    Delegates to QuerySet._get_from_db so deprecated from_db() overrides still
+    warn, matching ModelIterable / RelatedPopulator.
+    """
+    from django.db.models.query import _get_from_db
+
+    return _get_from_db(model, fetch_mode)
+
+
+def _run_native_prefetch(model, objs, handle, specs, connection, *, fetch_mode=None):
     """
     Execute secondary SELECTs for reverse FK / M2M / forward FK and attach.
 
     Specs are ordered hop-by-hop for multi-hop lookups. parent_path empty
     means attach to root objs; otherwise walk prior prefetches.
+
+    Related rows inherit ``fetch_mode`` (and share a peer list when
+    ``track_peers``) so FETCH_PEERS / FETCH_RAISE match stock prefetch.
     """
     if not objs:
         return
+    from weakref import ref as weak_ref
+
     db = connection.alias
     roots = objs
+    track_peers = bool(fetch_mode is not None and fetch_mode.track_peers)
 
     for spec in specs:
         try:
@@ -871,14 +897,23 @@ def _run_native_prefetch(model, objs, handle, specs, connection):
             rel = spec.get("rel") or ""
             cache = spec.get("cache_name") or spec.get("hop") or spec.get("lookup")
             buckets = {pk: [] for pk in parent_pks}
+            from_db = _from_db_factory(rel_model, fetch_mode)
+            # One peer list per secondary result set (matches evaluating a
+            # prefetch queryset under FETCH_PEERS via ModelIterable).
+            rel_peers = []
+
+            def _make_rel(row_vals):
+                rel_obj = from_db(db, remote_atts, row_vals)
+                if track_peers:
+                    rel_peers.append(weak_ref(rel_obj))
+                    rel_obj._state.peers = rel_peers
+                return rel_obj
 
             if rel in ("fk", "forward_fk"):
                 # Forward FK: parents hold FK values; attach single related obj.
                 by_pk = {}
                 for row in rows:
-                    rel_obj = rel_model.from_db(
-                        db, remote_atts, row[: len(remote_atts)]
-                    )
+                    rel_obj = _make_rel(row[: len(remote_atts)])
                     by_pk[rel_obj.pk] = rel_obj
                 try:
                     field = parent_model._meta.get_field(cache)
@@ -894,7 +929,7 @@ def _run_native_prefetch(model, objs, handle, specs, connection):
                 continue
 
             for row in rows:
-                rel_obj = rel_model.from_db(db, remote_atts, row[: len(remote_atts)])
+                rel_obj = _make_rel(row[: len(remote_atts)])
                 parent_id = None
                 if rel in ("rev_fk", "reverse_fk"):
                     fk_col = spec.get("remote_fk_column") or ""
